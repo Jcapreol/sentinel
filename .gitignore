@@ -1,0 +1,32 @@
+# Claude Code
+.claude/settings.local.json
+
+# Environment & secrets
+.env
+.env.*
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
