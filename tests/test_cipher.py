@@ -1,5 +1,5 @@
 import httpx
-import pytest
+from pytest_mock import MockerFixture
 
 from sentinel.cipher import CipherAgent
 from sentinel.config import Config
@@ -7,7 +7,7 @@ from sentinel.verdict import SentinelAgent
 
 
 def test_cipher_success(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -50,7 +50,7 @@ def test_cipher_no_ioc_returns_structured_null(fake_config: Config) -> None:
 
 
 def test_cipher_rate_limit_returns_blind_spot(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -69,7 +69,7 @@ def test_cipher_rate_limit_returns_blind_spot(
 
 
 def test_cipher_timeout_returns_blind_spot(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -85,7 +85,7 @@ def test_cipher_timeout_returns_blind_spot(
 
 
 def test_cipher_generic_exception_returns_blind_spot(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -100,7 +100,7 @@ def test_cipher_generic_exception_returns_blind_spot(
 
 
 def test_cipher_satisfies_sentinel_agent_protocol(
-    mocker: pytest.MockerFixture, fake_config: Config
+    mocker: MockerFixture, fake_config: Config
 ) -> None:
     mocker.patch("sentinel.cipher.httpx.Client")
     agent: SentinelAgent = CipherAgent(config=fake_config)

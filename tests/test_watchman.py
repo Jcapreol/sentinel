@@ -1,5 +1,5 @@
 import anthropic
-import pytest
+from pytest_mock import MockerFixture
 
 from sentinel.config import Config
 from sentinel.verdict import SentinelAgent
@@ -7,7 +7,7 @@ from sentinel.watchman import WatchmanAgent
 
 
 def test_watchman_success(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
     mock_response = mocker.MagicMock()
@@ -28,7 +28,7 @@ def test_watchman_success(
 
 
 def test_watchman_timeout_returns_blind_spot(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
     mock_anthropic.return_value.messages.create.side_effect = (
@@ -46,7 +46,7 @@ def test_watchman_timeout_returns_blind_spot(
 
 
 def test_watchman_malformed_output_returns_blind_spot(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
     mock_response = mocker.MagicMock()
@@ -65,7 +65,7 @@ def test_watchman_malformed_output_returns_blind_spot(
 
 
 def test_watchman_generic_exception_returns_blind_spot(
-    mocker: pytest.MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
     mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
     mock_anthropic.return_value.messages.create.side_effect = (
@@ -82,7 +82,7 @@ def test_watchman_generic_exception_returns_blind_spot(
 
 
 def test_watchman_satisfies_sentinel_agent_protocol(
-    mocker: pytest.MockerFixture, fake_config: Config
+    mocker: MockerFixture, fake_config: Config
 ) -> None:
     mocker.patch("sentinel.watchman.anthropic.Anthropic")
     agent: SentinelAgent = WatchmanAgent(config=fake_config)
