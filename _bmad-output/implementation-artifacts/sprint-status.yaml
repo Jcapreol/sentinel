@@ -46,7 +46,7 @@ development_status:
   epic-1: in-progress
   1-1-package-scaffold-and-ci-pipeline: review
   1-2-shared-type-definitions: review
-  1-3-config-module-and-test-infrastructure: backlog
+  1-3-config-module-and-test-infrastructure: review
   epic-1-retrospective: optional
 
   # Epic 2: Source Independence & Confidence Engine
