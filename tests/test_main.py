@@ -5,6 +5,7 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+from pytest_mock import MockerFixture
 
 from conftest import make_agent_result
 from sentinel.config import ConfigError
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
 
 
 def test_positional_arg_is_used_as_input(
-    mocker: pytest.MockerFixture, fake_config: "Config"
+    mocker: MockerFixture, fake_config: "Config"
 ) -> None:
     mocker.patch("sys.argv", ["sentinel", "test alert content"])
     mocker.patch("sentinel.main.load_config", return_value=fake_config)
@@ -32,7 +33,7 @@ def test_positional_arg_is_used_as_input(
 
 
 def test_stdin_read_when_no_positional_arg(
-    mocker: pytest.MockerFixture, fake_config: "Config"
+    mocker: MockerFixture, fake_config: "Config"
 ) -> None:
     mocker.patch("sys.argv", ["sentinel"])
     mocker.patch("sys.stdin", io.StringIO("alert from stdin"))
@@ -50,7 +51,7 @@ def test_stdin_read_when_no_positional_arg(
 
 
 def test_no_input_exits_2_with_usage_to_stderr(
-    mocker: pytest.MockerFixture, capsys: pytest.CaptureFixture[str]
+    mocker: MockerFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mocker.patch("sys.argv", ["sentinel"])
     mock_stdin = mocker.MagicMock()
@@ -67,7 +68,7 @@ def test_no_input_exits_2_with_usage_to_stderr(
 
 
 def test_empty_input_exits_2(
-    mocker: pytest.MockerFixture, capsys: pytest.CaptureFixture[str]
+    mocker: MockerFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mocker.patch("sys.argv", ["sentinel"])
     mocker.patch("sys.stdin", io.StringIO("   "))
@@ -81,7 +82,7 @@ def test_empty_input_exits_2(
 
 
 def test_config_error_exits_2(
-    mocker: pytest.MockerFixture, capsys: pytest.CaptureFixture[str]
+    mocker: MockerFixture, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mocker.patch("sys.argv", ["sentinel", "some alert"])
     mocker.patch(
@@ -99,7 +100,7 @@ def test_config_error_exits_2(
 
 
 def test_success_exits_0_with_json_to_stdout(
-    mocker: pytest.MockerFixture,
+    mocker: MockerFixture,
     fake_config: "Config",
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -127,7 +128,7 @@ def test_success_exits_0_with_json_to_stdout(
 
 
 def test_unhandled_exception_exits_1(
-    mocker: pytest.MockerFixture,
+    mocker: MockerFixture,
     fake_config: "Config",
     capsys: pytest.CaptureFixture[str],
 ) -> None:
