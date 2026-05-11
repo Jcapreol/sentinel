@@ -1,5 +1,6 @@
 # Claude Code / BMad
 .claude/settings.local.json
+.claude/skills/
 _bmad/
 _bmad-output/
 
