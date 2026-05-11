@@ -65,6 +65,6 @@ development_status:
   epic-4: in-progress
   4-1-verdict-assembly-and-json-output: review
   4-2-cli-orchestrator: ready-for-dev
-  4-3-documentation-and-open-source-hygiene: backlog
+  4-3-documentation-and-open-source-hygiene: ready-for-dev
   4-4-end-to-end-integration-test: backlog
   epic-4-retrospective: optional
