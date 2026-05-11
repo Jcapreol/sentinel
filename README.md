@@ -41,12 +41,22 @@ cd sentinel
 pip install -e .
 ```
 
+> **Windows:** use `py -m pip install -e .` if `pip` is not on your PATH.
+
 Set your API keys:
 
+**macOS / Linux:**
 ```bash
 export ANTHROPIC_API_KEY=your_anthropic_key
 export VIRUSTOTAL_API_KEY=your_virustotal_key
 export ABUSEIPDB_API_KEY=your_abuseipdb_key
+```
+
+**Windows (PowerShell):**
+```powershell
+$env:ANTHROPIC_API_KEY="your_anthropic_key"
+$env:VIRUSTOTAL_API_KEY="your_virustotal_key"
+$env:ABUSEIPDB_API_KEY="your_abuseipdb_key"
 ```
 
 Run:
