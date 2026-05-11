@@ -50,8 +50,8 @@ development_status:
   epic-1-retrospective: optional
 
   # Epic 2: Source Independence & Confidence Engine
-  epic-2: backlog
-  2-1-source-registry: backlog
+  epic-2: in-progress
+  2-1-source-registry: review
   2-2-confidence-engine: backlog
   epic-2-retrospective: optional
 
