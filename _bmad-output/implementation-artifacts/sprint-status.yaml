@@ -52,7 +52,7 @@ development_status:
   # Epic 2: Source Independence & Confidence Engine
   epic-2: in-progress
   2-1-source-registry: review
-  2-2-confidence-engine: backlog
+  2-2-confidence-engine: review
   epic-2-retrospective: optional
 
   # Epic 3: Analysis Agents

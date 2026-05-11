@@ -1,7 +1,9 @@
 SOURCE_CATEGORIES: dict[str, str] = {
     "anthropic_claude": "llm_behavioral",
+    "watchman": "llm_behavioral",
     "virustotal": "community_reputation",
     "abuseipdb": "community_reputation",
+    "cipher": "community_reputation",
 }
 
 
