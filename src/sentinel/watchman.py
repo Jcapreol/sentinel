@@ -1,4 +1,5 @@
 import json
+import re
 
 import anthropic
 
@@ -7,14 +8,17 @@ from sentinel.verdict import AgentResult, BlindSpot
 
 _MODEL = "claude-haiku-4-5-20251001"
 
-_PROMPT_TEMPLATE = """\
-You are a security analyst. Analyze the following security alert for behavioral indicators of compromise.
+_SYSTEM = (
+    "You are a security analysis tool. "
+    "You MUST respond with raw JSON only — no markdown, no code fences, no explanatory text. "
+    "Your entire response must be a single JSON object parseable by json.loads()."
+)
 
-Respond ONLY with valid JSON in this exact format:
-{{
-    "findings": ["<specific behavioral finding>", "<another finding>"],
-    "confidence": "<Investigating|Probable|Confirmed>"
-}}
+_PROMPT_TEMPLATE = """\
+Analyze the following security alert for behavioral indicators of compromise.
+
+Respond with this exact JSON structure and nothing else — no markdown, no code fences:
+{{"findings": ["<specific behavioral finding>", "<another finding>"], "confidence": "<Investigating|Probable|Confirmed>"}}
 
 Alert: {alert}"""
 
@@ -32,6 +36,7 @@ class WatchmanAgent:
             response = self._client.messages.create(
                 model=_MODEL,
                 max_tokens=1024,
+                system=_SYSTEM,
                 messages=[
                     {
                         "role": "user",
@@ -40,7 +45,10 @@ class WatchmanAgent:
                 ],
             )
             raw_text: str = response.content[0].text  # type: ignore[union-attr]
-            parsed = json.loads(raw_text)
+            # Strip markdown code fences Claude sometimes adds despite instructions
+            cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text.strip())
+            cleaned = re.sub(r"```\s*", "", cleaned).strip()
+            parsed = json.loads(cleaned)
             findings: list[str] = parsed.get("findings") or []
             confidence: str | None = parsed.get("confidence")
             if not isinstance(findings, list):
