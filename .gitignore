@@ -1,5 +1,7 @@
-# Claude Code
+# Claude Code / BMad
 .claude/settings.local.json
+_bmad/
+_bmad-output/
 
 # Environment & secrets
 .env
