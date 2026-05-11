@@ -4,6 +4,7 @@
 # Environment & secrets
 .env
 .env.*
+!.env.example
 *.key
 secrets/
 
@@ -19,6 +20,7 @@ dist/
 build/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 htmlcov/
 .coverage
 
