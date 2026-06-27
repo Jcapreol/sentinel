@@ -1,0 +1,15 @@
+{
+  "description": "Labeled evaluation set for Sentinel.",
+  "labeled_alerts": [
+    { "id": "benign-01", "indicator": "1.1.1.1", "indicator_type": "ip", "ground_truth": "benign", "note": "Cloudflare DNS" },
+    { "id": "benign-02", "indicator": "8.8.8.8", "indicator_type": "ip", "ground_truth": "benign", "note": "Google DNS" },
+    { "id": "benign-03", "indicator": "google.com", "indicator_type": "domain", "ground_truth": "benign", "note": "Known-good domain" },
+    { "id": "benign-04", "indicator": "microsoft.com", "indicator_type": "domain", "ground_truth": "benign", "note": "Known-good domain" },
+    { "id": "benign-05", "indicator": "github.com", "indicator_type": "domain", "ground_truth": "benign", "note": "Known-good domain" },
+    { "id": "malicious-01", "indicator": "http://36.71.31.249:54024/bin.sh", "indicator_type": "url", "ground_truth": "malicious", "note": "URLhaus live sample" },
+    { "id": "malicious-02", "indicator": "http://219.157.50.8:45761/i", "indicator_type": "url", "ground_truth": "malicious", "note": "URLhaus live sample" },
+    { "id": "malicious-03", "indicator": "http://110.36.77.17:43286/i", "indicator_type": "url", "ground_truth": "malicious", "note": "URLhaus live sample" },
+    { "id": "malicious-04", "indicator": "http://110.38.215.152:43893/i", "indicator_type": "url", "ground_truth": "malicious", "note": "URLhaus live sample" },
+    { "id": "malicious-05", "indicator": "http://115.49.120.250:47051/i", "indicator_type": "url", "ground_truth": "malicious", "note": "URLhaus live sample" }
+  ]
+}

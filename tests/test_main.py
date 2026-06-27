@@ -112,7 +112,8 @@ def test_success_exits_0_with_json_to_stdout(
         "watchman", findings=["Suspicious outbound connection pattern"]
     )
     cipher_mock.return_value.analyze.return_value = make_agent_result(
-        "cipher", findings=["VirusTotal: 1.2.3.4 flagged by 5 engines"]
+        "cipher",
+        findings=["VirusTotal: 1.2.3.4 flagged by 5 engines as malicious, 2 as suspicious"],
     )
 
     with pytest.raises(SystemExit) as exc:
@@ -122,9 +123,10 @@ def test_success_exits_0_with_json_to_stdout(
     captured = capsys.readouterr()
     assert captured.out != ""
     result = json.loads(captured.out)
-    assert result["confidence_tier"] == 2
+    # Watchman "Probable" (medium) + Cipher malicious → CONFIRMED (tier 3)
+    assert result["confidence_tier"] == 3
     assert result["source_independence_confirmed"] is True
-    assert result["verdict"] == "Probable"
+    assert result["verdict"] == "Confirmed"
 
 
 def test_unhandled_exception_exits_1(

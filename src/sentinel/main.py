@@ -69,7 +69,7 @@ def _run() -> None:
         watchman_result = w_future.result()
         cipher_result = c_future.result()
 
-    tier_enum = calculate_tier([watchman_result, cipher_result])
+    tier_enum = calculate_tier(watchman_result, cipher_result)
     tier = TIER_MAP[tier_enum]
     independence = are_independent("watchman", "cipher")
 
