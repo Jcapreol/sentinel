@@ -5,8 +5,7 @@ from sentinel.confidence import (
     calculate_tier,
     count_independent_sources,
 )
-from sentinel.source_registry import SOURCE_CATEGORIES
-from sentinel.verdict import AgentResult, BlindSpot
+from sentinel.verdict import AgentResult
 
 
 # ---------------------------------------------------------------------------
