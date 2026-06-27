@@ -179,7 +179,9 @@ py eval/run_eval.py
 
 ### Known limitation
 
-The single false negative was a URLhaus-listed malicious IP that VirusTotal had not yet flagged at evaluation time. This illustrates a real-world blind spot: threat-intelligence sources lag one another, so a freshly weaponized indicator can read as clean on one feed while another already lists it. This is exactly why SENTINEL keeps Watchman's behavioral analysis as an independent signal rather than relying on reputation alone — and why it surfaces named blind spots instead of presenting a single unqualified verdict.
+The single false negative was a URLhaus-listed malicious IP that VirusTotal had not yet flagged at evaluation time. This illustrates a real-world blind spot: threat-intelligence sources lag one another, so a freshly weaponized indicator can read as clean on one feed while another already lists it. This is exactly why SENTINEL keeps Watchman's behavioral analysis as an independent signal rather than relying on reputation alone, and why it surfaces named blind spots instead of presenting a single unqualified verdict.
+
+Because Cipher depends on live threat-intelligence feeds, eval scores vary slightly between runs as those feeds update. The false negative above resolved to a correct "Confirmed" on a later run once VirusTotal's engines caught up to the indicator, which is the same source-latency effect from the other direction. The 88.9% F1 reported here is from the run where that lag was visible; treat it as a representative figure rather than a fixed benchmark.
 
 ## Data Handling
 
