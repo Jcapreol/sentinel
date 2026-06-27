@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "PowerShell(& \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\venv\\\\Scripts\\\\python.exe\" -m ruff check \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\src\" 2>&1)",
-      "PowerShell(& \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\venv\\\\Scripts\\\\python.exe\" -m pytest \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\tests\\\\\" -q 2>&1)"
+      "PowerShell(& \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\venv\\\\Scripts\\\\python.exe\" -m pytest \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\tests\\\\\" -q 2>&1)",
+      "PowerShell(& \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\venv\\\\Scripts\\\\python.exe\" -m mypy \"c:\\\\Users\\\\jacks\\\\Documents\\\\sentinel\\\\src\" 2>&1)"
     ]
   }
 }
