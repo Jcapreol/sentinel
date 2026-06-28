@@ -34,6 +34,17 @@ def _extract_domains(text: str) -> list[str]:
     return list(seen)
 
 
+def extract_ioc(text: str) -> tuple[str, str] | None:
+    """Return the first extractable IOC as (type, value), or None."""
+    ips = _extract_public_ips(text)
+    if ips:
+        return ("ip", ips[0])
+    domains = _extract_domains(text)
+    if domains:
+        return ("domain", domains[0])
+    return None
+
+
 class CipherAgent:
     def __init__(self, config: Config) -> None:
         self._config = config

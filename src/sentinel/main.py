@@ -2,11 +2,13 @@ import argparse
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, cast
 
 from sentinel.cipher import CipherAgent
 from sentinel.confidence import TIER_MAP, calculate_tier
 from sentinel.config import ConfigError
 from sentinel.config import load as load_config
+from sentinel.reporter import generate_report, write_report_markdown
 from sentinel.source_registry import are_independent
 from sentinel.verdict import assemble_verdict, print_verdict
 from sentinel.watchman import WatchmanAgent
@@ -33,6 +35,11 @@ def _run() -> None:
         "input",
         nargs="?",
         help="Security alert, log line, or IOC to analyze",
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Generate a structured incident report (JSON stdout + Markdown file in reports/)",
     )
     args = parser.parse_args()
 
@@ -74,6 +81,13 @@ def _run() -> None:
     independence = are_independent("watchman", "cipher")
 
     verdict = assemble_verdict(watchman_result, cipher_result, tier, independence, start_time)
+
+    if args.report:
+        report = generate_report(input_data, watchman_result, cipher_result, verdict)
+        md_path = write_report_markdown(report, verdict["timestamp"])
+        print(f"[sentinel] Report written to {md_path}", file=sys.stderr)
+        verdict["incident_report"] = cast(dict[str, Any], report)
+
     print_verdict(verdict)
     sys.exit(0)
 

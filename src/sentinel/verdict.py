@@ -11,7 +11,7 @@ class BlindSpot(TypedDict):
     next_step: str | None
 
 
-class AgentResult(TypedDict):
+class _AgentResultRequired(TypedDict):
     source_name: str
     findings: list[str]
     blind_spots: list[BlindSpot]
@@ -19,7 +19,11 @@ class AgentResult(TypedDict):
     error: str | None
 
 
-class VerdictSchema(TypedDict):
+class AgentResult(_AgentResultRequired, total=False):
+    mitre_tags: list[str]
+
+
+class _VerdictSchemaRequired(TypedDict):
     verdict: str
     confidence_tier: int
     methodology: list[dict[str, Any]]
@@ -28,6 +32,10 @@ class VerdictSchema(TypedDict):
     source_independence_confirmed: bool
     execution_time_seconds: float
     timestamp: str
+
+
+class VerdictSchema(_VerdictSchemaRequired, total=False):
+    incident_report: dict[str, Any]
 
 
 class SentinelAgent(Protocol):

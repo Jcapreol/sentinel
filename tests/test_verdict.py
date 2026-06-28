@@ -61,8 +61,8 @@ def test_agent_result_blind_spots_is_list_of_blindspot() -> None:
     assert result["blind_spots"][0]["reason"] == "rate limited"
 
 
-def test_verdict_schema_has_exactly_eight_fields() -> None:
-    hints = typing.get_type_hints(VerdictSchema)
+def test_verdict_schema_has_exactly_nine_fields() -> None:
+    hints = typing.get_type_hints(VerdictSchema, include_extras=True)
     assert set(hints.keys()) == {
         "verdict",
         "confidence_tier",
@@ -72,6 +72,7 @@ def test_verdict_schema_has_exactly_eight_fields() -> None:
         "source_independence_confirmed",
         "execution_time_seconds",
         "timestamp",
+        "incident_report",
     }
 
 
