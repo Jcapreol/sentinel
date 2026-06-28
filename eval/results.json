@@ -1,12 +1,12 @@
 {
   "summary": {
     "precision": 1.0,
-    "recall": 0.8,
-    "f1": 0.888888888888889,
-    "tp": 4,
+    "recall": 1.0,
+    "f1": 1.0,
+    "tp": 5,
     "fp": 0,
     "tn": 5,
-    "fn": 1,
+    "fn": 0,
     "unknown": 0
   },
   "details": [
@@ -66,9 +66,9 @@
       "indicator_type": "url",
       "ground_truth": "malicious",
       "note": "URLhaus live sample",
-      "verdict": "Benign",
-      "confidence_tier": 0,
-      "predicted": "benign"
+      "verdict": "Confirmed",
+      "confidence_tier": 3,
+      "predicted": "malicious"
     },
     {
       "id": "malicious-02",

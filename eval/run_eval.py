@@ -17,7 +17,7 @@ def build_alert(indicator, indicator_type):
 
 def run_sentinel(alert):
     try:
-        result = subprocess.run(["sentinel", alert], capture_output=True, text=True, timeout=120)
+        result = subprocess.run(["py", "-m", "sentinel.main", alert], capture_output=True, text=True, timeout=120)
     except FileNotFoundError:
         print("ERROR: sentinel command not found. Activate the venv first.")
         sys.exit(1)

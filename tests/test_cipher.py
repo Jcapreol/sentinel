@@ -107,6 +107,97 @@ def test_cipher_satisfies_sentinel_agent_protocol(
     assert callable(getattr(agent, "analyze", None))
 
 
+# --- URLhaus tests ---
+
+
+def test_cipher_urlhaus_hit_adds_finding(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 0, "suspicious": 0}}}
+    }
+    ab_response = mocker.MagicMock()
+    ab_response.status_code = 200
+    ab_response.json.return_value = {"data": {"abuseConfidenceScore": 0, "totalReports": 0}}
+    uh_response = mocker.MagicMock()
+    uh_response.status_code = 200
+    uh_response.json.return_value = {"query_status": "ok", "url_count": 3}
+
+    mock_client.get.side_effect = [vt_response, ab_response]
+    mock_client.post.return_value = uh_response
+
+    agent = CipherAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["error"] is None
+    assert any("URLhaus" in f for f in result["findings"])
+    assert any("3" in f for f in result["findings"])
+    # POST was called with the expected indicator
+    mock_client.post.assert_called_once()
+    call_kwargs = mock_client.post.call_args
+    assert call_kwargs.kwargs["data"]["host"] == "185.220.101.45"
+
+
+def test_cipher_urlhaus_miss_is_no_data_not_clean(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """no_results must not add a finding OR a blind spot — absence is not exonerating."""
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 0, "suspicious": 0}}}
+    }
+    ab_response = mocker.MagicMock()
+    ab_response.status_code = 200
+    ab_response.json.return_value = {"data": {"abuseConfidenceScore": 0, "totalReports": 0}}
+    uh_response = mocker.MagicMock()
+    uh_response.status_code = 200
+    uh_response.json.return_value = {"query_status": "no_results"}
+
+    mock_client.get.side_effect = [vt_response, ab_response]
+    mock_client.post.return_value = uh_response
+
+    agent = CipherAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["error"] is None
+    assert not any("URLhaus" in f for f in result["findings"])
+    assert not any(bs["source"] == "urlhaus" for bs in result["blind_spots"])
+
+
+def test_cipher_urlhaus_failure_adds_blind_spot(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 0, "suspicious": 0}}}
+    }
+    ab_response = mocker.MagicMock()
+    ab_response.status_code = 200
+    ab_response.json.return_value = {"data": {"abuseConfidenceScore": 0, "totalReports": 0}}
+
+    mock_client.get.side_effect = [vt_response, ab_response]
+    mock_client.post.side_effect = httpx.ConnectError("connection refused")
+
+    agent = CipherAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert not any("URLhaus" in f for f in result["findings"])
+    assert any(bs["source"] == "urlhaus" for bs in result["blind_spots"])
+
+
 # --- Domain path tests ---
 
 

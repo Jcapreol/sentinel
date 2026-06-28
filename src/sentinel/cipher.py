@@ -8,6 +8,7 @@ from sentinel.verdict import AgentResult, BlindSpot
 _VT_IP_URL = "https://www.virustotal.com/api/v3/ip_addresses/{ip}"
 _VT_DOMAIN_URL = "https://www.virustotal.com/api/v3/domains/{domain}"
 _ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
+_URLHAUS_URL = "https://urlhaus-api.abuse.ch/v1/host/"
 
 _IP_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _PRIVATE_IP = re.compile(
@@ -90,6 +91,52 @@ class CipherAgent:
                 raw_confidence=None,
                 error="analysis_failed",
             )
+
+    def _lookup_urlhaus(
+        self,
+        indicator: str,
+        findings: list[str],
+        blind_spots: list[BlindSpot],
+    ) -> str | None:
+        """Query URLhaus host endpoint (POST). Returns an error code or None.
+
+        A 'no_results' status is treated as no-data — absence from URLhaus
+        does not indicate the indicator is safe.
+        """
+        try:
+            uh_resp = self._client.post(
+                _URLHAUS_URL,
+                data={"host": indicator},
+                headers={"Auth-Key": self._config.urlhaus_api_key},
+            )
+            if uh_resp.status_code == 429:
+                blind_spots.append(
+                    BlindSpot(
+                        source="urlhaus",
+                        reason="URLhaus rate limit reached — malicious URL data unavailable",
+                        next_step="Wait before retrying or check URLhaus API quota",
+                    )
+                )
+                return "rate_limited"
+            uh_data = uh_resp.json()
+            if uh_data.get("query_status") == "ok":
+                url_count = int(uh_data.get("url_count", 0))
+                findings.append(
+                    f"URLhaus: {indicator} associated with {url_count} malicious URL(s)"
+                )
+            # query_status == "no_results" → silent no-data; absence is not exonerating
+            return None
+        except httpx.TimeoutException:
+            raise
+        except Exception:
+            blind_spots.append(
+                BlindSpot(
+                    source="urlhaus",
+                    reason="URLhaus lookup failed — malicious URL data unavailable",
+                    next_step=None,
+                )
+            )
+            return "analysis_failed"
 
     def _analyze_ip(self, ip: str) -> AgentResult:
         findings: list[str] = []
@@ -177,6 +224,11 @@ class CipherAgent:
             if overall_error is None:
                 overall_error = "analysis_failed"
 
+        # URLhaus lookup
+        uh_error = self._lookup_urlhaus(ip, findings, blind_spots)
+        if uh_error is not None and overall_error is None:
+            overall_error = uh_error
+
         return AgentResult(
             source_name="cipher",
             findings=findings,
@@ -239,6 +291,11 @@ class CipherAgent:
                 next_step="Query AbuseIPDB manually with the resolved IP address if available",
             )
         )
+
+        # URLhaus lookup (supports both IPs and domains)
+        uh_error = self._lookup_urlhaus(domain, findings, blind_spots)
+        if uh_error is not None and overall_error is None:
+            overall_error = uh_error
 
         return AgentResult(
             source_name="cipher",

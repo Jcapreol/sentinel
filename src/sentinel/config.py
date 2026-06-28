@@ -15,13 +15,19 @@ class Config:
     anthropic_api_key: str
     virustotal_api_key: str
     abuseipdb_api_key: str
+    urlhaus_api_key: str
     timeout_seconds: int = 10
 
 
 def load() -> Config:
     missing = [
         var
-        for var in ("ANTHROPIC_API_KEY", "VIRUSTOTAL_API_KEY", "ABUSEIPDB_API_KEY")
+        for var in (
+            "ANTHROPIC_API_KEY",
+            "VIRUSTOTAL_API_KEY",
+            "ABUSEIPDB_API_KEY",
+            "URLHAUS_API_KEY",
+        )
         if not os.environ.get(var)
     ]
     if missing:
@@ -34,5 +40,6 @@ def load() -> Config:
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         virustotal_api_key=os.environ["VIRUSTOTAL_API_KEY"],
         abuseipdb_api_key=os.environ["ABUSEIPDB_API_KEY"],
+        urlhaus_api_key=os.environ["URLHAUS_API_KEY"],
         timeout_seconds=timeout,
     )
