@@ -49,6 +49,21 @@ _NEXT_STEPS: dict[str, list[str]] = {
     ],
 }
 
+_MITRE_NAMES: dict[str, str] = {
+    "T1003": "OS Credential Dumping",
+    "T1027": "Obfuscated Files or Information",
+    "T1036": "Masquerading",
+    "T1041": "Exfiltration Over C2 Channel",
+    "T1055": "Process Injection",
+    "T1059": "Command and Scripting Interpreter",
+    "T1071": "Application Layer Protocol",
+    "T1078": "Valid Accounts",
+    "T1133": "External Remote Services",
+    "T1190": "Exploit Public-Facing Application",
+    "T1486": "Data Encrypted for Impact",
+    "T1571": "Non-Standard Port",
+}
+
 _ACTION_PHRASE: dict[str, str] = {
     "Confirmed": "Immediate escalation and host isolation are recommended.",
     "Probable": "Further investigation is recommended; escalate if confirmed.",
@@ -167,7 +182,8 @@ def render_markdown(report: IncidentReport, timestamp: str) -> str:
     tags: list[str] = report["mitre_attack_mapping"]
     if tags:
         for tag in tags:
-            lines.append(f"- {tag}")
+            name = _MITRE_NAMES.get(tag)
+            lines.append(f"- {tag} — {name}" if name else f"- {tag}")
     else:
         lines.append("- No ATT&CK techniques identified")
     lines.append("")
