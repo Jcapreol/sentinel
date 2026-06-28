@@ -9,7 +9,12 @@ git clone https://github.com/Jcapreol/sentinel.git
 cd sentinel
 pip install -e .
 cp .env.example .env   # then fill in your four API keys
+
+# Basic triage
 sentinel "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
+
+# Full incident report with MITRE ATT&CK mapping (saves Markdown to reports/)
+sentinel --report "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
 ```
 
 API keys required: Anthropic (pay-per-use, fractions of a cent per run), VirusTotal (free tier), AbuseIPDB (free tier), URLhaus (free tier — get one at auth.abuse.ch).
@@ -87,6 +92,13 @@ Run:
 
 ```bash
 sentinel "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
+```
+
+Or generate a full incident report with MITRE ATT&CK mapping:
+
+```bash
+sentinel --report "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
+# Verdict JSON to stdout + Markdown report saved to reports/TIMESTAMP-incident.md
 ```
 
 Or pipe via stdin:
