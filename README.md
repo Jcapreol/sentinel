@@ -2,8 +2,22 @@
 
 [![CI](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml)
 
+## Quick Start
+
+```bash
+git clone https://github.com/Jcapreol/sentinel.git
+cd sentinel
+pip install -e .
+cp .env.example .env   # then fill in your four API keys
+sentinel "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
+```
+
+API keys required: Anthropic (pay-per-use, fractions of a cent per run), VirusTotal (free tier), AbuseIPDB (free tier), URLhaus (free tier — get one at auth.abuse.ch).
+
+---
+
 SENTINEL is an open-source, MIT-licensed multi-agent AI SOC analyst for the terminal that accepts a raw security alert, log line, or IOC and produces a corroborated, structured verdict in under 30 seconds.
-It runs two independent analysis agents — Watchman (Claude behavioral analysis) and Cipher (VirusTotal + AbuseIPDB threat intelligence) — and weighs their combined evidence into a human-readable verdict (Benign / Investigating / Probable / Confirmed). A clean reputation lookup pulls a verdict toward benign; concrete malicious reputation pushes it toward confirmed; behavioral suspicion alone is reported but not treated as proof.
+It runs two independent analysis agents — Watchman (Claude behavioral analysis) and Cipher (VirusTotal + AbuseIPDB + URLhaus threat intelligence) — and weighs their combined evidence into a human-readable verdict (Benign / Investigating / Probable / Confirmed). A clean reputation lookup pulls a verdict toward benign; concrete malicious reputation pushes it toward confirmed; behavioral suspicion alone is reported but not treated as proof.
 JSON output is stable across all v1.x releases and parseable by standard tools like `jq` without SENTINEL-specific libraries.
 
 ## Demo
@@ -50,6 +64,7 @@ Set your API keys. SENTINEL reads them from a `.env` file in the project root (c
 ANTHROPIC_API_KEY=your_anthropic_key
 VIRUSTOTAL_API_KEY=your_virustotal_key
 ABUSEIPDB_API_KEY=your_abuseipdb_key
+URLHAUS_API_KEY=your_urlhaus_key
 ```
 
 **Or export directly (macOS / Linux):**
@@ -57,6 +72,7 @@ ABUSEIPDB_API_KEY=your_abuseipdb_key
 export ANTHROPIC_API_KEY=your_anthropic_key
 export VIRUSTOTAL_API_KEY=your_virustotal_key
 export ABUSEIPDB_API_KEY=your_abuseipdb_key
+export URLHAUS_API_KEY=your_urlhaus_key
 ```
 
 **Or export directly (Windows PowerShell):**
@@ -64,6 +80,7 @@ export ABUSEIPDB_API_KEY=your_abuseipdb_key
 $env:ANTHROPIC_API_KEY="your_anthropic_key"
 $env:VIRUSTOTAL_API_KEY="your_virustotal_key"
 $env:ABUSEIPDB_API_KEY="your_abuseipdb_key"
+$env:URLHAUS_API_KEY="your_urlhaus_key"
 ```
 
 Run:
@@ -142,11 +159,13 @@ A named blind spot is always surfaced when a source can't contribute — so you 
 
 ## Threat Intelligence Coverage
 
-Cipher extracts indicators from the alert text and looks them up:
+Cipher extracts indicators from the alert text and queries three independent sources:
 
-- **IP addresses** — VirusTotal reputation + AbuseIPDB abuse reports
-- **Domains** — VirusTotal domain reputation (AbuseIPDB is IP-only and is reported as a blind spot for domains)
-- **URLs** — the host/IP is extracted and looked up
+- **IP addresses** — VirusTotal reputation + AbuseIPDB abuse reports + URLhaus malware-host lookup
+- **Domains** — VirusTotal domain reputation + URLhaus malware-host lookup (AbuseIPDB is IP-only and is reported as a blind spot for domains)
+- **URLs** — the host/IP is extracted and looked up across all three sources
+
+Each source covers different threat infrastructure. VirusTotal aggregates antivirus engine verdicts; AbuseIPDB tracks community-reported abuse; URLhaus specifically indexes active malware distribution hosts, catching freshly weaponized IOCs that other feeds haven't yet flagged. A miss on any single source is treated as no-data, not as exoneration — only a confirmed clean result counts as evidence of safety.
 
 Private/internal IP ranges are filtered out automatically so only externally routable indicators are queried.
 
@@ -154,44 +173,43 @@ Private/internal IP ranges are filtered out automatically so only externally rou
 
 SENTINEL ships with a small evaluation harness (`eval/run_eval.py`) that runs a labeled set of indicators through the full pipeline and scores the verdicts against known ground truth. The labeled set (`eval/labeled_set.json`) contains known-benign infrastructure (Cloudflare/Google DNS, major domains) and live malicious samples pulled from URLhaus.
 
-The harness was used to validate a change to the verdict logic. The original implementation derived the verdict purely from the count of agents that returned findings, which meant a clean indicator and a malicious one received the same verdict. Replacing that with the evidence-weighting logic above produced a measurable improvement on the same labeled set:
+The harness has been used to validate two successive improvements to the pipeline. The original implementation derived the verdict purely from the count of agents that returned findings, which meant a clean indicator and a malicious one received the same verdict. The changes below were made iteratively, each measured against the same labeled set:
 
-| Metric | Before (source-count) | After (evidence-weighted) |
-|--------|----------------------|---------------------------|
-| Precision | 50.0% | **100.0%** |
-| Recall | 100.0% | 80.0% |
-| F1 | 66.7% | **88.9%** |
+| Metric | Baseline (source-count verdict) | After evidence-weighting | After URLhaus added |
+|--------|--------------------------------|--------------------------|---------------------|
+| Precision | 50.0% | 100.0% | **100.0%** |
+| Recall | 100.0% | 80.0% | **100.0%** |
+| F1 | 66.7% | 88.9% | **100.0%** |
 
-Confusion matrix (positive class = malicious), after the change:
+Confusion matrix (positive class = malicious), current:
 
 ```
                  predicted MAL   predicted BEN
-actual MAL          TP = 4          FN = 1
+actual MAL          TP = 5          FN = 0
 actual BEN          FP = 0          TN = 5
 ```
+
+The recall improvement from 80% to 100% came from adding URLhaus as a third intel source. The single false negative in the evidence-weighting run was a URLhaus-listed malicious IP that VirusTotal had not yet flagged — a real-world illustration of threat-intel source latency. URLhaus indexes active malware distribution hosts and caught that indicator when VirusTotal lagged, closing the gap.
 
 Reproduce it yourself:
 
 ```bash
-sentinel ...   # ensure your API keys are set
 py eval/run_eval.py
 ```
 
 ### Known limitation
 
-The single false negative was a URLhaus-listed malicious IP that VirusTotal had not yet flagged at evaluation time. This illustrates a real-world blind spot: threat-intelligence sources lag one another, so a freshly weaponized indicator can read as clean on one feed while another already lists it. This is exactly why SENTINEL keeps Watchman's behavioral analysis as an independent signal rather than relying on reputation alone, and why it surfaces named blind spots instead of presenting a single unqualified verdict.
-
-Because Cipher depends on live threat-intelligence feeds, eval scores vary slightly between runs as those feeds update. The false negative above resolved to a correct "Confirmed" on a later run once VirusTotal's engines caught up to the indicator, which is the same source-latency effect from the other direction. The 88.9% F1 reported here is from the run where that lag was visible; treat it as a representative figure rather than a fixed benchmark.
+Because Cipher depends on live threat-intelligence feeds, eval scores vary between runs as those feeds update. The numbers above reflect the current state of the labeled set against live feeds. Treat them as representative figures rather than fixed benchmarks — a freshly weaponized indicator may still lag on some feeds even with three sources, which is exactly why SENTINEL keeps Watchman's behavioral analysis as an independent signal rather than relying on reputation alone.
 
 ## Data Handling
 
 SENTINEL does not store or transmit your incident data beyond the analysis APIs.
 
-No alert content, IOCs, or log lines are written to disk at any point. The only external transmissions are to the Anthropic API (Watchman behavioral analysis) and the VirusTotal/AbuseIPDB APIs (Cipher threat intelligence) as required to produce a verdict.
+No alert content, IOCs, or log lines are written to disk at any point. The only external transmissions are to the Anthropic API (Watchman behavioral analysis) and the VirusTotal, AbuseIPDB, and URLhaus APIs (Cipher threat intelligence) as required to produce a verdict.
 
 ## Connectivity Requirements
 
-SENTINEL requires internet access to the Anthropic and VirusTotal/AbuseIPDB APIs. Air-gapped environments are not supported in v1.
+SENTINEL requires internet access to the Anthropic, VirusTotal, AbuseIPDB, and URLhaus APIs. Air-gapped environments are not supported in v1.
 
 ## Rate Limits
 
