@@ -37,3 +37,6 @@ Thumbs.db
 *.swp
 .claude/
 README.md.bak
+
+# Generated incident reports
+reports/

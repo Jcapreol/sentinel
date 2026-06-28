@@ -18,7 +18,9 @@ _PROMPT_TEMPLATE = """\
 Analyze the following security alert for behavioral indicators of compromise.
 
 Respond with this exact JSON structure and nothing else — no markdown, no code fences:
-{{"findings": ["<specific behavioral finding>", "<another finding>"], "confidence": "<Investigating|Probable|Confirmed>"}}
+{{"findings": ["<specific behavioral finding>", "<another finding>"], "confidence": "<Investigating|Probable|Confirmed>", "mitre_tags": ["T1003", "T1071"]}}
+
+In "mitre_tags", include relevant MITRE ATT&CK technique IDs. Leave the array empty if none apply.
 
 Alert: {alert}"""
 
@@ -51,6 +53,8 @@ class WatchmanAgent:
             parsed = json.loads(cleaned)
             findings: list[str] = parsed.get("findings") or []
             confidence: str | None = parsed.get("confidence")
+            raw_tags = parsed.get("mitre_tags")
+            mitre_tags: list[str] = raw_tags if isinstance(raw_tags, list) else []
             if not isinstance(findings, list):
                 raise ValueError("findings must be a list")
             return AgentResult(
@@ -59,6 +63,7 @@ class WatchmanAgent:
                 blind_spots=[],
                 raw_confidence=confidence,
                 error=None,
+                mitre_tags=mitre_tags,
             )
         except anthropic.APITimeoutError:
             return AgentResult(
