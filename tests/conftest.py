@@ -10,6 +10,7 @@ def fake_config() -> Config:
         anthropic_api_key="test-anthropic-key",
         virustotal_api_key="test-virustotal-key",
         abuseipdb_api_key="test-abuseipdb-key",
+        urlhaus_api_key="test-urlhaus-key",
         timeout_seconds=5,
     )
 
