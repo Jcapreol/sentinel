@@ -112,6 +112,7 @@ def test_markdown_file_written_to_reports_dir(tmp_path: Path) -> None:
     watchman_result = make_agent_result(
         "watchman", findings=["Suspicious outbound connection"]
     )
+    watchman_result["mitre_tags"] = ["T1071", "T1999"]  # known + unknown tag
     cipher_result = make_agent_result(
         "cipher",
         findings=["AbuseIPDB: 1.2.3.4 abuse confidence 80% from 12 reports"],
@@ -130,6 +131,10 @@ def test_markdown_file_written_to_reports_dir(tmp_path: Path) -> None:
     assert "## Verdict and Confidence" in content
     assert "## MITRE ATT&CK Mapping" in content
     assert "## Recommended Next Steps" in content
+    # known tag renders with name; unknown tag renders as-is
+    assert "T1071 — Application Layer Protocol" in content
+    assert "T1999" in content
+    assert "T1999 —" not in content
 
 
 def test_existing_behavior_unchanged_without_flag(
