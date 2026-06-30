@@ -15,6 +15,10 @@ sentinel "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01
 
 # Full incident report with MITRE ATT&CK mapping (saves Markdown to reports/)
 sentinel --report "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
+
+# Web dashboard (browser UI with demo scenarios, session history, live quota)
+uvicorn sentinel.web.main:app --reload
+# then open http://localhost:8000
 ```
 
 API keys required: Anthropic (pay-per-use, fractions of a cent per run), VirusTotal (free tier), AbuseIPDB (free tier), URLhaus (free tier — get one at auth.abuse.ch).
@@ -51,6 +55,25 @@ Execution time: 2.57 seconds
 ```
 
 Two independent agents analyzed the alert. Watchman flagged the behavioral TTPs (lsass access + unsigned binary from a world-writable directory). Cipher found no external IOC to corroborate against threat intelligence — so the verdict rests on a single source (Watchman) and lands at Probable rather than Confirmed. Cipher reports the gap explicitly so you know exactly what to add to the alert to raise confidence, rather than silently dropping it.
+
+## Web Dashboard
+
+SENTINEL also ships with a browser-based dashboard — a FastAPI backend wrapping the same analysis engine, with a vanilla HTML/CSS/JS frontend. No build step, no npm, no framework.
+
+```bash
+uvicorn sentinel.web.main:app --reload
+```
+
+Open `http://localhost:8000`. The dashboard includes:
+
+- **Alert input** — paste a raw alert or pick from five pre-loaded demo scenarios (one for each verdict tier) that run entirely from local fixture data, with no live API calls
+- **Live progress** — streamed agent-by-agent status during a live analysis via Server-Sent Events
+- **Verdict display** — the same evidence chain, named blind spots, and MITRE ATT&CK tags as the CLI, rendered as readable cards instead of JSON
+- **Session history** — every alert analyzed in the current tab, with confidence tier and timing; click any row to re-expand its full evidence chain without a new request
+- **Live VirusTotal quota indicator** — remaining daily calls, visible at all times, so a live demo never runs out of quota unannounced
+- **Eval transparency footnote** — the same evaluation results from below, shown directly in the UI rather than left to a README someone may not read
+
+The web layer makes zero changes to the verdict logic in `verdict.py` or `confidence.py` — it calls the same `run_analysis()` function the CLI uses, so a given alert produces an identical verdict through either interface. The dashboard is local-only in v1: no authentication, no hosted deployment, no database. Session history lives in browser `sessionStorage` and clears when the tab closes.
 
 ## Install
 
