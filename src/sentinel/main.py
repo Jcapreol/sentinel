@@ -6,12 +6,28 @@ from typing import Any, cast
 
 from sentinel.cipher import CipherAgent
 from sentinel.confidence import TIER_MAP, calculate_tier
-from sentinel.config import ConfigError
+from sentinel.config import Config, ConfigError
 from sentinel.config import load as load_config
 from sentinel.reporter import generate_report, write_report_markdown
 from sentinel.source_registry import are_independent
-from sentinel.verdict import assemble_verdict, print_verdict
+from sentinel.verdict import VerdictSchema, assemble_verdict, print_verdict
 from sentinel.watchman import WatchmanAgent
+
+
+def run_analysis(alert_text: str, config: Config) -> VerdictSchema:
+    """Callable entry point for web layer and tests. No sys.exit(), no stdout writes."""
+    start_time = time.time()
+    watchman = WatchmanAgent(config)
+    cipher = CipherAgent(config)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        w_future = executor.submit(watchman.analyze, alert_text)
+        c_future = executor.submit(cipher.analyze, alert_text)
+        watchman_result = w_future.result()
+        cipher_result = c_future.result()
+    tier_enum = calculate_tier(watchman_result, cipher_result)
+    tier = TIER_MAP[tier_enum]
+    independence = are_independent("watchman", "cipher")
+    return assemble_verdict(watchman_result, cipher_result, tier, independence, start_time)
 
 
 def main() -> None:
