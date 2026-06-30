@@ -269,3 +269,121 @@ def test_missing_config_yields_error_event_not_crash(fake_config: "Config") -> N
     assert response.status_code == 200
     events = parse_sse(response.text)
     assert any(e["type"] == "error" for e in events)
+
+
+# ── Graceful degradation: partial agent failure → downgraded result, not error ─
+
+_PARTIAL_VERDICT = {
+    "verdict": "Investigating",
+    "confidence_tier": 1,
+    "methodology": [
+        {"agent": "watchman", "status": "success", "error": None},
+        {"agent": "cipher", "status": "error", "error": "rate_limited"},
+    ],
+    "citations": [{"source": "watchman", "finding": "Behavioral anomaly detected."}],
+    "blind_spots": [
+        {
+            "source": "virustotal",
+            "reason": "VirusTotal rate limit reached — reputation data unavailable",
+            "next_step": "Wait 60 seconds or upgrade to VirusTotal Premium",
+        }
+    ],
+    "source_independence_confirmed": False,
+    "execution_time_seconds": 2.5,
+    "timestamp": "2026-06-29T12:00:00+00:00",
+}
+
+
+def test_partial_verdict_emits_result_event_not_error(fake_config: "Config") -> None:
+    """When run_analysis() returns a partial verdict (cipher failed, watchman ok),
+    the route must emit a result event — not an error event."""
+    state_mod._config = fake_config
+    with patch("sentinel.web.routes.run_analysis", return_value=_PARTIAL_VERDICT):
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            with patch("sentinel.web.main.load_config", return_value=fake_config):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/analyze/stream",
+                        json={"alert_text": "SSH brute force on 185.220.101.45", "scenario_slug": None},
+                    )
+    events = parse_sse(response.text)
+    assert any(e["type"] == "result" for e in events)
+    assert not any(e["type"] == "error" for e in events)
+
+
+def test_partial_verdict_blind_spots_preserved_in_result_data(fake_config: "Config") -> None:
+    """Blind spots from a partial failure appear in result data, not as a top-level error event."""
+    state_mod._config = fake_config
+    with patch("sentinel.web.routes.run_analysis", return_value=_PARTIAL_VERDICT):
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            with patch("sentinel.web.main.load_config", return_value=fake_config):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/analyze/stream",
+                        json={"alert_text": "suspicious traffic", "scenario_slug": None},
+                    )
+    events = parse_sse(response.text)
+    result_event = next(e for e in events if e["type"] == "result")
+    assert len(result_event["data"]["blind_spots"]) == 1
+    assert result_event["data"]["blind_spots"][0]["source"] == "virustotal"
+
+
+def test_partial_verdict_tier_reflects_degradation(fake_config: "Config") -> None:
+    """Partial failure (VT rate-limit) downgrades tier — Investigating (1), not Confirmed (3)."""
+    state_mod._config = fake_config
+    with patch("sentinel.web.routes.run_analysis", return_value=_PARTIAL_VERDICT):
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            with patch("sentinel.web.main.load_config", return_value=fake_config):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/analyze/stream",
+                        json={"alert_text": "suspicious traffic", "scenario_slug": None},
+                    )
+    events = parse_sse(response.text)
+    result_event = next(e for e in events if e["type"] == "result")
+    assert result_event["data"]["confidence_tier"] == 1
+
+
+def test_quota_incremented_after_partial_success_with_blind_spots(fake_config: "Config") -> None:
+    """Quota counter increments after a partial verdict — VT was called even if rate-limited."""
+    state_mod._config = fake_config
+    with patch("sentinel.web.routes.run_analysis", return_value=_PARTIAL_VERDICT):
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            with patch("sentinel.web.main.load_config", return_value=fake_config):
+                with TestClient(app) as client:
+                    client.post(
+                        "/analyze/stream",
+                        json={"alert_text": "suspicious traffic", "scenario_slug": None},
+                    )
+                    quota_data = client.get("/quota").json()
+    assert quota_data["remaining"] == 499
+
+
+def test_vt_rate_limit_blind_spot_reason_names_virustotal(fake_config: "Config") -> None:
+    """The VT rate-limit blind spot source and reason correctly identify VirusTotal."""
+    state_mod._config = fake_config
+    with patch("sentinel.web.routes.run_analysis", return_value=_PARTIAL_VERDICT):
+        with patch("asyncio.sleep", new=AsyncMock(return_value=None)):
+            with patch("sentinel.web.main.load_config", return_value=fake_config):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/analyze/stream",
+                        json={"alert_text": "suspicious traffic", "scenario_slug": None},
+                    )
+    events = parse_sse(response.text)
+    result_event = next(e for e in events if e["type"] == "result")
+    vt_bs = result_event["data"]["blind_spots"][0]
+    assert vt_bs["source"] == "virustotal"
+    assert "rate limit" in vt_bs["reason"].lower()
+
+
+def test_error_event_is_terminal_no_events_follow(web_client: TestClient) -> None:
+    """After an error SSE event the stream closes immediately — the frontend finally
+    block fires and re-enables the submit button without waiting for a timeout."""
+    response = web_client.post(
+        "/analyze/stream", json={"scenario_slug": "bogus-slug"}
+    )
+    events = parse_sse(response.text)
+    error_indices = [i for i, e in enumerate(events) if e["type"] == "error"]
+    assert len(error_indices) == 1
+    assert error_indices[0] == len(events) - 1
