@@ -66,6 +66,27 @@
             hidden
             aria-label="Analysis result"
         ></section>
+
+        <!-- Session history (shown after first analysis; persists for tab lifetime) -->
+        <section
+            class="history-panel"
+            id="history-panel"
+            hidden
+            aria-label="Session history"
+        >
+            <h2 class="history-heading">Session History</h2>
+            <table class="history-table" id="history-table">
+                <thead>
+                    <tr>
+                        <th scope="col">Timestamp</th>
+                        <th scope="col">Indicator</th>
+                        <th scope="col">Tier</th>
+                        <th scope="col">Time</th>
+                    </tr>
+                </thead>
+                <tbody id="history-tbody"></tbody>
+            </table>
+        </section>
     </main>
 
     <script src="/static/app.js"></script>

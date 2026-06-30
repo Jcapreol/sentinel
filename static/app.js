@@ -212,7 +212,7 @@ function appendHistory(alertText, result) {
         history.push({
             id: Date.now(),
             timestamp: result.timestamp || new Date().toISOString(),
-            indicator: (alertText || "").slice(0, 80) || "(demo)",
+            indicator: (alertText || "").slice(0, 60) || "(demo)",
             confidence_tier: result.confidence_tier,
             execution_time: result.execution_time_seconds,
             full_result: result,
@@ -221,6 +221,39 @@ function appendHistory(alertText, result) {
     } catch (_) {
         // sessionStorage may be unavailable; silently skip
     }
+}
+
+function renderHistoryTable() {
+    var raw, history, panel, tbody, rows;
+    try {
+        raw = sessionStorage.getItem("sentinel_history");
+        history = raw ? JSON.parse(raw) : [];
+    } catch (_) {
+        return;
+    }
+    panel = document.getElementById("history-panel");
+    tbody = document.getElementById("history-tbody");
+    if (!panel || !tbody) return;
+    if (history.length === 0) {
+        panel.hidden = true;
+        return;
+    }
+    panel.hidden = false;
+    rows = history.slice().reverse().map(function(entry) {
+        var ts = entry.timestamp
+            ? new Date(entry.timestamp).toLocaleTimeString()
+            : "—";
+        var time = typeof entry.execution_time === "number"
+            ? entry.execution_time.toFixed(2) + "s"
+            : "—";
+        return "<tr class=\"history-row\">"
+            + "<td class=\"hist-ts\">" + escapeHtml(ts) + "</td>"
+            + "<td class=\"hist-indicator\">" + escapeHtml(entry.indicator || "(demo)") + "</td>"
+            + "<td class=\"hist-tier\">" + renderTierBadge(entry.confidence_tier) + "</td>"
+            + "<td class=\"hist-time\">" + escapeHtml(time) + "</td>"
+            + "</tr>";
+    });
+    tbody.innerHTML = rows.join("");
 }
 
 // ── SSE chunk parser ──────────────────────────────────────
@@ -318,6 +351,7 @@ async function handleSubmit() {
                     lastResult = msg.data;
                     showVerdict(renderVerdict(msg.data));
                     appendHistory(alertText, msg.data);
+                    renderHistoryTable();
                 } else if (msg.type === "error") {
                     showVerdict(
                         `<div class="verdict-section">
@@ -366,4 +400,7 @@ document.addEventListener("DOMContentLoaded", function() {
                 handleSubmit();
             }
         });
+
+    // Restore session history from sessionStorage on page load / refresh
+    renderHistoryTable();
 });
