@@ -246,14 +246,47 @@ function renderHistoryTable() {
         var time = typeof entry.execution_time === "number"
             ? entry.execution_time.toFixed(2) + "s"
             : "—";
-        return "<tr class=\"history-row\">"
+        var rowId = escapeHtml(String(entry.id));
+        return "<tr class=\"history-row\" data-history-id=\"" + rowId + "\" onclick=\"toggleHistoryRow(this)\" aria-expanded=\"false\">"
             + "<td class=\"hist-ts\">" + escapeHtml(ts) + "</td>"
             + "<td class=\"hist-indicator\">" + escapeHtml(entry.indicator || "(demo)") + "</td>"
             + "<td class=\"hist-tier\">" + renderTierBadge(entry.confidence_tier) + "</td>"
             + "<td class=\"hist-time\">" + escapeHtml(time) + "</td>"
+            + "</tr>"
+            + "<tr class=\"history-expand-row\" hidden>"
+            + "<td colspan=\"4\" class=\"hist-expand-content\"></td>"
             + "</tr>";
     });
     tbody.innerHTML = rows.join("");
+}
+
+function getHistoryEntryById(id) {
+    try {
+        var raw = sessionStorage.getItem("sentinel_history");
+        var history = raw ? JSON.parse(raw) : [];
+        return history.find(function(e) { return String(e.id) === String(id); }) || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function toggleHistoryRow(row) {
+    var expanded = row.getAttribute("aria-expanded") === "true";
+    var expandRow = row.nextElementSibling;
+    if (!expandRow || !expandRow.classList.contains("history-expand-row")) return;
+    var contentCell = expandRow.querySelector(".hist-expand-content");
+    if (!contentCell) return;
+    if (expanded) {
+        row.setAttribute("aria-expanded", "false");
+        expandRow.hidden = true;
+        contentCell.innerHTML = "";
+    } else {
+        var entry = getHistoryEntryById(row.getAttribute("data-history-id"));
+        if (!entry || !entry.full_result) return;
+        row.setAttribute("aria-expanded", "true");
+        expandRow.hidden = false;
+        contentCell.innerHTML = renderVerdict(entry.full_result);
+    }
 }
 
 // ── SSE chunk parser ──────────────────────────────────────
