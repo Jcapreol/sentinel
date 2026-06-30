@@ -390,9 +390,13 @@ select option { background: var(--surface-2); }
     vertical-align: middle;
 }
 
+.history-row { cursor: pointer; }
 .history-row:last-child td { border-bottom: none; }
-
 .history-row:hover td { background: var(--surface-2); }
+
+.history-expand-row td { padding: 0; border-bottom: 1px solid var(--border); }
+.history-expand-row:last-child td { border-bottom: none; }
+.hist-expand-content { padding: 1rem; background: var(--bg); }
 
 .hist-ts    { color: var(--text-muted); white-space: nowrap; }
 .hist-indicator { max-width: 28rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

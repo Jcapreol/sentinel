@@ -132,3 +132,59 @@ def test_history_table_has_tier_column() -> None:
     """History table includes a Tier column header."""
     html = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
     assert "Tier" in html
+
+
+# ── Static analysis: app.js implements row expand/collapse (Story 2.2) ────────
+
+def test_app_js_has_toggle_history_row_function() -> None:
+    """app.js defines toggleHistoryRow() for expand/collapse on row click."""
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "function toggleHistoryRow" in app_js
+
+
+def test_app_js_expand_calls_render_verdict_with_full_result() -> None:
+    """toggleHistoryRow() calls renderVerdict() with full_result — reusing verdict display logic."""
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    fn_idx = app_js.find("function toggleHistoryRow")
+    assert fn_idx != -1
+    fn_body = app_js[fn_idx : fn_idx + 2000]
+    assert "renderVerdict" in fn_body
+    assert "full_result" in fn_body
+
+
+def test_app_js_collapse_sets_hidden_true() -> None:
+    """toggleHistoryRow() sets expandRow.hidden = true when collapsing — no fetch, no network."""
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    fn_idx = app_js.find("function toggleHistoryRow")
+    assert fn_idx != -1
+    fn_body = app_js[fn_idx : fn_idx + 2000]
+    assert "hidden = true" in fn_body
+
+
+def test_app_js_no_fetch_in_toggle_history_row() -> None:
+    """toggleHistoryRow() reads full_result from sessionStorage — no network request on expansion."""
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    fn_idx = app_js.find("function toggleHistoryRow")
+    assert fn_idx != -1
+    fn_body = app_js[fn_idx : fn_idx + 2000]
+    assert "fetch(" not in fn_body
+
+
+def test_app_js_expand_reads_full_result_from_sessionstorage() -> None:
+    """Full result data for expansion comes from sessionStorage via getHistoryEntryById()."""
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "getHistoryEntryById" in app_js
+    fn_idx = app_js.find("function getHistoryEntryById")
+    assert fn_idx != -1
+    fn_body = app_js[fn_idx : fn_idx + 500]
+    assert "sessionStorage.getItem" in fn_body
+
+
+def test_history_rows_wired_with_click_handler_and_data_id() -> None:
+    """renderHistoryTable() adds data-history-id and onclick=toggleHistoryRow to each row."""
+    app_js = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    fn_idx = app_js.find("function renderHistoryTable")
+    assert fn_idx != -1
+    fn_body = app_js[fn_idx : fn_idx + 2000]
+    assert "data-history-id" in fn_body
+    assert "toggleHistoryRow" in fn_body
