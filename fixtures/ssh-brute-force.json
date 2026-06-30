@@ -1,0 +1,28 @@
+{
+  "verdict": "Investigating",
+  "confidence_tier": 1,
+  "methodology": [
+    {"agent": "watchman", "status": "success", "error": null},
+    {"agent": "cipher", "status": "success", "error": null}
+  ],
+  "citations": [
+    {
+      "source": "watchman",
+      "finding": "47 failed SSH authentication attempts within 3 minutes targeting port 22 on bastion-01. Login usernames include root, admin, ubuntu — consistent with automated dictionary brute-force (T1110.001). Severity: medium."
+    },
+    {
+      "source": "cipher",
+      "finding": "No extractable IP address in alert text; source IP redacted in log format. Threat intelligence lookups skipped."
+    }
+  ],
+  "blind_spots": [
+    {
+      "source": "cipher",
+      "reason": "Coverage gap — source IP not extractable from alert text; VirusTotal and AbuseIPDB could not be queried",
+      "next_step": "Provide raw syslog with source IP to enable threat intelligence corroboration"
+    }
+  ],
+  "source_independence_confirmed": true,
+  "execution_time_seconds": 3.891,
+  "timestamp": "2026-06-29T14:27:33.000000+00:00"
+}
