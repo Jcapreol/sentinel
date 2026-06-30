@@ -48,3 +48,43 @@ def test_fixtures_not_accessible_via_static_mount(fake_config: "Config") -> None
         with TestClient(app) as client:
             response = client.get("/static/../fixtures/lsass-credential-dumping.json")
     assert response.status_code in (400, 404)
+
+
+# ── Static file content-type tests ───────────────────────────────────────────
+
+def test_static_style_css_serves_correct_content_type(web_client: TestClient) -> None:
+    response = web_client.get("/static/style.css")
+    assert response.status_code == 200
+    assert "text/css" in response.headers["content-type"]
+
+
+def test_static_app_js_serves_correct_content_type(web_client: TestClient) -> None:
+    response = web_client.get("/static/app.js")
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
+
+
+def test_static_index_html_serves_correct_content_type(web_client: TestClient) -> None:
+    response = web_client.get("/static/index.html")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+
+
+# ── NFR8: no .env / config / source files reachable via the web server ───────
+
+def test_direct_fixtures_path_returns_404(web_client: TestClient) -> None:
+    """NFR8: fixtures/ is not mounted — direct path must return 404."""
+    response = web_client.get("/fixtures/tor-exit-node.json")
+    assert response.status_code == 404
+
+
+def test_dotenv_not_accessible_via_server(web_client: TestClient) -> None:
+    """NFR8: /.env is not a registered route — must return 404."""
+    response = web_client.get("/.env")
+    assert response.status_code == 404
+
+
+def test_src_path_traversal_via_static_blocked(web_client: TestClient) -> None:
+    """NFR8: path traversal from /static into src/ must be blocked."""
+    response = web_client.get("/static/../src/sentinel/config.py")
+    assert response.status_code in (400, 404)
