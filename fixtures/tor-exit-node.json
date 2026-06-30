@@ -1,0 +1,26 @@
+{
+  "verdict": "Confirmed",
+  "confidence_tier": 3,
+  "methodology": [
+    {"agent": "watchman", "status": "success", "error": null},
+    {"agent": "cipher", "status": "success", "error": null}
+  ],
+  "citations": [
+    {
+      "source": "watchman",
+      "finding": "Sustained outbound traffic to 185.220.101.45 on port 443 from prod-db-01. IP is a known Tor exit node. Traffic pattern (long session, encrypted, low-entropy timing) consistent with anonymised C2 communication (T1090.003)."
+    },
+    {
+      "source": "cipher",
+      "finding": "VirusTotal: 185.220.101.45 flagged by 18 engines as malicious, 3 as suspicious."
+    },
+    {
+      "source": "cipher",
+      "finding": "AbuseIPDB: 185.220.101.45 abuse confidence 97% from 1204 reports. Category: Tor exit node, C2."
+    }
+  ],
+  "blind_spots": [],
+  "source_independence_confirmed": true,
+  "execution_time_seconds": 5.831,
+  "timestamp": "2026-06-29T14:31:44.000000+00:00"
+}
