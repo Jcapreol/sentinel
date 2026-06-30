@@ -192,6 +192,7 @@ function showVerdict(html) {
     const panel = document.getElementById("verdict-panel");
     panel.innerHTML = html;
     panel.hidden = false;
+    setLoading(false);
 }
 
 function showError(message) {
