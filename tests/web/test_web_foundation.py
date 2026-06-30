@@ -88,3 +88,14 @@ def test_src_path_traversal_via_static_blocked(web_client: TestClient) -> None:
     """NFR8: path traversal from /static into src/ must be blocked."""
     response = web_client.get("/static/../src/sentinel/config.py")
     assert response.status_code in (400, 404)
+
+
+# ── FR28: Evaluation methodology footnote ────────────────────────────────────
+
+def test_eval_footnote_present_in_rendered_page(web_client: TestClient) -> None:
+    """FR28: rendered page states 10-sample evaluation set size and references reproducibility files."""
+    html = web_client.get("/").text
+    assert "10" in html, "Footnote must state the 10-sample evaluation set size"
+    assert "labeled_set.json" in html, "Footnote must reference the labeled set file"
+    assert "run_eval.py" in html, "Footnote must reference the reproducibility script"
+    assert "5" in html, "Footnote must state per-class sample count (5 benign, 5 malicious)"

@@ -425,6 +425,25 @@ select option { background: var(--surface-2); }
 .hist-tier  { white-space: nowrap; }
 .hist-time  { color: var(--text-muted); white-space: nowrap; text-align: right; }
 
+/* ── Evaluation footnote (FR28) ──────────────────────────── */
+.eval-footnote {
+    font-family: var(--font-mono);
+    font-size: 0.875rem;   /* 14px at 16px base — meets ≥14px AC */
+    color: var(--text-muted);
+    text-align: center;
+    padding: 0.75rem 0;
+    border-top: 1px solid var(--border);
+    line-height: 1.6;
+}
+
+.eval-footnote code {
+    color: var(--text);
+    background: var(--surface-2);
+    border-radius: 3px;
+    padding: 0.1em 0.35em;
+    font-size: inherit;
+}
+
 /* [hidden] utility */
 [hidden] { display: none !important; }
 
