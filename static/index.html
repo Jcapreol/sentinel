@@ -4,9 +4,70 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sentinel — AI SOC Analyst</title>
+    <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <h1>Sentinel</h1>
-    <p>Web interface coming soon.</p>
+    <header class="site-header">
+        <div class="header-inner">
+            <h1 class="logo">&#x26A1; SENTINEL</h1>
+            <p class="tagline">Multi-agent security alert corroboration engine</p>
+        </div>
+    </header>
+
+    <main class="main">
+        <!-- Input panel -->
+        <section class="input-panel" aria-label="Alert submission">
+            <div class="form-group">
+                <label for="alert-text">Security alert</label>
+                <textarea
+                    id="alert-text"
+                    rows="5"
+                    placeholder="Paste a security alert, log line, or IOC to analyze&#8230; (Ctrl+Enter to submit)"
+                    aria-label="Security alert text"
+                ></textarea>
+            </div>
+
+            <div class="form-group">
+                <label for="scenario-select">Or load a demo scenario</label>
+                <select id="scenario-select" aria-label="Demo scenario selector">
+                    <option value="">&#8212; Custom alert (live analysis) &#8212;</option>
+                    <option value="tor-exit-node">Tor Exit Node (Confirmed)</option>
+                    <option value="lsass-credential-dumping">LSASS Credential Dumping (Probable)</option>
+                    <option value="urlhaus-malware-ip">URLhaus Malware IP (Confirmed)</option>
+                    <option value="ssh-brute-force">SSH Brute Force (Investigating)</option>
+                    <option value="google-benign">Google.com DNS Query (Benign)</option>
+                </select>
+            </div>
+
+            <div class="form-actions">
+                <button id="submit-btn" type="button">Analyze</button>
+                <span class="submit-hint">Ctrl+Enter</span>
+            </div>
+        </section>
+
+        <!-- Progress panel (visible during analysis) -->
+        <section
+            class="progress-panel"
+            id="progress-panel"
+            hidden
+            aria-live="polite"
+            aria-label="Analysis progress"
+        >
+            <div class="progress-inner">
+                <span class="progress-spinner" aria-hidden="true">&#9676;</span>
+                <span id="progress-label">Initializing analysis&#8230;</span>
+            </div>
+        </section>
+
+        <!-- Verdict panel (populated and revealed by app.js) -->
+        <section
+            class="verdict-panel"
+            id="verdict-panel"
+            hidden
+            aria-label="Analysis result"
+        ></section>
+    </main>
+
+    <script src="/static/app.js"></script>
 </body>
 </html>
