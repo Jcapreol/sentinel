@@ -7,19 +7,18 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from sentinel.config import Config, ConfigError
+from sentinel.config import ConfigError
 from sentinel.config import load as load_config
+from sentinel.web import state
+from sentinel.web.routes import router
 
 _STATIC_DIR = Path(__file__).parent.parent.parent.parent / "static"
-
-_config: Config | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    global _config
     try:
-        _config = load_config()
+        state._config = load_config()
     except ConfigError as exc:
         print(f"[sentinel-web] {exc}", file=sys.stderr)
         print(
@@ -32,6 +31,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+app.include_router(router)
 
 
 @app.get("/")
