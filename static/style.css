@@ -31,7 +31,14 @@ body {
     padding: 1rem 2rem;
     background: var(--surface);
 }
-.header-inner { max-width: 1200px; margin: 0 auto; }
+.header-inner {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+}
 
 .logo {
     font-family: var(--font-mono);
@@ -46,6 +53,21 @@ body {
     color: var(--text-muted);
     margin-top: 0.15rem;
     letter-spacing: 0.03em;
+}
+
+/* ── Quota badge ─────────────────────────────────────────── */
+.quota-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35em;
+    padding: 0.3em 0.8em;
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
 }
 
 /* ── Main layout ─────────────────────────────────────────── */

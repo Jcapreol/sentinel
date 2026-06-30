@@ -35,6 +35,36 @@ function renderTierBadge(tier) {
     return `<span class="tier-badge" style="background:${cfg.color}">● ${escapeHtml(cfg.label)}</span>`;
 }
 
+// ── Quota badge ───────────────────────────────────────────
+const QUOTA_THRESHOLDS = { low: 100, critical: 25 };
+const QUOTA_STATES = {
+    healthy:  { label: "VT Quota",    color: "#3fb950" },
+    low:      { label: "VT Low",      color: "#d97706" },
+    critical: { label: "VT Critical", color: "#dc2626" },
+};
+
+function _quotaState(remaining) {
+    if (remaining < QUOTA_THRESHOLDS.critical) return QUOTA_STATES.critical;
+    if (remaining < QUOTA_THRESHOLDS.low)      return QUOTA_STATES.low;
+    return QUOTA_STATES.healthy;
+}
+
+function renderQuotaBadge(remaining, limit) {
+    var cfg = _quotaState(remaining);
+    return '<span class="quota-badge" style="background:' + cfg.color + '">● '
+        + escapeHtml(cfg.label) + ': ' + remaining + '/' + limit + '</span>';
+}
+
+function updateQuotaBadge() {
+    fetch('/quota')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var el = document.getElementById('quota-badge');
+            if (el) el.innerHTML = renderQuotaBadge(data.remaining, data.limit);
+        })
+        .catch(function() {});
+}
+
 // ── Blind spot rendering ──────────────────────────────────
 function renderBlindSpot(bs) {
     const nextStep = bs.next_step
@@ -385,6 +415,9 @@ async function handleSubmit() {
                     showVerdict(renderVerdict(msg.data));
                     appendHistory(alertText, msg.data);
                     renderHistoryTable();
+                    if (!scenarioSlug) {
+                        updateQuotaBadge();
+                    }
                 } else if (msg.type === "error") {
                     showVerdict(
                         `<div class="verdict-section">
@@ -436,4 +469,6 @@ document.addEventListener("DOMContentLoaded", function() {
 
     // Restore session history from sessionStorage on page load / refresh
     renderHistoryTable();
+    // Fetch current VT quota on page load so badge is visible immediately (FR25)
+    updateQuotaBadge();
 });
