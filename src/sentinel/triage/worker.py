@@ -8,7 +8,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Literal
 
-from sentinel.config import Config
+from sentinel.config import Config, ConfigError
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.headers import investigate_header_authentication
 from sentinel.triage.ingest import FetchFailed
@@ -16,9 +16,18 @@ from sentinel.triage.report import TriageReport
 from sentinel.triage.scoring import InconclusiveScoreError, compute_raw_score, determine_verdict
 
 
+def _require_valid_deferral_threshold(config: Config) -> None:
+    if not (0.0 <= config.deferral_threshold <= 1.0):
+        raise ConfigError(
+            f"SENTINEL_DEFERRAL_THRESHOLD must be within [0.0, 1.0], got "
+            f"{config.deferral_threshold!r}"
+        )
+
+
 def process_message(
     message_id: str, auth_results_header: str | None | FetchFailed, config: Config
 ) -> TriageReport:
+    _require_valid_deferral_threshold(config)
     message_hash = hashlib.sha256(message_id.encode()).hexdigest()
     timestamp = datetime.now(timezone.utc).isoformat()
 

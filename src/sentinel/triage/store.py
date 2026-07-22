@@ -1,0 +1,206 @@
+"""Fernet-encrypted SQLite evidence store: persistence, retention/purge,
+poll-checkpoint durability, and cross-cycle message dedup.
+
+Never persists raw email body/attachment content (FR21) — only derived
+EvidenceItems and source-identifying metadata, encrypted at rest.
+
+Two complementary, non-redundant dedup mechanisms:
+
+- ``mark_message_processed`` (ID-based, atomic) is the primary, cheap
+  mechanism. A future polling loop MUST call it *before* fetching headers,
+  fetching raw content (``ingest.fetch_raw_message_bytes``), or scoring —
+  only proceed with that expensive pipeline if it returns ``True``. This is
+  what actually avoids redundant Gmail API calls and redundant scoring work
+  for a message already handled.
+- ``evidence_records.message_hash`` (content-hash primary key, via
+  ``INSERT OR IGNORE`` in ``persist_evidence_record``) is a storage-layer
+  safety net, not a substitute for the check above. It only prevents a
+  duplicate *row* — by the time a duplicate reaches ``persist_evidence_record``,
+  the expensive work (raw-content fetch, hashing, scoring) has already run
+  again. Checking ``mark_message_processed`` *after* that work would defeat
+  its purpose entirely; the ordering above is a hard requirement for whichever
+  future story wires the polling loop (Story 1.6/1.7), not a suggestion.
+"""
+
+import json
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from typing import TypedDict, cast
+
+from cryptography.fernet import Fernet
+
+from sentinel.config import Config, ConfigError
+from sentinel.triage.report import TriageReport
+
+
+class EvidenceRecord(TypedDict):
+    message_id: str
+    sender: str | None
+    report: TriageReport
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_records (
+            message_hash TEXT PRIMARY KEY,
+            verdict_json BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            schema_version INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS poll_checkpoint (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            since_history_id TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processed_message_ids (
+            message_id TEXT PRIMARY KEY,
+            processed_at TEXT NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def _require_valid_retention_days(config: Config) -> None:
+    if config.retention_days <= 0:
+        raise ConfigError(
+            f"SENTINEL_RETENTION_DAYS must be a positive integer, got "
+            f"{config.retention_days!r}"
+        )
+
+
+def _require_fernet(config: Config) -> Fernet:
+    if not config.evidence_encryption_key:
+        raise ConfigError("Missing required environment variable: SENTINEL_EVIDENCE_KEY")
+    try:
+        return Fernet(config.evidence_encryption_key.encode())
+    except Exception as e:
+        raise ConfigError(
+            "SENTINEL_EVIDENCE_KEY is not a valid Fernet key. Generate one with: "
+            'python -c "from cryptography.fernet import Fernet; '
+            'print(Fernet.generate_key().decode())"'
+        ) from e
+
+
+def persist_evidence_record(
+    db_path: str, message_hash: str, record: EvidenceRecord, config: Config
+) -> None:
+    fernet = _require_fernet(config)
+    _require_valid_retention_days(config)
+    plaintext = json.dumps(record).encode()
+    encrypted = fernet.encrypt(plaintext)
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=config.retention_days)
+
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO evidence_records "
+            "(message_hash, verdict_json, created_at, expires_at, schema_version) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                message_hash,
+                encrypted,
+                now.isoformat(),
+                expires_at.isoformat(),
+                record["report"]["schema_version"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def read_evidence_record(
+    db_path: str, message_hash: str, config: Config
+) -> EvidenceRecord | None:
+    fernet = _require_fernet(config)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT verdict_json FROM evidence_records WHERE message_hash = ?",
+            (message_hash,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    plaintext = fernet.decrypt(row[0])
+    return cast(EvidenceRecord, json.loads(plaintext))
+
+
+def purge_expired(db_path: str, config: Config) -> int:
+    _require_valid_retention_days(config)
+    now = datetime.now(timezone.utc)
+    processed_ids_cutoff = (now - timedelta(days=config.retention_days)).isoformat()
+
+    conn = _connect(db_path)
+    try:
+        cursor = conn.execute(
+            "DELETE FROM evidence_records WHERE expires_at < ?", (now.isoformat(),)
+        )
+        deleted = cursor.rowcount
+        conn.execute(
+            "DELETE FROM processed_message_ids WHERE processed_at < ?",
+            (processed_ids_cutoff,),
+        )
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def save_history_checkpoint(db_path: str, history_id: str) -> None:
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO poll_checkpoint (id, since_history_id) VALUES (1, ?)",
+            (history_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_history_checkpoint(db_path: str) -> str | None:
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT since_history_id FROM poll_checkpoint WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row is not None else None
+
+
+def mark_message_processed(db_path: str, message_id: str) -> bool:
+    """Call this BEFORE fetching headers, fetching raw content
+    (ingest.fetch_raw_message_bytes), or scoring — only proceed with that
+    work if this returns True. This is the cheap, ID-based check that avoids
+    redundant Gmail API calls for a message already handled; it is not
+    equivalent to relying on persist_evidence_record's content-hash
+    INSERT OR IGNORE, which only prevents a duplicate row after the
+    expensive work has already run again."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO processed_message_ids (message_id, processed_at) VALUES (?, ?)",
+            (message_id, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()

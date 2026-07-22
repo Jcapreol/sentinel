@@ -22,6 +22,8 @@ class Config:
     poll_interval_seconds: int = 300
     deferral_threshold: float = 0.05  # PROVISIONAL: pre-Epic-3 placeholder — FR15 wants this
     # eval-harness-derived, but the eval harness (Story 3.2) doesn't exist yet. Revisit then.
+    evidence_encryption_key: str | None = None
+    retention_days: int = 30
 
 
 def load() -> Config:
@@ -49,11 +51,20 @@ def load() -> Config:
 
     deferral_threshold_raw = os.environ.get("SENTINEL_DEFERRAL_THRESHOLD")
     deferral_threshold = float(deferral_threshold_raw) if deferral_threshold_raw else 0.05
-    if not (0.0 <= deferral_threshold <= 1.0):
-        raise ConfigError(
-            f"SENTINEL_DEFERRAL_THRESHOLD must be within [0.0, 1.0], got "
-            f"{deferral_threshold_raw!r}"
-        )
+    # Deliberately NOT range-validated here — deferral_threshold is a triage-only
+    # concern, like the Gmail fields and retention_days. load() is shared by the
+    # CLI and web dashboard, which never use it; validating it here would mean a
+    # bad SENTINEL_DEFERRAL_THRESHOLD breaks their startup too. Validated lazily
+    # at first actual use in sentinel.triage.worker.process_message.
+
+    retention_days_raw = os.environ.get("SENTINEL_RETENTION_DAYS")
+    retention_days = int(retention_days_raw) if retention_days_raw else 30
+    # Deliberately NOT range-validated here — retention_days is a triage-only
+    # concern, like the Gmail fields. load() is shared by the CLI and web
+    # dashboard, which never use it; validating it here would mean a bad
+    # SENTINEL_RETENTION_DAYS breaks their startup too. Validated lazily at
+    # first actual use in sentinel.triage.store, mirroring
+    # build_gmail_service()'s fail-fast-at-point-of-use pattern.
 
     return Config(
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
@@ -65,4 +76,6 @@ def load() -> Config:
         gmail_monitored_mailbox=os.environ.get("GMAIL_MONITORED_MAILBOX"),
         poll_interval_seconds=poll_interval,
         deferral_threshold=deferral_threshold,
+        evidence_encryption_key=os.environ.get("SENTINEL_EVIDENCE_KEY"),
+        retention_days=retention_days,
     )

@@ -92,3 +92,14 @@ attempting any poll — it will not start in a partially-configured state.
   header (SPF/DKIM/DMARC) rather than performing independent
   cryptographic/DNS verification. See `src/sentinel/triage/headers.py` for
   details on this named blind spot.
+- **To compute a tamper-evident hash for each stored evidence record,
+  Sentinel transiently reads the full raw message content** — headers, body,
+  and any attachments — via Gmail's `format="raw"`. This is a materially
+  broader read than the header-only fetches used everywhere else in the
+  pipeline. The raw content is hashed (SHA-256) and immediately discarded:
+  it is never persisted to disk, never logged, and never included in any
+  exception message. Only the resulting hash is stored, alongside the
+  derived evidence. Your organization's consent/legal documentation (see
+  "Legal boundary" above) should account for the fact that Sentinel reads
+  full message content transiently, not just headers, even though only a
+  hash of it is ever retained.

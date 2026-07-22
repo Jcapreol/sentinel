@@ -1,6 +1,8 @@
 import hashlib
 
-from sentinel.config import Config
+import pytest
+
+from sentinel.config import Config, ConfigError
 from sentinel.triage.ingest import FetchFailed, fetch_headers_for_messages
 from sentinel.triage.worker import process_message
 
@@ -125,3 +127,32 @@ def test_process_message_end_to_end_fetch_failure_never_yields_directional_verdi
     report = process_message("m1", fetch_results["m1"], _config())
 
     assert report["verdict"] == "Deferred"
+
+
+def test_process_message_raises_config_error_when_deferral_threshold_above_range() -> None:
+    with pytest.raises(ConfigError, match="SENTINEL_DEFERRAL_THRESHOLD"):
+        process_message("m1", "spf=pass", _config(deferral_threshold=1.5))
+
+
+def test_process_message_raises_config_error_when_deferral_threshold_below_range() -> None:
+    with pytest.raises(ConfigError, match="SENTINEL_DEFERRAL_THRESHOLD"):
+        process_message("m1", "spf=pass", _config(deferral_threshold=-0.1))
+
+
+def test_bad_deferral_threshold_does_not_affect_cli_web_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad SENTINEL_DEFERRAL_THRESHOLD must not break config.load() (the shared
+    entry point CLI/web dashboard call) — only triage's own process_message, which
+    is the only consumer of this field, validates it."""
+    from sentinel.config import load
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.setenv("SENTINEL_DEFERRAL_THRESHOLD", "1.5")
+
+    config = load()  # must not raise — CLI/web dashboard startup unaffected
+
+    assert config.anthropic_api_key == "ak-test"

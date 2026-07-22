@@ -11,6 +11,9 @@ _bmad-output/
 *.key
 secrets/
 
+# Evidence store — encrypted customer data, never committed
+data/
+
 # Python
 __pycache__/
 *.py[cod]
