@@ -12,6 +12,8 @@ dependencies = [
     "python-dotenv==1.2.2",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
+    "google-api-python-client==2.187.0",
+    "google-auth==2.56.2",
 ]
 
 [project.optional-dependencies]
@@ -35,6 +37,10 @@ mypy_path = "src"
 
 [[tool.mypy.overrides]]
 module = "dotenv"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["googleapiclient.*", "google.oauth2.*"]
 ignore_missing_imports = true
 
 [tool.ruff]
