@@ -135,6 +135,36 @@ def test_determine_verdict_raises_on_exactly_canceling_evidence(
         determine_verdict(score)
 
 
+def test_determine_verdict_deferral_band_defaults_to_zero_preserves_existing_behavior() -> None:
+    # 0.5 + 0.01 is far enough from the neutral prior that only a non-zero
+    # deferral_band would catch it — default behavior must NOT raise here.
+    assert determine_verdict(0.51) == "Malicious"
+
+
+def test_determine_verdict_raises_inside_nonzero_deferral_band() -> None:
+    with pytest.raises(InconclusiveScoreError):
+        determine_verdict(0.52, deferral_band=0.05)
+
+
+def test_determine_verdict_does_not_raise_at_exact_deferral_band_boundary() -> None:
+    # abs(0.55 - 0.5) == 0.05 == deferral_band; boundary is strict '<', not '<='
+    assert determine_verdict(0.55, deferral_band=0.05) == "Malicious"
+
+
+def test_determine_verdict_does_not_raise_just_outside_deferral_band() -> None:
+    assert determine_verdict(0.56, deferral_band=0.05) == "Malicious"
+
+
+def test_determine_verdict_rejects_threshold_out_of_range() -> None:
+    with pytest.raises(ValueError, match="threshold"):
+        determine_verdict(0.7, threshold=1.5)
+
+
+def test_determine_verdict_rejects_deferral_band_out_of_range() -> None:
+    with pytest.raises(ValueError, match="deferral_band"):
+        determine_verdict(0.7, deferral_band=-0.1)
+
+
 def test_scoring_never_imports_confidence() -> None:
     source_path = Path(__file__).resolve().parents[2] / "src" / "sentinel" / "triage" / "scoring.py"
     tree = ast.parse(source_path.read_text())
