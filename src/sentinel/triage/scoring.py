@@ -37,10 +37,23 @@ def compute_raw_score(evidence: list[EvidenceItem]) -> float:
     return (normalized + 1.0) / 2.0  # range [0.0, 1.0]
 
 
-def determine_verdict(score: float, threshold: float = 0.5) -> Literal["Malicious", "Benign"]:
-    if math.isclose(score, _NEUTRAL_PRIOR, abs_tol=1e-9):
+def determine_verdict(
+    score: float,
+    threshold: float = 0.5,
+    deferral_band: float = 0.0,
+) -> Literal["Malicious", "Benign"]:
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError(f"threshold must be within [0.0, 1.0], got {threshold!r}")
+    if not (0.0 <= deferral_band <= 1.0):
+        raise ValueError(f"deferral_band must be within [0.0, 1.0], got {deferral_band!r}")
+
+    if (
+        math.isclose(score, _NEUTRAL_PRIOR, abs_tol=1e-9)
+        or abs(score - _NEUTRAL_PRIOR) < deferral_band
+    ):
         raise InconclusiveScoreError(
-            "score has no directional signal (evidence was empty, all-neutral, or exactly "
-            "canceling) — caller must route to a deferred outcome, not a directional verdict"
+            "score has no directional signal (evidence was empty, all-neutral, exactly "
+            "canceling, or within the configured deferral band around the neutral prior) — "
+            "caller must route to a deferred outcome, not a directional verdict"
         )
     return "Malicious" if score >= threshold else "Benign"
