@@ -417,6 +417,25 @@ def test_get_header_returns_none_when_only_untrusted_authserv_id_present(mocker)
     assert result is None
 
 
+def test_get_header_retries_on_429_then_succeeds(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=429)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        HttpError(resp, b"rate limited"),
+        {
+            "payload": {
+                "headers": [{"name": "Authentication-Results", "value": "mx.google.com; spf=pass"}]
+            }
+        },
+    ]
+    sleep = mocker.patch("sentinel.triage.ingest.time.sleep")
+
+    result = get_authentication_results_header(service, "soc@example.com", "m1")
+
+    assert result == "mx.google.com; spf=pass"
+    sleep.assert_called_once()
+
+
 # --- fetch_headers_for_messages (AC7) -----------------------------------------
 
 
@@ -438,6 +457,28 @@ def test_fetch_headers_for_messages_isolates_per_message_failure(mocker) -> None
     assert isinstance(results["m1"], FetchFailed)
     assert results["m1"] is not None
     assert results["m2"] == "spf=pass"
+
+
+def test_fetch_headers_for_messages_retry_exhaustion_yields_fetchfailed_not_crash_or_none(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    # Sustained rate limiting on messages.get() must fail safe to FetchFailed —
+    # never crash fetch_headers_for_messages, and never silently collapse to
+    # None (which headers.py would treat as a genuine "no header" result).
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=429)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        HttpError(resp, b"rate limited")
+    )
+    sleep = mocker.patch("sentinel.triage.ingest.time.sleep")
+
+    results = fetch_headers_for_messages(service, "soc@example.com", [{"id": "m1"}])
+
+    assert isinstance(results["m1"], FetchFailed)
+    assert results["m1"] is not None
+    # Proves retries actually happened before giving up, not just that any
+    # exception is caught — sleep is called once per retry attempt.
+    assert sleep.call_count == 3
 
 
 def test_fetch_headers_for_messages_all_succeed(mocker) -> None:  # type: ignore[no-untyped-def]
