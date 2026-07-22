@@ -14,11 +14,15 @@ own execution time) but the next cycle's ``since_history_id`` is the earlier,
 pre-``history.list()`` checkpoint — so that same message is included again next
 cycle. This means a message can be triaged more than once. At-least-once is the
 correct default for this pipeline (silently dropping a message is worse than
-processing it twice); nothing in this module deduplicates across poll cycles.
-Cross-cycle dedup by message ID is scoped to Story 1.5 (persistence), which is
-where a durable "already processed" record can actually live.
+processing it twice). This module itself does not deduplicate across poll
+cycles — ``sentinel.triage.store.mark_message_processed`` is the primitive a
+future polling loop calls before running the pipeline for a message, to skip
+one already seen.
 """
 
+import base64
+import email
+import hashlib
 import sys
 import time
 from typing import Any
@@ -217,3 +221,31 @@ def fetch_headers_for_messages(
             )
             results[message_id] = FetchFailed()
     return results
+
+
+def fetch_raw_message_bytes(service: Any, mailbox: str, message_id: str) -> bytes:
+    """Fetches the full raw RFC 822 message content, decoded from Gmail's
+    base64url encoding. A materially broader read than the header-only
+    metadata fetches used elsewhere in this module — used only transiently to
+    derive a sender header and a tamper-evident content hash for the
+    persisted record (see sentinel.triage.store). The raw bytes returned by
+    this function must never be logged, and any caller must discard them
+    immediately after deriving what it needs — never write them to disk,
+    never include them in an exception message or print statement.
+    """
+    response = _execute_with_retry(
+        service.users().messages().get(userId=mailbox, id=message_id, format="raw")
+    )
+    raw = response["raw"]
+    raw += "=" * (-len(raw) % 4)  # Gmail's base64url payload can arrive unpadded
+    return base64.urlsafe_b64decode(raw)
+
+
+def extract_sender_and_content_hash(raw_bytes: bytes) -> tuple[str | None, str]:
+    """Pure function, no network call. Parses the From header and computes a
+    SHA-256 content hash from raw message bytes already fetched by
+    fetch_raw_message_bytes."""
+    parsed = email.message_from_bytes(raw_bytes)
+    sender = parsed.get("From")
+    content_hash = hashlib.sha256(raw_bytes).hexdigest()
+    return sender, content_hash

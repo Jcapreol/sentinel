@@ -1,4 +1,6 @@
 import ast
+import base64
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -9,7 +11,9 @@ from sentinel.config import Config, ConfigError
 from sentinel.triage.ingest import (
     FetchFailed,
     build_gmail_service,
+    extract_sender_and_content_hash,
     fetch_headers_for_messages,
+    fetch_raw_message_bytes,
     get_authentication_results_header,
     poll_new_messages,
 )
@@ -508,6 +512,84 @@ def test_fetch_headers_for_messages_skips_message_missing_id(mocker) -> None:  #
 
     assert results == {"m2": "spf=pass"}
     mock_get_header.assert_called_once_with(service, "soc@example.com", "m2")
+
+
+# --- fetch_raw_message_bytes / extract_sender_and_content_hash ----------------
+
+
+def test_fetch_raw_message_bytes_decodes_base64url(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    raw_content = b"From: alice@example.com\r\nSubject: test\r\n\r\nbody"
+    encoded = base64.urlsafe_b64encode(raw_content).decode()
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "raw": encoded
+    }
+
+    result = fetch_raw_message_bytes(service, "soc@example.com", "m1")
+
+    assert result == raw_content
+
+
+def test_fetch_raw_message_bytes_handles_unpadded_base64url(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    raw_content = b"From: alice@example.com\r\nSubject: test\r\n\r\nbody"
+    encoded = base64.urlsafe_b64encode(raw_content).decode().rstrip("=")
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "raw": encoded
+    }
+
+    result = fetch_raw_message_bytes(service, "soc@example.com", "m1")
+
+    assert result == raw_content
+
+
+def test_fetch_raw_message_bytes_retries_on_429_then_succeeds(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    raw_content = b"From: alice@example.com\r\n\r\nbody"
+    encoded = base64.urlsafe_b64encode(raw_content).decode()
+    resp = mocker.MagicMock(status=429)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        HttpError(resp, b"rate limited"),
+        {"raw": encoded},
+    ]
+    sleep = mocker.patch("sentinel.triage.ingest.time.sleep")
+
+    result = fetch_raw_message_bytes(service, "soc@example.com", "m1")
+
+    assert result == raw_content
+    sleep.assert_called_once()
+
+
+def test_fetch_raw_message_bytes_does_not_retry_on_403(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=403)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        HttpError(resp, b"forbidden")
+    )
+    sleep = mocker.patch("sentinel.triage.ingest.time.sleep")
+
+    with pytest.raises(HttpError):
+        fetch_raw_message_bytes(service, "soc@example.com", "m1")
+
+    sleep.assert_not_called()
+
+
+def test_extract_sender_and_content_hash_returns_sender_and_hash() -> None:
+    raw_bytes = b"From: alice@example.com\r\nSubject: test\r\n\r\nbody"
+
+    sender, content_hash = extract_sender_and_content_hash(raw_bytes)
+
+    assert sender == "alice@example.com"
+    assert content_hash == hashlib.sha256(raw_bytes).hexdigest()
+
+
+def test_extract_sender_and_content_hash_no_from_header_still_hashes() -> None:
+    raw_bytes = b"Subject: test\r\n\r\nbody"
+
+    sender, content_hash = extract_sender_and_content_hash(raw_bytes)
+
+    assert sender is None
+    assert content_hash == hashlib.sha256(raw_bytes).hexdigest()
 
 
 # --- structural / boundary checks --------------------------------------------
