@@ -4,6 +4,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Protocol, TypedDict
 
+from sentinel.triage.evidence import EvidenceItem
+
 
 class BlindSpot(TypedDict):
     source: str
@@ -21,6 +23,7 @@ class _AgentResultRequired(TypedDict):
 
 class AgentResult(_AgentResultRequired, total=False):
     mitre_tags: list[str]
+    evidence: list[EvidenceItem]
 
 
 class _VerdictSchemaRequired(TypedDict):
