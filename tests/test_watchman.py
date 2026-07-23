@@ -1,7 +1,10 @@
 import anthropic
+import pytest
 from pytest_mock import MockerFixture
 
 from sentinel.config import Config
+from sentinel.triage.evidence import EvidenceItem
+from sentinel.triage.scoring import compute_raw_score
 from sentinel.verdict import SentinelAgent
 from sentinel.watchman import WatchmanAgent
 
@@ -31,7 +34,42 @@ def test_watchman_success(
         assert item["name"] == "watchman_finding"
         assert item["finding"] == finding_text
         assert item["direction"] == "malicious"
-        assert item["weight"] == 0.5  # _CONFIDENCE_WEIGHT["Probable"]
+        # 2026-07-23, Story 2.2: weight-averaged per finding (tier_weight / len(findings))
+        # to fix the correlated-evidence score inflation deferred from Story 2.1's review.
+        assert item["weight"] == 0.25  # _CONFIDENCE_WEIGHT["Probable"] (0.5) / 2 findings
+
+
+def test_watchman_correlated_evidence_weight_averaging_fixes_score_inflation(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """Deferred from Story 2.1's code review (see deferred-work.md): N findings
+    from ONE Watchman inference must not inflate its influence on
+    compute_raw_score proportional to finding-count. Reproduces the exact
+    worked example from deferred-work.md -- 5 findings at "Confirmed"
+    (weight=0.7 each pre-fix) combined with one weight=0.45/benign header item
+    produced ~0.886 pre-fix vs ~0.609 for the same signal collapsed to 1
+    finding. Post-fix, both must produce the same score."""
+    header_evidence = [
+        EvidenceItem(name="dmarc_check", finding="DMARC pass", weight=0.45, direction="benign")
+    ]
+
+    def _watchman_evidence(num_findings: int) -> list[EvidenceItem]:
+        findings_json = ", ".join(f'"Finding {i}"' for i in range(num_findings))
+        mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+        mock_response = mocker.MagicMock()
+        mock_response.content[0].text = (
+            f'{{"findings": [{findings_json}], "confidence": "Confirmed"}}'
+        )
+        mock_anthropic.return_value.messages.create.return_value = mock_response
+        agent = WatchmanAgent(config=fake_config)
+        result = agent.analyze(sample_alert)
+        return result["evidence"]
+
+    score_one_finding = compute_raw_score(header_evidence + _watchman_evidence(1))
+    score_five_findings = compute_raw_score(header_evidence + _watchman_evidence(5))
+
+    assert score_one_finding == pytest.approx(score_five_findings, abs=1e-9)
+    assert score_one_finding == pytest.approx(0.609, abs=0.01)
 
 
 def test_watchman_unrecognized_confidence_yields_neutral_uninformative_evidence(
@@ -55,6 +93,76 @@ def test_watchman_unrecognized_confidence_yields_neutral_uninformative_evidence(
     assert result["evidence"][0]["direction"] == "neutral"
     assert result["evidence"][0]["weight"] == 0.10
     assert result["evidence"][0]["finding"] == "Unusual login time"
+
+
+def test_watchman_unhashable_confidence_does_not_crash(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """A malformed but valid-JSON response where "confidence" is a list/dict
+    (not a str) must not crash _CONFIDENCE_WEIGHT.get(confidence) with
+    TypeError: unhashable type -- it must be treated the same as any other
+    unrecognized confidence value (neutral/uninformative), not misreported
+    as error="analysis_failed"."""
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = (
+        '{"findings": ["Unusual login time"], "confidence": ["High"]}'
+    )
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+
+    agent = WatchmanAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["error"] is None
+    assert len(result["evidence"]) == 1
+    assert result["evidence"][0]["direction"] == "neutral"
+    assert result["evidence"][0]["weight"] == 0.10
+    assert result["evidence"][0]["finding"] == "Unusual login time"
+
+
+def test_watchman_non_string_finding_elements_are_filtered_out(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """The prompt instructs Claude to emit a findings array of strings, but
+    only the outer list type is validated at runtime. A non-string element
+    (e.g. a nested object) must not flow into EvidenceItem.finding (typed
+    str) or AgentResult.findings (typed list[str])."""
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = (
+        '{"findings": ["Unusual login time", {"nested": "object"}, 42],'
+        ' "confidence": "Probable"}'
+    )
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+
+    agent = WatchmanAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["findings"] == ["Unusual login time"]
+    assert len(result["evidence"]) == 1
+    assert result["evidence"][0]["finding"] == "Unusual login time"
+
+
+def test_watchman_empty_and_whitespace_only_findings_are_filtered_out(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """2026-07-23 code-review patch: the isinstance(f, str) filter excludes
+    non-string types but not empty/whitespace-only strings, which would
+    still count toward len(findings) in the weight-averaging division,
+    diluting a genuinely malicious finding's weight for free."""
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = (
+        '{"findings": ["Unusual login time", "", "   "], "confidence": "Probable"}'
+    )
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+
+    agent = WatchmanAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["findings"] == ["Unusual login time"]
+    assert len(result["evidence"]) == 1
+    assert result["evidence"][0]["weight"] == 0.5  # not diluted by the 2 blank entries
 
 
 def test_watchman_empty_findings_yields_single_neutral_evidence_item(
