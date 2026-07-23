@@ -10,10 +10,12 @@ import math
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from types import FrameType
 from typing import Literal
 
+from sentinel.cipher import CipherAgent
 from sentinel.config import Config, ConfigError
 from sentinel.config import load as load_config
 from sentinel.triage.evidence import EvidenceItem
@@ -21,6 +23,7 @@ from sentinel.triage.headers import investigate_header_authentication
 from sentinel.triage.ingest import (
     FetchFailed,
     build_gmail_service,
+    extract_email_content,
     extract_sender_and_content_hash,
     fetch_headers_for_messages,
     fetch_raw_message_bytes,
@@ -37,6 +40,8 @@ from sentinel.triage.store import (
     read_evidence_record,
     save_history_checkpoint,
 )
+from sentinel.verdict import SentinelAgent
+from sentinel.watchman import WatchmanAgent
 
 _DEFAULT_DB_PATH = "data/evidence.db"
 
@@ -64,7 +69,12 @@ def _require_valid_poll_interval(config: Config) -> None:
 
 
 def process_message(
-    message_id: str, auth_results_header: str | None | FetchFailed, config: Config
+    message_id: str,
+    auth_results_header: str | None | FetchFailed,
+    email_content: str,
+    watchman: SentinelAgent,
+    cipher: SentinelAgent,
+    config: Config,
 ) -> TriageReport:
     _require_valid_deferral_threshold(config)
     message_hash = hashlib.sha256(message_id.encode()).hexdigest()
@@ -74,7 +84,8 @@ def process_message(
         # A fetch failure carries no header data — never evidence, always a
         # deferred/coverage-gap outcome, the same way InconclusiveScoreError is
         # routed. Short-circuits before investigate_header_authentication /
-        # compute_raw_score / determine_verdict are ever called.
+        # compute_raw_score / determine_verdict — and now the Watchman/Cipher
+        # calls below, too — are ever reached.
         return TriageReport(
             verdict="Deferred",
             calibrated_confidence=0.5,
@@ -92,7 +103,46 @@ def process_message(
             timestamp=timestamp,
         )
 
-    evidence = investigate_header_authentication(auth_results_header)
+    header_evidence = investigate_header_authentication(auth_results_header)
+
+    # Watchman (LLM behavioral analysis) and Cipher (VT/AbuseIPDB/URLhaus
+    # reputation lookups) run concurrently, mirroring main.py's run_analysis
+    # precedent exactly. Both shipped SentinelAgent implementations are
+    # guaranteed to never raise and always populate `evidence` -- but
+    # process_message is deliberately typed against the bare SentinelAgent
+    # Protocol (not the concrete classes), which enforces neither guarantee.
+    # A third-party agent violating either one degrades to a coverage-gap
+    # evidence item here, matching every other failure path in this
+    # pipeline, rather than crashing (2026-07-23 code-review patch).
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        watchman_future = executor.submit(watchman.analyze, email_content)
+        cipher_future = executor.submit(cipher.analyze, email_content)
+        try:
+            watchman_evidence = watchman_future.result().get("evidence", [])
+        except Exception as e:
+            watchman_evidence = [
+                EvidenceItem(
+                    name="watchman_analysis",
+                    finding=f"Watchman analysis crashed unexpectedly: {type(e).__name__} — "
+                    "behavioral analysis unavailable",
+                    weight=0.0,
+                    direction="neutral",
+                )
+            ]
+        try:
+            cipher_evidence = cipher_future.result().get("evidence", [])
+        except Exception as e:
+            cipher_evidence = [
+                EvidenceItem(
+                    name="cipher_analysis",
+                    finding=f"Cipher analysis crashed unexpectedly: {type(e).__name__} — "
+                    "threat intelligence lookup unavailable",
+                    weight=0.0,
+                    direction="neutral",
+                )
+            ]
+
+    evidence = header_evidence + watchman_evidence + cipher_evidence
     raw_score = compute_raw_score(evidence)
 
     verdict: Literal["Malicious", "Benign", "Deferred"]
@@ -111,7 +161,19 @@ def process_message(
     )
 
 
-def run_poll_cycle(config: Config, db_path: str) -> None:
+def run_poll_cycle(
+    config: Config, db_path: str, watchman: SentinelAgent, cipher: SentinelAgent
+) -> None:
+    """`watchman`/`cipher` are caller-provided (not instantiated here) so a
+    caller invoking this repeatedly -- run_continuous_loop's `while True`
+    loop -- can build each agent exactly once and reuse it across every
+    cycle. CipherAgent/WatchmanAgent hold an httpx.Client/anthropic.Anthropic
+    client with no explicit .close() anywhere in this codebase (the old
+    one-shot CLI never needed one); instantiating fresh ones inside this
+    function would leak a pair of unclosed clients every poll interval for
+    the worker's entire lifetime (2026-07-23 code-review patch -- the
+    original per-cycle placement only eliminated the per-message version of
+    this leak, not the per-cycle one)."""
     service = build_gmail_service(config)
     mailbox = config.gmail_monitored_mailbox
     if mailbox is None:
@@ -192,7 +254,10 @@ def run_poll_cycle(config: Config, db_path: str) -> None:
                 )
             else:
                 sender, content_hash = extract_sender_and_content_hash(raw_bytes)
-                report = process_message(message_id, auth_results_header, config)
+                email_content = extract_email_content(raw_bytes)
+                report = process_message(
+                    message_id, auth_results_header, email_content, watchman, cipher, config
+                )
 
             record = EvidenceRecord(
                 message_id=message_id,
@@ -270,9 +335,13 @@ def run_continuous_loop(config: Config, db_path: str) -> None:
     """
     _require_valid_poll_interval(config)
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    # Instantiated once for the loop's entire lifetime, not once per cycle --
+    # see run_poll_cycle's docstring for why (2026-07-23 code-review patch).
+    watchman = WatchmanAgent(config)
+    cipher = CipherAgent(config)
     while True:
         try:
-            run_poll_cycle(config, db_path)
+            run_poll_cycle(config, db_path, watchman, cipher)
         except KeyboardInterrupt:
             # Ignore further SIGTERM immediately: a second SIGTERM landing
             # while this block is still running (e.g. mid-print) would
@@ -418,7 +487,7 @@ def _run() -> None:
         return  # unreachable in practice; kept for explicit control flow
 
     if args.once:
-        run_poll_cycle(config, args.db_path)
+        run_poll_cycle(config, args.db_path, WatchmanAgent(config), CipherAgent(config))
         sys.exit(0)
 
     run_continuous_loop(config, args.db_path)

@@ -18,6 +18,7 @@ from sentinel.triage.store import (
     read_evidence_record,
 )
 from sentinel.triage.worker import main, process_message, run_continuous_loop, run_poll_cycle
+from sentinel.verdict import AgentResult, SentinelAgent
 
 
 def _config(deferral_threshold: float = 0.05) -> Config:
@@ -30,10 +31,30 @@ def _config(deferral_threshold: float = 0.05) -> Config:
     )
 
 
+class _NeutralAgent:
+    """SentinelAgent stub contributing zero evidence -- process_message's
+    header-directional tests stay driven purely by header evidence, exactly
+    as before Story 2.2's pipeline wiring (empty evidence list means nothing
+    is added to the merged evidence fed to compute_raw_score)."""
+
+    def analyze(self, input_data: str) -> AgentResult:
+        return AgentResult(
+            source_name="stub",
+            findings=[],
+            blind_spots=[],
+            raw_confidence=None,
+            error=None,
+            evidence=[],
+        )
+
+
+_neutral_agent: SentinelAgent = _NeutralAgent()
+
+
 def test_process_message_malicious_header_returns_malicious_verdict() -> None:
     header = "spf=fail; dkim=fail; dmarc=fail"
 
-    report = process_message("m1", header, _config())
+    report = process_message("m1", header, "", _neutral_agent, _neutral_agent, _config())
 
     assert report["verdict"] == "Malicious"
     assert len(report["evidence"]) > 0
@@ -42,13 +63,13 @@ def test_process_message_malicious_header_returns_malicious_verdict() -> None:
 def test_process_message_benign_header_returns_benign_verdict() -> None:
     header = "spf=pass; dkim=pass; dmarc=pass"
 
-    report = process_message("m1", header, _config())
+    report = process_message("m1", header, "", _neutral_agent, _neutral_agent, _config())
 
     assert report["verdict"] == "Benign"
 
 
 def test_process_message_no_header_defers() -> None:
-    report = process_message("m1", None, _config())
+    report = process_message("m1", None, "", _neutral_agent, _neutral_agent, _config())
 
     assert report["verdict"] == "Deferred"
     assert len(report["evidence"]) > 0
@@ -62,7 +83,9 @@ def test_process_message_score_inside_deferral_band_defers() -> None:
     # on the exact-neutral case already covered by test_process_message_no_header_defers.
     header = "dmarc=pass; spf=fail"
 
-    report = process_message("m1", header, _config(deferral_threshold=0.05))
+    report = process_message(
+        "m1", header, "", _neutral_agent, _neutral_agent, _config(deferral_threshold=0.05)
+    )
 
     assert report["verdict"] == "Deferred"
     assert abs(report["calibrated_confidence"] - 0.5) < 0.05
@@ -72,13 +95,15 @@ def test_process_message_never_raises_inconclusive_score_error() -> None:
     # Empty/neutral evidence would raise InconclusiveScoreError inside
     # determine_verdict — process_message must catch it internally, never
     # propagate it to the caller.
-    report = process_message("m1", None, _config())
+    report = process_message("m1", None, "", _neutral_agent, _neutral_agent, _config())
 
     assert report["verdict"] == "Deferred"
 
 
 def test_process_message_message_hash_is_deterministic_sha256_of_message_id() -> None:
-    report = process_message("abc-123", "spf=pass", _config())
+    report = process_message(
+        "abc-123", "spf=pass", "", _neutral_agent, _neutral_agent, _config()
+    )
 
     assert report["message_hash"] == hashlib.sha256(b"abc-123").hexdigest()
 
@@ -86,13 +111,13 @@ def test_process_message_message_hash_is_deterministic_sha256_of_message_id() ->
 def test_process_message_produces_no_disk_io(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.chdir(tmp_path)
 
-    process_message("m1", "spf=pass", _config())
+    process_message("m1", "spf=pass", "", _neutral_agent, _neutral_agent, _config())
 
     assert list(tmp_path.iterdir()) == []
 
 
 def test_process_message_schema_version_is_one() -> None:
-    report = process_message("m1", "spf=pass", _config())
+    report = process_message("m1", "spf=pass", "", _neutral_agent, _neutral_agent, _config())
 
     assert report["schema_version"] == 1
 
@@ -101,7 +126,9 @@ def test_process_message_fetch_failed_defers_never_directional() -> None:
     # A header fetch failure (Story 1.3's FetchFailed sentinel) must never be
     # treated as evidence — it must always defer, the same way
     # InconclusiveScoreError does, regardless of deferral_threshold.
-    report = process_message("m1", FetchFailed(), _config())
+    report = process_message(
+        "m1", FetchFailed(), "", _neutral_agent, _neutral_agent, _config()
+    )
 
     assert report["verdict"] == "Deferred"
     assert report["verdict"] != "Malicious"
@@ -113,7 +140,7 @@ def test_process_message_fetch_failed_never_calls_header_investigation(mocker) -
     # ever called — a fetch failure carries no header data to investigate.
     spy = mocker.patch("sentinel.triage.worker.investigate_header_authentication")
 
-    process_message("m1", FetchFailed(), _config())
+    process_message("m1", FetchFailed(), "", _neutral_agent, _neutral_agent, _config())
 
     spy.assert_not_called()
 
@@ -122,7 +149,9 @@ def test_process_message_fetch_failed_with_extreme_deferral_threshold_still_defe
     # Even with deferral_threshold=0.0 (the narrowest possible band), a
     # FetchFailed must still defer — this is a hard routing rule, not a
     # side effect of the band width.
-    report = process_message("m1", FetchFailed(), _config(deferral_threshold=0.0))
+    report = process_message(
+        "m1", FetchFailed(), "", _neutral_agent, _neutral_agent, _config(deferral_threshold=0.0)
+    )
 
     assert report["verdict"] == "Deferred"
 
@@ -137,19 +166,124 @@ def test_process_message_end_to_end_fetch_failure_never_yields_directional_verdi
     )
 
     fetch_results = fetch_headers_for_messages(service, "soc@example.com", [{"id": "m1"}])
-    report = process_message("m1", fetch_results["m1"], _config())
+    report = process_message(
+        "m1", fetch_results["m1"], "", _neutral_agent, _neutral_agent, _config()
+    )
 
     assert report["verdict"] == "Deferred"
 
 
 def test_process_message_raises_config_error_when_deferral_threshold_above_range() -> None:
     with pytest.raises(ConfigError, match="SENTINEL_DEFERRAL_THRESHOLD"):
-        process_message("m1", "spf=pass", _config(deferral_threshold=1.5))
+        process_message(
+            "m1", "spf=pass", "", _neutral_agent, _neutral_agent, _config(deferral_threshold=1.5)
+        )
 
 
 def test_process_message_raises_config_error_when_deferral_threshold_below_range() -> None:
     with pytest.raises(ConfigError, match="SENTINEL_DEFERRAL_THRESHOLD"):
-        process_message("m1", "spf=pass", _config(deferral_threshold=-0.1))
+        process_message(
+            "m1", "spf=pass", "", _neutral_agent, _neutral_agent, _config(deferral_threshold=-0.1)
+        )
+
+
+def test_process_message_aggregates_evidence_from_headers_watchman_and_cipher() -> None:
+    """AC4: proves the verdict function correctly aggregates all three
+    sources, not just header evidence -- the actual point of this story's
+    pipeline wiring, per AC4's own wording."""
+
+    class _MaliciousStub:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        def analyze(self, input_data: str) -> AgentResult:
+            return AgentResult(
+                source_name=self._name,
+                findings=["synthetic malicious finding"],
+                blind_spots=[],
+                raw_confidence="Confirmed",
+                error=None,
+                evidence=[
+                    EvidenceItem(
+                        # Deliberately generic/synthetic name, not a real
+                        # CipherAgent/WatchmanAgent evidence name -- this test
+                        # validates Protocol-level aggregation, not either
+                        # concrete agent's literal output shape.
+                        name="stub_finding",
+                        finding="synthetic malicious finding",
+                        weight=0.7,
+                        direction="malicious",
+                    )
+                ],
+            )
+
+    watchman_stub: SentinelAgent = _MaliciousStub("watchman")
+    cipher_stub: SentinelAgent = _MaliciousStub("cipher")
+    header = "spf=fail"  # malicious, weight 0.40 alone -> not enough for "Malicious" verdict
+
+    header_only_report = process_message(
+        "m1", header, "", _neutral_agent, _neutral_agent, _config()
+    )
+    combined_report = process_message(
+        "m1", header, "synthetic email content", watchman_stub, cipher_stub, _config()
+    )
+
+    watchman_names = {item["name"] for item in combined_report["evidence"]}
+    # Names are deliberately synthetic/generic ("stub_finding"), not real
+    # CipherAgent/WatchmanAgent output shapes -- this test validates
+    # SentinelAgent Protocol-level aggregation (per the Testing Standards
+    # section above), not either concrete agent's exact evidence naming.
+    assert len([n for n in watchman_names if n == "stub_finding"]) >= 1
+    # Combined score must reflect all three sources' weighted contribution,
+    # not just the header's -- strictly more malicious-leaning than header alone.
+    assert combined_report["calibrated_confidence"] > header_only_report["calibrated_confidence"]
+
+
+def test_process_message_agent_crash_degrades_to_coverage_gap_not_raising() -> None:
+    """2026-07-23 code-review patch: process_message previously called
+    .result() unguarded, resting on an unenforced comment claiming
+    SentinelAgent.analyze() never raises -- true for the two shipped
+    agents, but not enforced by the bare Protocol process_message is
+    deliberately typed against. A third-party agent violating that
+    assumption must degrade to a coverage-gap evidence item, matching every
+    other failure path in this pipeline, not crash process_message."""
+
+    class _CrashingAgent:
+        def analyze(self, input_data: str) -> AgentResult:
+            raise RuntimeError("simulated third-party agent crash")
+
+    crashing_agent: SentinelAgent = _CrashingAgent()
+
+    report = process_message(
+        "m1", "spf=pass", "content", crashing_agent, _neutral_agent, _config()
+    )
+
+    assert report["verdict"] in ("Malicious", "Benign", "Deferred")
+    assert any("crashed" in item["finding"].lower() for item in report["evidence"])
+
+
+def test_process_message_agent_missing_evidence_key_does_not_crash() -> None:
+    """A Protocol-conforming agent that omits the optional `evidence` key
+    entirely (legal per AgentResult's total=False) must not raise a
+    KeyError inside process_message."""
+
+    class _IncompleteAgent:
+        def analyze(self, input_data: str) -> AgentResult:
+            return AgentResult(
+                source_name="incomplete",
+                findings=[],
+                blind_spots=[],
+                raw_confidence=None,
+                error=None,
+            )
+
+    incomplete_agent: SentinelAgent = _IncompleteAgent()
+
+    report = process_message(
+        "m1", "spf=pass", "content", incomplete_agent, _neutral_agent, _config()
+    )
+
+    assert report["verdict"] in ("Malicious", "Benign", "Deferred")
 
 
 def test_bad_deferral_threshold_does_not_affect_cli_web_startup(
@@ -386,6 +520,25 @@ def test_replay_legacy_record_missing_deferral_threshold_used_exits_nonzero_with
 # --- run_poll_cycle --------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _stub_watchman_cipher(mocker):  # type: ignore[no-untyped-def]
+    """run_poll_cycle now instantiates WatchmanAgent/CipherAgent once per
+    cycle (Story 2.2) -- autouse so every run_poll_cycle test below is
+    protected from real Anthropic/VT/AbuseIPDB/URLhaus network calls without
+    editing each test individually. Mocked at the class level (same
+    boundary-mocking convention as test_watchman.py/test_cipher.py). Returns
+    both mocks so a test needing specific evidence can further configure
+    `.return_value.analyze.return_value` itself."""
+    stub_result = AgentResult(
+        source_name="stub", findings=[], blind_spots=[], raw_confidence=None, error=None, evidence=[]
+    )
+    mock_watchman = mocker.patch("sentinel.triage.worker.WatchmanAgent")
+    mock_watchman.return_value.analyze.return_value = stub_result
+    mock_cipher = mocker.patch("sentinel.triage.worker.CipherAgent")
+    mock_cipher.return_value.analyze.return_value = stub_result
+    return mock_watchman, mock_cipher
+
+
 def _gmail_config(store_config: Config) -> Config:
     return replace(
         store_config,
@@ -419,7 +572,7 @@ def test_run_poll_cycle_persists_one_new_message(
         {"raw": encoded},
     ]
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     content_hash = hashlib.sha256(raw_content).hexdigest()
     record = read_evidence_record(store_db_path, content_hash, config)
@@ -454,7 +607,7 @@ def test_run_poll_cycle_skips_already_processed_message(
     }
     spy = mocker.patch("sentinel.triage.worker.process_message")
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     spy.assert_not_called()
 
@@ -488,7 +641,7 @@ def test_run_poll_cycle_is_message_processed_failure_is_per_message_not_cycle_le
         side_effect=RuntimeError("simulated database is locked"),
     )
 
-    run_poll_cycle(config, store_db_path)  # must not raise/crash the cycle
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise/crash the cycle
 
 
 def test_run_poll_cycle_saves_new_checkpoint(
@@ -505,7 +658,7 @@ def test_run_poll_cycle_saves_new_checkpoint(
         "historyId": "5000"
     }
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     assert load_history_checkpoint(store_db_path) == "5000"
 
@@ -523,7 +676,7 @@ def test_run_poll_cycle_calls_purge_expired(
     }
     spy = mocker.patch("sentinel.triage.worker.purge_expired")
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     spy.assert_called_once_with(store_db_path, config)
 
@@ -551,7 +704,7 @@ def test_run_poll_cycle_raw_fetch_failure_persists_deferred_coverage_gap(
         RuntimeError("boom"),
     ]
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     fallback_hash = hashlib.sha256(b"m1").hexdigest()
     record = read_evidence_record(store_db_path, fallback_hash, config)
@@ -590,7 +743,7 @@ def test_run_poll_cycle_raw_fetch_failure_does_not_stop_remaining_messages(
         {"raw": encoded_m2},  # m2 raw fetch ok
     ]
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     content_hash_m2 = hashlib.sha256(raw_content_m2).hexdigest()
     record_m2 = read_evidence_record(store_db_path, content_hash_m2, config)
@@ -634,7 +787,7 @@ def test_run_poll_cycle_persist_failure_does_not_permanently_mark_processed(
         side_effect=RuntimeError("simulated DB failure"),
     )
 
-    run_poll_cycle(config, store_db_path)  # must not raise/crash the cycle
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise/crash the cycle
 
     # Nothing was ever committed for "m1" -- persist_evidence_record's atomic
     # write never completed, so a future poll cycle will correctly retry it.
@@ -678,7 +831,7 @@ def test_run_poll_cycle_persist_failure_does_not_advance_checkpoint_past_it(
         side_effect=RuntimeError("simulated DB failure"),
     )
 
-    run_poll_cycle(config, store_db_path)
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     # Must stay at the OLD checkpoint ("999"), not advance to the new one
     # ("1000") -- otherwise the next cycle's history.list(startHistoryId="1000")
@@ -730,7 +883,7 @@ def test_run_poll_cycle_print_failure_after_persist_does_not_misclassify_success
     mocker.patch("builtins.print", side_effect=flaky_print)
 
     with pytest.raises(BrokenPipeError):
-        run_poll_cycle(config, store_db_path)
+        run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
     content_hash = hashlib.sha256(raw_content).hexdigest()
     record = read_evidence_record(store_db_path, content_hash, config)
@@ -781,7 +934,7 @@ def test_run_poll_cycle_persist_failure_for_one_message_does_not_stop_remaining_
 
     mocker.patch("sentinel.triage.worker.persist_evidence_record", side_effect=flaky_persist)
 
-    run_poll_cycle(config, store_db_path)  # must not raise/crash the cycle
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise/crash the cycle
 
     content_hash_m2 = hashlib.sha256(raw_content_m2).hexdigest()
     record_m2 = read_evidence_record(store_db_path, content_hash_m2, config)
@@ -941,6 +1094,39 @@ def test_run_continuous_loop_sleeps_for_configured_poll_interval(
     run_continuous_loop(config, store_db_path)
 
     sleep_spy.assert_called_once_with(42)
+
+
+def test_run_continuous_loop_instantiates_agents_once_not_per_cycle(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """2026-07-23 code-review patch: WatchmanAgent/CipherAgent (and their
+    underlying httpx.Client/anthropic.Anthropic clients, never explicitly
+    closed anywhere in this codebase) were previously instantiated inside
+    run_poll_cycle, meaning every poll cycle -- not just every message --
+    created and abandoned a fresh pair. Must now be built once for the
+    loop's entire lifetime and reused across every cycle."""
+    config = store_config
+    run_poll_cycle_spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    mock_watchman_cls = mocker.patch("sentinel.triage.worker.WatchmanAgent")
+    mock_cipher_cls = mocker.patch("sentinel.triage.worker.CipherAgent")
+    mocker.patch("sentinel.triage.worker.signal.signal")
+    # 3 cycles, then interrupt -- proves reuse across MULTIPLE cycles, not
+    # just that construction happens before the first one.
+    mocker.patch(
+        "sentinel.triage.worker.time.sleep",
+        side_effect=[None, None, KeyboardInterrupt],
+    )
+
+    run_continuous_loop(config, store_db_path)
+
+    mock_watchman_cls.assert_called_once_with(config)
+    mock_cipher_cls.assert_called_once_with(config)
+    assert run_poll_cycle_spy.call_count == 3
+    for call in run_poll_cycle_spy.call_args_list:
+        assert call.args[2] is mock_watchman_cls.return_value
+        assert call.args[3] is mock_cipher_cls.return_value
 
 
 @pytest.mark.parametrize("bad_interval", [0, -1, -300])

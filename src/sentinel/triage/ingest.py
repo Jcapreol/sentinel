@@ -23,8 +23,11 @@ one already seen.
 import base64
 import email
 import hashlib
+import re
 import sys
 import time
+from email.header import decode_header
+from email.message import Message
 from typing import Any
 
 from google.oauth2 import service_account
@@ -249,3 +252,114 @@ def extract_sender_and_content_hash(raw_bytes: bytes) -> tuple[str | None, str]:
     sender = parsed.get("From")
     content_hash = hashlib.sha256(raw_bytes).hexdigest()
     return sender, content_hash
+
+
+_TAG_PATTERN = re.compile(r"<[^>]+>")
+_HREF_PATTERN = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+
+def _decode_part(part: Message) -> str:
+    payload = part.get_payload(decode=True)
+    if not isinstance(payload, bytes):
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def _decode_subject(raw_subject: str) -> str:
+    """Decodes RFC 2047 MIME-encoded-word Subject headers (e.g.
+    '=?UTF-8?B?...?='). email.message_from_bytes's default Compat32 policy
+    returns these verbatim otherwise, hiding urgency/homoglyph phishing
+    language deliberately placed in the subject line."""
+    try:
+        pieces = decode_header(raw_subject)
+    except Exception:
+        return raw_subject
+    decoded: list[str] = []
+    for text, charset in pieces:
+        if isinstance(text, bytes):
+            try:
+                decoded.append(text.decode(charset or "utf-8", errors="replace"))
+            except LookupError:
+                decoded.append(text.decode("utf-8", errors="replace"))
+        else:
+            decoded.append(text)
+    return "".join(decoded)
+
+
+def _strip_html(html: str) -> str:
+    """Strips tag markup but preserves hyperlink targets (href values) as
+    trailing plain text. A blanket tag-removal regex would otherwise delete
+    an <a href="..."> URL along with the tag itself -- for an HTML-only
+    phishing email using generic anchor text ("click here"), that silently
+    destroys the one thing CipherAgent's IOC extraction depends on."""
+    hrefs = _HREF_PATTERN.findall(html)
+    stripped = _TAG_PATTERN.sub(" ", html)
+    if hrefs:
+        stripped += "\n" + "\n".join(hrefs)
+    return stripped
+
+
+def _extract_body(parsed: Message) -> str:
+    """Best-effort body extraction, deliberately isolated from Subject
+    extraction (see extract_email_content) so a body-parsing failure doesn't
+    discard an already-obtained Subject."""
+    text_plain: str | None = None
+    text_html: str | None = None
+    if parsed.is_multipart():
+        for part in parsed.walk():
+            if part.get_content_disposition() == "attachment":
+                continue
+            content_type = part.get_content_type()
+            if content_type == "text/plain" and text_plain is None:
+                text_plain = _decode_part(part)
+            elif content_type == "text/html" and text_html is None:
+                text_html = _decode_part(part)
+    elif parsed.get_content_type() == "text/html":
+        text_html = _decode_part(parsed)
+    elif parsed.get_content_maintype() == "text":
+        text_plain = _decode_part(parsed)
+    # else: non-text single-part body (e.g. application/pdf, image/png) --
+    # deliberately not decoded as text; nothing extractable from it.
+
+    if text_plain:
+        return text_plain
+    if text_html:
+        return _strip_html(text_html)
+    return ""
+
+
+def extract_email_content(raw_bytes: bytes) -> str:
+    """Pure function, no network call. Extracts a best-effort analyzable text
+    blob (Subject + body) from raw message bytes already fetched by
+    fetch_raw_message_bytes, for WatchmanAgent/CipherAgent to analyze.
+
+    Same discipline as fetch_raw_message_bytes: the returned text must never be
+    logged or persisted directly -- it is only ever passed transiently into
+    WatchmanAgent.analyze()/CipherAgent.analyze(), whose own outputs (LLM
+    findings, IOC-derived strings) are what eventually get persisted, never
+    this raw text itself. Never raises -- degrades to the best-effort text it
+    could extract (possibly empty Subject and/or body) rather than propagate a
+    parse failure into run_poll_cycle's per-message loop. Subject and body
+    extraction are independently guarded so a failure in one does not discard
+    an already-obtained result from the other.
+    """
+    try:
+        parsed = email.message_from_bytes(raw_bytes)
+    except Exception:
+        return "Subject: \n\n"
+
+    try:
+        subject = _decode_subject(parsed.get("Subject", ""))
+    except Exception:
+        subject = ""
+
+    try:
+        body = _extract_body(parsed)
+    except Exception:
+        body = ""
+
+    return f"Subject: {subject}\n\n{body}"

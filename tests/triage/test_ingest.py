@@ -11,6 +11,7 @@ from sentinel.config import Config, ConfigError
 from sentinel.triage.ingest import (
     FetchFailed,
     build_gmail_service,
+    extract_email_content,
     extract_sender_and_content_hash,
     fetch_headers_for_messages,
     fetch_raw_message_bytes,
@@ -590,6 +591,186 @@ def test_extract_sender_and_content_hash_no_from_header_still_hashes() -> None:
 
     assert sender is None
     assert content_hash == hashlib.sha256(raw_bytes).hexdigest()
+
+
+# --- extract_email_content -----------------------------------------------------
+
+
+def test_extract_email_content_plain_text_single_part() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: Urgent invoice overdue\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"Please pay immediately via http://evil.example.com/pay"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Subject: Urgent invoice overdue" in content
+    assert "Please pay immediately via http://evil.example.com/pay" in content
+
+
+def test_extract_email_content_prefers_text_plain_part_in_multipart() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b'Content-Type: multipart/alternative; boundary="BOUNDARY"\r\n\r\n'
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"plain body text\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><body>html body text</body></html>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "plain body text" in content
+    assert "<html>" not in content
+
+
+def test_extract_email_content_falls_back_to_html_when_no_text_plain_part() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><body>click <a href='http://evil.example.com'>here</a></body></html>"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "click" in content
+    assert "here" in content
+    assert "<html>" not in content
+    assert "<a href" not in content
+
+
+def test_extract_email_content_no_text_part_returns_best_effort_empty_body() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n\r\n'
+        b"--BOUNDARY\r\n"
+        b"Content-Type: application/pdf\r\n\r\n"
+        b"%PDF-1.4 binary garbage\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Subject: test" in content
+
+
+def test_extract_email_content_includes_subject_header() -> None:
+    raw_bytes = b"Subject: Account verification needed\r\n\r\nbody text"
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Account verification needed" in content
+
+
+def test_extract_email_content_missing_subject_does_not_raise() -> None:
+    raw_bytes = b"From: alice@example.com\r\n\r\nbody text"
+
+    content = extract_email_content(raw_bytes)
+
+    assert "body text" in content
+
+
+def test_extract_email_content_never_raises_on_garbage_bytes() -> None:
+    raw_bytes = b"\xff\xfe\x00\x01 not a valid email at all"
+
+    content = extract_email_content(raw_bytes)
+
+    assert isinstance(content, str)
+
+
+def test_extract_email_content_preserves_href_url_when_stripping_html_tags() -> None:
+    """2026-07-23 code-review patch: a blanket tag-removal regex previously
+    deleted <a href="..."> entirely, losing the malicious URL for an
+    HTML-only phishing email using generic anchor text ("click here") --
+    defeating CipherAgent's IOC extraction, the core purpose of Story 2.2."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b'<html><body>click <a href="http://evil.example.com/pay">here</a></body></html>'
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "http://evil.example.com/pay" in content
+
+
+def test_extract_email_content_non_text_single_part_body_is_not_decoded_as_text() -> None:
+    """2026-07-23 code-review patch: a non-multipart, non-text body (e.g.
+    application/pdf) was previously force-decoded as UTF-8 plain text,
+    feeding decoded binary noise into the LLM prompt."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: application/pdf\r\n\r\n"
+        b"%PDF-1.4 \xff\xfe binary garbage not text"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "PDF" not in content
+    assert "binary garbage" not in content
+
+
+def test_extract_email_content_decodes_rfc2047_encoded_subject() -> None:
+    """2026-07-23 code-review patch: RFC 2047 MIME-encoded-word Subject
+    headers were previously returned verbatim (base64-looking gibberish),
+    hiding urgency/homoglyph phishing language placed in the subject line."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: =?UTF-8?B?VXJnZW50IEFjdGlvbiBSZXF1aXJlZCE=?=\r\n\r\n"
+        b"body text"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Urgent Action Required!" in content
+    assert "=?UTF-8?B?" not in content
+
+
+def test_extract_email_content_body_failure_does_not_discard_subject(mocker) -> None:  # type: ignore[no-untyped-def]
+    """2026-07-23 code-review patch: the function-wide try/except was
+    all-or-nothing -- a failure extracting the body discarded an
+    already-successfully-extracted Subject too, contradicting the
+    docstring's 'best-effort' claim."""
+    mocker.patch("sentinel.triage.ingest._extract_body", side_effect=RuntimeError("boom"))
+    raw_bytes = b"Subject: Account verification needed\r\n\r\nbody text"
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Account verification needed" in content
+
+
+def test_extract_email_content_skips_attachment_parts() -> None:
+    """2026-07-23 code-review patch: a text/plain attachment preceding the
+    real message body in MIME structure was previously indistinguishable
+    from the actual body and would be analyzed instead of it."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b'Content-Type: multipart/mixed; boundary="BOUNDARY"\r\n\r\n'
+        b"--BOUNDARY\r\n"
+        b'Content-Type: text/plain\r\n'
+        b'Content-Disposition: attachment; filename="notes.txt"\r\n\r\n'
+        b"unrelated attachment content\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/plain\r\n\r\n"
+        b"the real message body\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "the real message body" in content
+    assert "unrelated attachment content" not in content
 
 
 # --- structural / boundary checks --------------------------------------------
