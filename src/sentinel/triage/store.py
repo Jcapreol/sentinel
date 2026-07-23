@@ -25,6 +25,7 @@ Two complementary, non-redundant dedup mechanisms:
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import TypedDict, cast
 
 from cryptography.fernet import Fernet
@@ -37,9 +38,13 @@ class EvidenceRecord(TypedDict):
     message_id: str
     sender: str | None
     report: TriageReport
+    deferral_threshold_used: float
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
+    parent = Path(db_path).parent
+    if str(parent) not in ("", "."):
+        parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -202,5 +207,21 @@ def mark_message_processed(db_path: str, message_id: str) -> bool:
         return True
     except sqlite3.IntegrityError:
         return False
+    finally:
+        conn.close()
+
+
+def unmark_message_processed(db_path: str, message_id: str) -> None:
+    """Rolls back a mark_message_processed claim. Callers MUST call this if
+    anything fails between a successful mark_message_processed claim and a
+    confirmed-successful persist_evidence_record for the same message —
+    otherwise the message is permanently lost: marked processed, but no
+    evidence record ever exists, and no future poll cycle will ever retry it."""
+    conn = _connect(db_path)
+    try:
+        conn.execute(
+            "DELETE FROM processed_message_ids WHERE message_id = ?", (message_id,)
+        )
+        conn.commit()
     finally:
         conn.close()
