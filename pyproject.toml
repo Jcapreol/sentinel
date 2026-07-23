@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 sentinel = "sentinel.main:main"
+sentinel-triage = "sentinel.triage.worker:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

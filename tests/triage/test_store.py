@@ -38,11 +38,13 @@ def _make_record(
     message_id: str = "m1",
     sender: str | None = "alice@example.com",
     report: TriageReport | None = None,
+    deferral_threshold_used: float = 0.05,
 ) -> EvidenceRecord:
     return EvidenceRecord(
         message_id=message_id,
         sender=sender,
         report=report if report is not None else _make_report(),
+        deferral_threshold_used=deferral_threshold_used,
     )
 
 
