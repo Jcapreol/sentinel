@@ -15,8 +15,8 @@ pre-``history.list()`` checkpoint — so that same message is included again nex
 cycle. This means a message can be triaged more than once. At-least-once is the
 correct default for this pipeline (silently dropping a message is worse than
 processing it twice). This module itself does not deduplicate across poll
-cycles — ``sentinel.triage.store.mark_message_processed`` is the primitive a
-future polling loop calls before running the pipeline for a message, to skip
+cycles — ``sentinel.triage.store.is_message_processed`` is the primitive the
+polling loop calls before running the pipeline for a message, to skip
 one already seen.
 """
 

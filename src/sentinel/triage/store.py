@@ -6,10 +6,10 @@ EvidenceItems and source-identifying metadata, encrypted at rest.
 
 Two complementary, non-redundant dedup mechanisms:
 
-- ``mark_message_processed`` (ID-based, atomic) is the primary, cheap
-  mechanism. A future polling loop MUST call it *before* fetching headers,
-  fetching raw content (``ingest.fetch_raw_message_bytes``), or scoring —
-  only proceed with that expensive pipeline if it returns ``True``. This is
+- ``is_message_processed`` (ID-based, read-only) is the primary, cheap
+  mechanism. A polling loop MUST call it *before* fetching headers, fetching
+  raw content (``ingest.fetch_raw_message_bytes``), or scoring — only
+  proceed with that expensive pipeline if it returns ``False``. This is
   what actually avoids redundant Gmail API calls and redundant scoring work
   for a message already handled.
 - ``evidence_records.message_hash`` (content-hash primary key, via
@@ -17,9 +17,19 @@ Two complementary, non-redundant dedup mechanisms:
   safety net, not a substitute for the check above. It only prevents a
   duplicate *row* — by the time a duplicate reaches ``persist_evidence_record``,
   the expensive work (raw-content fetch, hashing, scoring) has already run
-  again. Checking ``mark_message_processed`` *after* that work would defeat
-  its purpose entirely; the ordering above is a hard requirement for whichever
-  future story wires the polling loop (Story 1.6/1.7), not a suggestion.
+  again.
+
+``persist_evidence_record`` is the ONLY place ``processed_message_ids`` is
+ever written — it inserts the evidence row and the processed-ID row in a
+single transaction (one connection, one commit). This is deliberate: a
+message is recorded as processed if and only if its evidence was also
+durably persisted, in the very same atomic write. There is no separate
+"claim" step, so there is no crash window where a hard process kill
+(SIGKILL, OOM, power loss) between two writes could leave a message marked
+processed with no evidence record to show for it — a residual risk flagged
+during Story 1.6's code review (which could only guard against catchable
+Python exceptions, never a hard kill) and closed here (2026-07-22, Story 1.7
+follow-up).
 """
 
 import json
@@ -100,6 +110,11 @@ def _require_fernet(config: Config) -> Fernet:
 def persist_evidence_record(
     db_path: str, message_hash: str, record: EvidenceRecord, config: Config
 ) -> None:
+    """Atomically persists the evidence record AND marks record["message_id"]
+    processed, in a single transaction (one connection, one commit). If
+    anything fails before the commit — including a hard process kill — NEITHER
+    row is written: the message is naturally retried by a future poll cycle,
+    since is_message_processed will correctly report it as not yet processed."""
     fernet = _require_fernet(config)
     _require_valid_retention_days(config)
     plaintext = json.dumps(record).encode()
@@ -121,6 +136,11 @@ def persist_evidence_record(
                 expires_at.isoformat(),
                 record["report"]["schema_version"],
             ),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_message_ids (message_id, processed_at) "
+            "VALUES (?, ?)",
+            (record["message_id"], now.isoformat()),
         )
         conn.commit()
     finally:
@@ -189,39 +209,21 @@ def load_history_checkpoint(db_path: str) -> str | None:
     return row[0] if row is not None else None
 
 
-def mark_message_processed(db_path: str, message_id: str) -> bool:
+def is_message_processed(db_path: str, message_id: str) -> bool:
     """Call this BEFORE fetching headers, fetching raw content
-    (ingest.fetch_raw_message_bytes), or scoring — only proceed with that
-    work if this returns True. This is the cheap, ID-based check that avoids
-    redundant Gmail API calls for a message already handled; it is not
-    equivalent to relying on persist_evidence_record's content-hash
-    INSERT OR IGNORE, which only prevents a duplicate row after the
-    expensive work has already run again."""
+    (ingest.fetch_raw_message_bytes), or scoring — skip that work if this
+    returns True. This is the cheap, ID-based check that avoids redundant
+    Gmail API calls for a message already handled; it is not equivalent to
+    relying on persist_evidence_record's content-hash INSERT OR IGNORE,
+    which only prevents a duplicate row after the expensive work has already
+    run again. Read-only: never writes to processed_message_ids —
+    persist_evidence_record is the only writer, atomically alongside the
+    evidence row."""
     conn = _connect(db_path)
     try:
-        conn.execute(
-            "INSERT INTO processed_message_ids (message_id, processed_at) VALUES (?, ?)",
-            (message_id, datetime.now(timezone.utc).isoformat()),
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-    finally:
-        conn.close()
-
-
-def unmark_message_processed(db_path: str, message_id: str) -> None:
-    """Rolls back a mark_message_processed claim. Callers MUST call this if
-    anything fails between a successful mark_message_processed claim and a
-    confirmed-successful persist_evidence_record for the same message —
-    otherwise the message is permanently lost: marked processed, but no
-    evidence record ever exists, and no future poll cycle will ever retry it."""
-    conn = _connect(db_path)
-    try:
-        conn.execute(
-            "DELETE FROM processed_message_ids WHERE message_id = ?", (message_id,)
-        )
-        conn.commit()
+        row = conn.execute(
+            "SELECT 1 FROM processed_message_ids WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
