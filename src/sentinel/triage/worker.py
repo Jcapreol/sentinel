@@ -1,15 +1,17 @@
 """Single-message triage pipeline (investigate -> score -> verdict -> report)
-plus the sentinel-triage CLI entry point: --once (one poll cycle) and
---replay <message_hash> (audit a stored verdict). The continuous default-loop
-mode is not implemented here — it requires Story 1.7's per-message failure
-isolation, which does not exist yet.
+plus the sentinel-triage CLI entry point and its three modes: the default
+continuous poll loop (run_continuous_loop), --once (one poll cycle), and
+--replay <message_hash> (audit a stored verdict).
 """
 
 import argparse
 import hashlib
 import math
+import signal
 import sys
+import time
 from datetime import datetime, timezone
+from types import FrameType
 from typing import Literal
 
 from sentinel.config import Config, ConfigError
@@ -28,13 +30,12 @@ from sentinel.triage.report import TriageReport
 from sentinel.triage.scoring import InconclusiveScoreError, compute_raw_score, determine_verdict
 from sentinel.triage.store import (
     EvidenceRecord,
+    is_message_processed,
     load_history_checkpoint,
-    mark_message_processed,
     persist_evidence_record,
     purge_expired,
     read_evidence_record,
     save_history_checkpoint,
-    unmark_message_processed,
 )
 
 _DEFAULT_DB_PATH = "data/evidence.db"
@@ -45,6 +46,20 @@ def _require_valid_deferral_threshold(config: Config) -> None:
         raise ConfigError(
             f"SENTINEL_DEFERRAL_THRESHOLD must be within [0.0, 1.0], got "
             f"{config.deferral_threshold!r}"
+        )
+
+
+def _require_valid_poll_interval(config: Config) -> None:
+    """Validated lazily at first actual use (run_continuous_loop), mirroring
+    deferral_threshold/retention_days -- poll_interval_seconds is a
+    triage-only concern and load_config() is shared by the CLI/web
+    dashboard, which never read it (2026-07-22 code-review follow-up: a
+    negative value crashed on the first time.sleep() call; zero produced a
+    busy-loop hammering the Gmail API)."""
+    if config.poll_interval_seconds <= 0:
+        raise ConfigError(
+            f"SENTINEL_POLL_INTERVAL must be a positive integer, got "
+            f"{config.poll_interval_seconds!r}"
         )
 
 
@@ -114,20 +129,33 @@ def run_poll_cycle(config: Config, db_path: str) -> None:
     any_failures = False
     for message in messages:
         message_id = message["id"]
-        if not mark_message_processed(db_path, message_id):
-            print(
-                f"[worker] Skipping already-processed message {message_id!r}",
-                file=sys.stderr,
-            )
-            continue
 
-        # Everything from here through persist_evidence_record is wrapped:
-        # mark_message_processed above already claimed message_id. If anything
-        # below raises before persist_evidence_record confirms success, the
-        # claim MUST be rolled back (unmark_message_processed) — otherwise the
-        # message is permanently lost: marked processed, but no evidence
-        # record ever exists, and no future poll cycle will ever retry it.
+        # is_message_processed is deliberately INSIDE this try (not checked
+        # before it): if the read itself raises (e.g. a transient sqlite
+        # lock), that must be treated as a per-message failure like any
+        # other -- not escalated to run_continuous_loop as a cycle-level
+        # "PERSISTENT FAILURE", which would kill the whole worker over a
+        # single message's bookkeeping hiccup (2026-07-22 code-review
+        # follow-up). `continue` from inside a `try` skips both `except` and
+        # `else` (verified: no exception occurred, and control never falls
+        # through to the end of the try body), so the "already processed"
+        # skip below is neither a failure nor a persisted-success.
+        #
+        # Nothing below writes to the store until persist_evidence_record's
+        # single atomic commit at the very end, which durably records both
+        # the evidence AND the processed-message-id together. A failure
+        # anywhere in this block -- including a hard process kill -- simply
+        # means nothing was recorded for this message, and it is naturally
+        # retried by a future poll cycle (is_message_processed above will
+        # correctly report it as not yet processed).
         try:
+            if is_message_processed(db_path, message_id):
+                print(
+                    f"[worker] Skipping already-processed message {message_id!r}",
+                    file=sys.stderr,
+                )
+                continue
+
             header_results = fetch_headers_for_messages(service, mailbox, [message])
             auth_results_header = header_results[message_id]
 
@@ -174,53 +202,40 @@ def run_poll_cycle(config: Config, db_path: str) -> None:
             )
             persist_evidence_record(db_path, content_hash, record, config)
         except Exception as e:
-            # unmark_message_processed's own call is wrapped separately below:
-            # if the rollback itself fails, that is a different, worse failure
-            # mode than the one that triggered it (see the nested try/except).
-            try:
-                unmark_message_processed(db_path, message_id)
-            except Exception as rollback_error:
-                print(
-                    f"[worker] CRITICAL: failed to roll back the processed-claim "
-                    f"for message {message_id!r} after a processing failure "
-                    f"({type(e).__name__}: {e}) — rollback itself failed with "
-                    f"{type(rollback_error).__name__}: {rollback_error}. This "
-                    "message is now stuck marked-processed with no evidence "
-                    "record and will NOT be retried automatically.",
-                    file=sys.stderr,
-                )
-            else:
-                any_failures = True
-                print(
-                    f"[worker] Failed to process message {message_id!r}: "
-                    f"{type(e).__name__}: {e} — un-marking as processed so it is "
-                    "retried on a future poll cycle",
-                    file=sys.stderr,
-                )
+            any_failures = True
+            print(
+                f"[worker] Failed to process message {message_id!r}: "
+                f"{type(e).__name__}: {e} — this message was never marked "
+                "processed, so it will be retried on a future poll cycle",
+                file=sys.stderr,
+            )
             continue
         else:
-            # Deliberately outside the try above: if this print() itself were to
-            # raise (e.g. a broken stderr pipe), the except block would wrongly
-            # roll back a message whose evidence was already durably persisted.
+            # Deliberately outside the try above: if this print() itself were
+            # to raise (e.g. a broken stderr pipe), the except block would
+            # wrongly log this as a processing failure (any_failures = True,
+            # capping the checkpoint below) for a message whose evidence was
+            # already durably persisted.
             print(
                 f"[worker] Persisted evidence record {content_hash} for message "
                 f"{message_id!r} (verdict={report['verdict']})",
                 file=sys.stderr,
             )
 
-    # If any message failed and was rolled back above, do NOT advance the
-    # checkpoint to new_history_id -- history.list() only returns events
-    # strictly after the saved checkpoint, so advancing past a failed
+    # If any message failed above, it was never written to the store at all
+    # (persist_evidence_record's atomic commit never happened) -- so do NOT
+    # advance the checkpoint to new_history_id. history.list() only returns
+    # events strictly after the saved checkpoint, so advancing past a failed
     # message's own history event would make it permanently unreachable on
     # every future cycle, silently breaking the "retried on a future poll
-    # cycle" promise the rollback above claims to provide (2026-07-22
-    # code-review follow-up). Keeping the OLD checkpoint means the next cycle
-    # cheaply re-scans the same range: already-persisted messages are skipped
-    # via mark_message_processed's ID check before any expensive work, and the
-    # failed message is genuinely handed back for another attempt. since_history_id
-    # is only None on a mailbox's very first cycle, which always returns zero
-    # messages (see poll_new_messages), so any_failures can never be True here
-    # when since_history_id is None -- the `is not None` check is for mypy only.
+    # cycle" promise above (2026-07-22 code-review follow-up). Keeping the
+    # OLD checkpoint means the next cycle cheaply re-scans the same range:
+    # already-persisted messages are skipped via is_message_processed's ID
+    # check before any expensive work, and the failed message is genuinely
+    # handed back for another attempt. since_history_id is only None on a
+    # mailbox's very first cycle, which always returns zero messages (see
+    # poll_new_messages), so any_failures can never be True here when
+    # since_history_id is None -- the `is not None` check is for mypy only.
     checkpoint_to_save = (
         since_history_id
         if any_failures and since_history_id is not None
@@ -228,6 +243,65 @@ def run_poll_cycle(config: Config, db_path: str) -> None:
     )
     save_history_checkpoint(db_path, checkpoint_to_save)
     purge_expired(db_path, config)
+
+
+def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
+    """SIGTERM -- what `systemctl stop` actually sends -- has no default
+    Python handler, unlike SIGINT/Ctrl+C, which Python already turns into
+    KeyboardInterrupt automatically. Without this, SIGTERM kills the process
+    immediately, bypassing run_continuous_loop's clean-shutdown path
+    entirely. Raising KeyboardInterrupt here routes SIGTERM through the exact
+    same except KeyboardInterrupt blocks already used for Ctrl+C -- same log
+    line, same clean exit, one code path for both."""
+    raise KeyboardInterrupt()
+
+
+def run_continuous_loop(config: Config, db_path: str) -> None:
+    """sentinel-triage's default (no-flag) mode: calls run_poll_cycle on an
+    interval until interrupted (Ctrl+C/SIGINT or systemctl stop/SIGTERM) or a
+    persistent (cycle-level) failure occurs.
+
+    Per-message failures never reach this function as an exception -- they're
+    already isolated inside run_poll_cycle (Story 1.6). If run_poll_cycle
+    itself raises, that's a persistent failure (e.g. revoked Gmail
+    credentials): log it distinctly from a per-message failure, then re-raise
+    so the process exits. Restart-on-crash is deliberately an ops concern
+    (systemd unit), not something this loop retries internally.
+    """
+    _require_valid_poll_interval(config)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    while True:
+        try:
+            run_poll_cycle(config, db_path)
+        except KeyboardInterrupt:
+            # Ignore further SIGTERM immediately: a second SIGTERM landing
+            # while this block is still running (e.g. mid-print) would
+            # otherwise raise a fresh KeyboardInterrupt that escapes this
+            # except clause entirely, bypassing the clean-shutdown path
+            # (2026-07-22 code-review follow-up). Does not cover a second
+            # Ctrl+C/SIGINT, which Python's own default handler delivers
+            # independently of this registration.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            print("[worker] Shutting down (received interrupt)", file=sys.stderr)
+            return
+        except Exception as e:
+            print(
+                f"[worker] PERSISTENT FAILURE — poll cycle could not complete: "
+                f"{type(e).__name__}: {e}. This is not a per-message issue; "
+                "the worker is stopping rather than silently retrying a "
+                "cycle-level failure. Most often this means revoked/expired "
+                "Gmail credentials or a connectivity problem, but see the "
+                "exception details above — it may not be.",
+                file=sys.stderr,
+            )
+            raise
+
+        try:
+            time.sleep(config.poll_interval_seconds)
+        except KeyboardInterrupt:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            print("[worker] Shutting down (received interrupt)", file=sys.stderr)
+            return
 
 
 def _run_replay(message_hash: str, db_path: str, config: Config) -> None:
@@ -317,7 +391,9 @@ def main() -> None:
 def _run() -> None:
     parser = argparse.ArgumentParser(
         prog="sentinel-triage",
-        description="SENTINEL — autonomous phishing triage worker",
+        description="SENTINEL — autonomous phishing triage worker. Default "
+        "(no flags): continuous poll loop, polling every "
+        "SENTINEL_POLL_INTERVAL seconds until interrupted.",
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -345,14 +421,8 @@ def _run() -> None:
         run_poll_cycle(config, args.db_path)
         sys.exit(0)
 
-    print(
-        "sentinel-triage: no mode specified. Use --once for a single poll cycle "
-        "or --replay <message_hash> to audit a stored verdict. Continuous "
-        "unattended polling requires Story 1.7's failure-isolation wrapper and "
-        "is not yet available.",
-        file=sys.stderr,
-    )
-    sys.exit(2)
+    run_continuous_loop(config, args.db_path)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -13,11 +13,11 @@ from sentinel.triage.report import TriageReport
 from sentinel.triage.scoring import compute_raw_score, determine_verdict
 from sentinel.triage.store import (
     EvidenceRecord,
-    mark_message_processed,
+    is_message_processed,
     persist_evidence_record,
     read_evidence_record,
 )
-from sentinel.triage.worker import main, process_message, run_poll_cycle
+from sentinel.triage.worker import main, process_message, run_continuous_loop, run_poll_cycle
 
 
 def _config(deferral_threshold: float = 0.05) -> Config:
@@ -433,11 +433,16 @@ def test_run_poll_cycle_skips_already_processed_message(
     store_db_path: str,
     store_config: Config,
 ) -> None:
-    from sentinel.triage.store import mark_message_processed, save_history_checkpoint
+    from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
-    mark_message_processed(store_db_path, "m1")
     config = _gmail_config(store_config)
+    # "m1" is already processed iff persist_evidence_record has already run
+    # for it -- there is no separate claim step (2026-07-22, Story 1.7 follow-up).
+    already_processed = EvidenceRecord(
+        message_id="m1", sender=None, report=_make_report(), deferral_threshold_used=0.05
+    )
+    persist_evidence_record(store_db_path, "priorhash", already_processed, config)
 
     service = mocker.MagicMock()
     mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
@@ -452,6 +457,38 @@ def test_run_poll_cycle_skips_already_processed_message(
     run_poll_cycle(config, store_db_path)
 
     spy.assert_not_called()
+
+
+def test_run_poll_cycle_is_message_processed_failure_is_per_message_not_cycle_level(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """If is_message_processed itself raises (e.g. a transient sqlite lock),
+    that must be caught as a per-message failure -- not left to propagate out
+    of run_poll_cycle, where run_continuous_loop would misclassify it as a
+    cycle-level PERSISTENT FAILURE and kill the whole worker over a single
+    message's bookkeeping hiccup. Regression guard (2026-07-22 code-review
+    follow-up)."""
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _gmail_config(store_config)
+
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]
+    }
+    mocker.patch(
+        "sentinel.triage.worker.is_message_processed",
+        side_effect=RuntimeError("simulated database is locked"),
+    )
+
+    run_poll_cycle(config, store_db_path)  # must not raise/crash the cycle
 
 
 def test_run_poll_cycle_saves_new_checkpoint(
@@ -566,12 +603,13 @@ def test_run_poll_cycle_persist_failure_does_not_permanently_mark_processed(
     store_db_path: str,
     store_config: Config,
 ) -> None:
-    """If persist_evidence_record fails after mark_message_processed already
-    claimed the message, the claim must be rolled back — otherwise the message
-    is permanently lost: marked processed, but no evidence record ever exists,
-    and no future poll cycle will ever retry it. Same failure class as the
-    fetch_raw_message_bytes data-loss bug already fixed in this story, just a
-    different trigger point (a persist-time failure instead of a fetch-time one)."""
+    """If persist_evidence_record fails, the message must never be left
+    marked-processed with no evidence record -- otherwise it is permanently
+    lost, since no future poll cycle would ever retry it. Since Story 1.7's
+    atomicity fix, this is now inherent to persist_evidence_record's single
+    atomic commit (both rows land together or neither does), not a separate
+    rollback step -- there is nothing to roll back, because nothing was ever
+    written before the commit."""
     from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
@@ -598,9 +636,9 @@ def test_run_poll_cycle_persist_failure_does_not_permanently_mark_processed(
 
     run_poll_cycle(config, store_db_path)  # must not raise/crash the cycle
 
-    # If the claim were NOT rolled back, this second claim attempt (simulating
-    # a future poll cycle re-seeing the same message) would return False.
-    assert mark_message_processed(store_db_path, "m1") is True
+    # Nothing was ever committed for "m1" -- persist_evidence_record's atomic
+    # write never completed, so a future poll cycle will correctly retry it.
+    assert is_message_processed(store_db_path, "m1") is False
 
 
 def test_run_poll_cycle_persist_failure_does_not_advance_checkpoint_past_it(
@@ -648,16 +686,19 @@ def test_run_poll_cycle_persist_failure_does_not_advance_checkpoint_past_it(
     assert load_history_checkpoint(store_db_path) == "999"
 
 
-def test_run_poll_cycle_print_failure_after_persist_does_not_unmark(
+def test_run_poll_cycle_print_failure_after_persist_does_not_misclassify_success(
     mocker,  # type: ignore[no-untyped-def]
     store_db_path: str,
     store_config: Config,
 ) -> None:
     """A print() failure strictly AFTER a successful persist_evidence_record
-    call must not trigger a false unmark_message_processed rollback -- the
-    evidence is already durably persisted at that point. Regression guard for
-    moving the success-path print() into an `else` clause outside the try
-    (2026-07-22 code-review follow-up)."""
+    call must not be misclassified as a processing failure (any_failures=True,
+    capping the checkpoint below unnecessarily) -- the evidence is already
+    durably persisted at that point. Regression guard for moving the
+    success-path print() into an `else` clause outside the try (originally a
+    2026-07-22 code-review follow-up guarding against a false rollback; the
+    rollback mechanism itself was later removed by Story 1.7's atomicity fix,
+    but this same print-placement protection remains necessary)."""
     from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
@@ -694,21 +735,16 @@ def test_run_poll_cycle_print_failure_after_persist_does_not_unmark(
     content_hash = hashlib.sha256(raw_content).hexdigest()
     record = read_evidence_record(store_db_path, content_hash, config)
     assert record is not None  # evidence survives the print() failure
-    # If a false unmark had fired, this claim would have been rolled back and
-    # a fresh call would succeed (return True). It must still stand.
-    assert mark_message_processed(store_db_path, "m1") is False
+    assert is_message_processed(store_db_path, "m1") is True
 
 
-def test_run_poll_cycle_unmark_failure_does_not_abort_cycle(
+def test_run_poll_cycle_persist_failure_for_one_message_does_not_stop_remaining_messages(
     mocker,  # type: ignore[no-untyped-def]
     store_db_path: str,
     store_config: Config,
 ) -> None:
-    """If unmark_message_processed itself fails during rollback (e.g. DB
-    locked), that failure must not propagate and abort the whole cycle --
-    remaining messages must still be processed and persisted. Regression guard
-    for wrapping the rollback call in its own try/except (2026-07-22
-    code-review follow-up)."""
+    """A persist-time failure for one message must not stop the cycle from
+    processing subsequent messages -- m1 fails, m2 must still be persisted."""
     from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
@@ -744,10 +780,6 @@ def test_run_poll_cycle_unmark_failure_does_not_abort_cycle(
         persist_evidence_record(db_path, content_hash, record, config)
 
     mocker.patch("sentinel.triage.worker.persist_evidence_record", side_effect=flaky_persist)
-    mocker.patch(
-        "sentinel.triage.worker.unmark_message_processed",
-        side_effect=RuntimeError("simulated rollback DB failure"),
-    )
 
     run_poll_cycle(config, store_db_path)  # must not raise/crash the cycle
 
@@ -757,24 +789,242 @@ def test_run_poll_cycle_unmark_failure_does_not_abort_cycle(
     assert record_m2["message_id"] == "m2"
 
 
-# --- main() / _run() CLI dispatch -------------------------------------------------
+# --- run_continuous_loop ----------------------------------------------------------
 
 
-def test_no_mode_given_exits_nonzero_with_usage_to_stderr(
+def test_run_continuous_loop_survives_a_per_message_failure_within_a_cycle(
     mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """A per-message failure inside a poll cycle must not propagate out of
+    run_continuous_loop -- this proves Story 1.6's claim/rollback isolation
+    survives being invoked through the new outer loop, end to end, not just
+    in isolation via run_poll_cycle's own test suite."""
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _gmail_config(store_config)
+
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [
+            {"messagesAdded": [{"message": {"id": "m1"}}]},
+            {"messagesAdded": [{"message": {"id": "m2"}}]},
+        ]
+    }
+    raw_content_m1 = b"From: alice@example.com\r\nSubject: t1\r\n\r\nbody1"
+    encoded_m1 = base64.urlsafe_b64encode(raw_content_m1).decode()
+    raw_content_m2 = b"From: bob@example.com\r\nSubject: t2\r\n\r\nbody2"
+    encoded_m2 = base64.urlsafe_b64encode(raw_content_m2).decode()
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {"payload": {"headers": []}},  # m1 header fetch ok
+        {"raw": encoded_m1},  # m1 raw fetch ok (fails later, at persist time)
+        {"payload": {"headers": []}},  # m2 header fetch ok
+        {"raw": encoded_m2},  # m2 raw fetch ok
+    ]
+
+    def flaky_persist(
+        db_path: str, content_hash: str, record: EvidenceRecord, config: Config
+    ) -> None:
+        if record["message_id"] == "m1":
+            raise RuntimeError("simulated failure for m1")
+        persist_evidence_record(db_path, content_hash, record, config)
+
+    mocker.patch("sentinel.triage.worker.persist_evidence_record", side_effect=flaky_persist)
+    mocker.patch("sentinel.triage.worker.time.sleep", side_effect=KeyboardInterrupt)
+    mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(config, store_db_path)  # must not raise
+
+    content_hash_m2 = hashlib.sha256(raw_content_m2).hexdigest()
+    record_m2 = read_evidence_record(store_db_path, content_hash_m2, config)
+    assert record_m2 is not None
+    assert record_m2["message_id"] == "m2"
+
+
+def test_run_continuous_loop_persistent_failure_propagates_with_distinct_log_message(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
     store_config: Config,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """If run_poll_cycle itself raises (a cycle-level, not per-message,
+    failure -- e.g. revoked Gmail credentials), the loop must not swallow it
+    and silently retry forever. It re-raises after a distinct log line so an
+    operator can tell this apart from a per-message failure at a glance."""
+    mocker.patch(
+        "sentinel.triage.worker.run_poll_cycle",
+        side_effect=RuntimeError("simulated persistent failure"),
+    )
+    mocker.patch("sentinel.triage.worker.signal.signal")
+
+    with pytest.raises(RuntimeError, match="simulated persistent failure"):
+        run_continuous_loop(store_config, store_db_path)
+
+    captured = capsys.readouterr()
+    assert "PERSISTENT" in captured.err
+    assert "Failed to process message" not in captured.err
+
+
+def test_run_continuous_loop_clean_shutdown_on_interrupt_during_sleep(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    mocker.patch("sentinel.triage.worker.time.sleep", side_effect=KeyboardInterrupt)
+    mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(store_config, store_db_path)  # must not raise
+
+    captured = capsys.readouterr()
+    assert "Shutting down" in captured.err
+
+
+def test_run_continuous_loop_clean_shutdown_on_interrupt_during_cycle(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch("sentinel.triage.worker.run_poll_cycle", side_effect=KeyboardInterrupt)
+    sleep_spy = mocker.patch("sentinel.triage.worker.time.sleep")
+    mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(store_config, store_db_path)  # must not raise
+
+    sleep_spy.assert_not_called()
+    captured = capsys.readouterr()
+    assert "Shutting down" in captured.err
+
+
+def test_run_continuous_loop_ignores_further_sigterm_once_shutdown_begins(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """A second SIGTERM landing while the shutdown except-block is still
+    running (e.g. mid-print) must not raise a fresh KeyboardInterrupt that
+    escapes the clean-shutdown path -- verified here by asserting SIGTERM is
+    re-registered to SIG_IGN as soon as shutdown begins. Regression guard
+    (2026-07-22 code-review follow-up)."""
+    import signal as signal_module
+
+    from sentinel.triage.worker import _handle_sigterm
+
+    mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    mocker.patch("sentinel.triage.worker.time.sleep", side_effect=KeyboardInterrupt)
+    signal_spy = mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(store_config, store_db_path)
+
+    signal_spy.assert_any_call(signal_module.SIGTERM, _handle_sigterm)
+    signal_spy.assert_any_call(signal_module.SIGTERM, signal_module.SIG_IGN)
+
+
+def test_run_continuous_loop_sleeps_for_configured_poll_interval(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = replace(store_config, poll_interval_seconds=42)
+    mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    sleep_spy = mocker.patch("sentinel.triage.worker.time.sleep", side_effect=KeyboardInterrupt)
+    mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(config, store_db_path)
+
+    sleep_spy.assert_called_once_with(42)
+
+
+@pytest.mark.parametrize("bad_interval", [0, -1, -300])
+def test_run_continuous_loop_raises_config_error_on_nonpositive_poll_interval(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    bad_interval: int,
+) -> None:
+    """A non-positive SENTINEL_POLL_INTERVAL previously crashed on the first
+    time.sleep() call (negative: ValueError) or produced a busy-loop
+    hammering the Gmail API (zero). Validated lazily at first actual use,
+    mirroring deferral_threshold/retention_days (2026-07-22 code-review
+    follow-up)."""
+    config = replace(store_config, poll_interval_seconds=bad_interval)
+    run_spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    sleep_spy = mocker.patch("sentinel.triage.worker.time.sleep")
+
+    with pytest.raises(ConfigError, match="SENTINEL_POLL_INTERVAL"):
+        run_continuous_loop(config, store_db_path)
+
+    run_spy.assert_not_called()
+    sleep_spy.assert_not_called()
+
+
+def test_run_continuous_loop_registers_sigterm_handler(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """systemctl stop sends SIGTERM, not SIGINT -- Python has no default
+    handler for it (unlike SIGINT, which Python already turns into
+    KeyboardInterrupt). Without an explicit registration, SIGTERM kills the
+    process immediately, bypassing the clean-shutdown path entirely. This
+    proves run_continuous_loop actually wires up the handler at startup, not
+    just that the handler function itself behaves correctly in isolation
+    (see test_handle_sigterm_raises_keyboard_interrupt)."""
+    import signal as signal_module
+
+    from sentinel.triage.worker import _handle_sigterm
+
+    mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    mocker.patch("sentinel.triage.worker.time.sleep", side_effect=KeyboardInterrupt)
+    signal_spy = mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(store_config, store_db_path)
+
+    # assert_any_call, not assert_called_once_with: signal.signal is also
+    # called a second time (SIG_IGN) once shutdown begins -- see
+    # test_run_continuous_loop_ignores_further_sigterm_once_shutdown_begins.
+    signal_spy.assert_any_call(signal_module.SIGTERM, _handle_sigterm)
+
+
+def test_handle_sigterm_raises_keyboard_interrupt() -> None:
+    """Unit test of the handler itself, independent of registration/delivery
+    (real OS-level SIGTERM delivery is not portably testable -- e.g. os.kill
+    with SIGTERM on Windows does not invoke a registered Python handler the
+    way POSIX does, so this only tests the handler's own logic, not signal
+    delivery mechanics)."""
+    from sentinel.triage.worker import _handle_sigterm
+
+    with pytest.raises(KeyboardInterrupt):
+        _handle_sigterm(15, None)
+
+
+# --- main() / _run() CLI dispatch -------------------------------------------------
+
+
+def test_default_mode_calls_run_continuous_loop(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    """No --replay/--once given -- AR8's default mode is the continuous poll
+    loop, not a usage error (that placeholder was Story 1.6's explicit scope
+    boundary, now filled in by this story)."""
     mocker.patch("sys.argv", ["sentinel-triage"])
     mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_continuous_loop")
 
     with pytest.raises(SystemExit) as exc:
         main()
 
-    assert exc.value.code != 0
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err != ""
+    spy.assert_called_once()
+    assert exc.value.code == 0
 
 
 def test_once_calls_run_poll_cycle_and_exits_zero(
@@ -851,3 +1101,27 @@ def test_worker_imports_no_network_listening_library() -> None:
                 assert alias.name not in forbidden, f"worker.py imports {alias.name}"
         elif isinstance(node, ast.ImportFrom):
             assert node.module not in forbidden, f"worker.py imports from {node.module}"
+
+
+def test_triage_imports_no_remediation_capable_library() -> None:
+    """AC3 (FR32): no path in the triage pipeline may execute containment,
+    remediation, or any response action. This can't be proven exhaustively,
+    but structurally removing the *capability* -- no email-sending, no
+    shell-out, no raw OS-level file/process control -- makes it as close to
+    true as an import-boundary test can get. Complements Story 1.3's
+    test_build_gmail_service_uses_readonly_scope_and_single_mailbox_subject,
+    which proves the Gmail client itself can't mutate the mailbox."""
+    triage_dir = Path(__file__).resolve().parents[2] / "src" / "sentinel" / "triage"
+    forbidden = {"smtplib", "subprocess", "os"}
+    for source_path in triage_dir.glob("*.py"):
+        tree = ast.parse(source_path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name not in forbidden, (
+                        f"{source_path.name} imports {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module not in forbidden, (
+                    f"{source_path.name} imports from {node.module}"
+                )

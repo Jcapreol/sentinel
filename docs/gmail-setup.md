@@ -81,6 +81,53 @@ If either `GMAIL_SERVICE_ACCOUNT_KEY_PATH` or `GMAIL_MONITORED_MAILBOX` is
 missing or invalid, Sentinel fails fast with a clear error before
 attempting any poll — it will not start in a partially-configured state.
 
+## 5. Running continuously
+
+Running `sentinel-triage` with no flags is the default mode: it polls every
+`SENTINEL_POLL_INTERVAL` seconds (default 300 / 5 minutes) until stopped.
+Per-message failures (a single malformed or unparseable email) are isolated
+automatically and never stop the loop.
+
+A **persistent** failure — most commonly revoked or expired Gmail
+credentials — is different: rather than silently retrying a broken cycle
+forever, Sentinel logs it prominently to stderr and exits non-zero.
+Restart-on-crash is deliberately left to your process supervisor rather than
+built into Sentinel itself — a `systemd` unit is the reference pattern:
+
+```ini
+# /etc/systemd/system/sentinel-triage.service
+[Unit]
+Description=Sentinel phishing triage worker
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/sentinel
+EnvironmentFile=/opt/sentinel/.env
+ExecStart=/opt/sentinel/.venv/bin/sentinel-triage
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl stop sentinel-triage` sends SIGTERM by default; Sentinel handles
+it explicitly (alongside Ctrl+C/SIGINT) to shut down cleanly rather than
+being killed mid-cycle.
+
+With `Restart=on-failure` and `RestartSec=30`, a transient issue (e.g. a
+brief credential propagation delay) recovers automatically. `StartLimitBurst=5`
+within `StartLimitIntervalSec=600` caps this at 5 restart attempts per
+10-minute window — without it, a *genuinely* broken credential would hot-loop
+forever, restarting every 30 seconds and hammering the Gmail API indefinitely.
+Once the burst limit is hit, systemd marks the unit `failed` and stops
+retrying — visible via `systemctl status sentinel-triage` /
+`journalctl -u sentinel-triage` — until an operator fixes the root cause and
+runs `systemctl reset-failed sentinel-triage` followed by `systemctl start`.
+
 ## Notes
 
 - The first poll after startup establishes a baseline and does not

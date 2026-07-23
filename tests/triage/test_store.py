@@ -11,8 +11,8 @@ from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.report import TriageReport
 from sentinel.triage.store import (
     EvidenceRecord,
+    is_message_processed,
     load_history_checkpoint,
-    mark_message_processed,
     persist_evidence_record,
     purge_expired,
     read_evidence_record,
@@ -194,28 +194,98 @@ def test_checkpoint_second_save_overwrites_first_single_row(store_db_path: str) 
     assert row_count == 1
 
 
-# --- mark_message_processed ------------------------------------------------------
+# --- is_message_processed ---------------------------------------------------------
 
 
-def test_mark_message_processed_first_call_returns_true(store_db_path: str) -> None:
-    assert mark_message_processed(store_db_path, "m1") is True
+def test_is_message_processed_false_before_persist(store_db_path: str) -> None:
+    assert is_message_processed(store_db_path, "m1") is False
 
 
-def test_mark_message_processed_second_call_same_id_returns_false(store_db_path: str) -> None:
-    mark_message_processed(store_db_path, "m1")
+def test_is_message_processed_true_after_persist(
+    store_db_path: str, store_config: Config
+) -> None:
+    record = _make_record(message_id="m1")
+    persist_evidence_record(store_db_path, "contenthash1", record, store_config)
 
-    assert mark_message_processed(store_db_path, "m1") is False
+    assert is_message_processed(store_db_path, "m1") is True
 
 
-def test_mark_message_processed_different_ids_both_return_true(store_db_path: str) -> None:
-    assert mark_message_processed(store_db_path, "m1") is True
-    assert mark_message_processed(store_db_path, "m2") is True
+def test_is_message_processed_does_not_write(store_db_path: str) -> None:
+    """Read-only: calling it must never insert a row -- that would recreate
+    the exact claim-without-evidence risk the persist_evidence_record
+    atomicity fix eliminates (2026-07-22, Story 1.7 follow-up)."""
+    is_message_processed(store_db_path, "m1")
+
+    conn = sqlite3.connect(store_db_path)
+    row_count = conn.execute("SELECT COUNT(*) FROM processed_message_ids").fetchone()[0]
+    conn.close()
+
+    assert row_count == 0
+
+
+def test_persist_evidence_record_failure_before_commit_writes_neither_row(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """persist_evidence_record writes the evidence row and the
+    processed-message-id row atomically -- one connection, one commit. If
+    anything fails between the two INSERTs (simulated here), NEITHER must
+    land. This is what actually closes the crash window a hard process kill
+    (SIGKILL, OOM, power loss) could previously exploit: there is no longer
+    a separate, earlier commit for a "claim" alone (2026-07-22, Story 1.7
+    follow-up)."""
+    from sentinel.triage import store as store_module
+
+    record = _make_record(message_id="m-atomic-test")
+    real_connect = store_module._connect
+
+    class FlakyConnection:
+        """Thin proxy -- sqlite3.Connection is an immutable C type and can't
+        be monkeypatched directly, so this wraps a real connection instead."""
+
+        def __init__(self, real_conn: sqlite3.Connection) -> None:
+            self._real = real_conn
+
+        def execute(self, sql: str, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            if "processed_message_ids" in sql and sql.strip().upper().startswith("INSERT"):
+                raise sqlite3.OperationalError("simulated failure between writes")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def commit(self) -> None:
+            self._real.commit()
+
+        def close(self) -> None:
+            self._real.close()
+
+    def flaky_connect(db_path: str) -> FlakyConnection:
+        return FlakyConnection(real_connect(db_path))
+
+    mocker.patch("sentinel.triage.store._connect", side_effect=flaky_connect)
+
+    with pytest.raises(sqlite3.OperationalError):
+        persist_evidence_record(store_db_path, "contenthash-atomic", record, store_config)
+
+    conn = sqlite3.connect(store_db_path)
+    evidence_count = conn.execute(
+        "SELECT COUNT(*) FROM evidence_records WHERE message_hash = ?",
+        ("contenthash-atomic",),
+    ).fetchone()[0]
+    processed_count = conn.execute(
+        "SELECT COUNT(*) FROM processed_message_ids WHERE message_id = ?",
+        ("m-atomic-test",),
+    ).fetchone()[0]
+    conn.close()
+
+    assert evidence_count == 0
+    assert processed_count == 0
 
 
 def test_purge_expired_removes_old_processed_message_ids(
     store_db_path: str, store_config: Config
 ) -> None:
-    mark_message_processed(store_db_path, "old-id")
+    old_record = _make_record(message_id="old-id")
+    persist_evidence_record(store_db_path, "old-hash", old_record, store_config)
 
     conn = sqlite3.connect(store_db_path)
     conn.execute(
@@ -225,7 +295,8 @@ def test_purge_expired_removes_old_processed_message_ids(
     conn.commit()
     conn.close()
 
-    mark_message_processed(store_db_path, "recent-id")
+    recent_record = _make_record(message_id="recent-id")
+    persist_evidence_record(store_db_path, "recent-hash", recent_record, store_config)
 
     purge_expired(store_db_path, store_config)
 
