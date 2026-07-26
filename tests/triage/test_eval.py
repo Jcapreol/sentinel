@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 
@@ -450,6 +451,36 @@ def test_fit_isotonic_regression_is_monotonically_non_decreasing() -> None:
     assert calibrated == sorted(calibrated)
 
 
+def test_fit_isotonic_regression_ties_average_regardless_of_input_order() -> None:
+    """[Review][Patch] Code review (Blind Hunter + Edge Case Hunter): two
+    pairs sharing the same raw_score but different labels must be pooled
+    into a single block (the average of their labels), not left as two
+    separate same-x blocks whose merge depends on input order -- confirmed
+    a real bug where reversing the input order changed apply_isotonic(0.5)
+    from 0.0 to 0.5 for the identical training set."""
+    order_a = [(0.5, 0.0), (0.5, 1.0)]
+    order_b = [(0.5, 1.0), (0.5, 0.0)]
+
+    breakpoints_a = fit_isotonic_regression(order_a)
+    breakpoints_b = fit_isotonic_regression(order_b)
+
+    assert breakpoints_a == breakpoints_b
+    assert apply_isotonic(0.5, breakpoints_a) == 0.5
+    assert apply_isotonic(0.5, breakpoints_b) == 0.5
+
+
+def test_fit_isotonic_regression_ties_with_surrounding_points_average_correctly() -> None:
+    # Two tied points (0.5, 0.0) and (0.5, 1.0) must average to 0.5, not
+    # silently drop one label -- verified alongside distinct-x neighbors so
+    # the fix doesn't disturb ordinary (non-tied) pooling behavior.
+    pairs = [(0.1, 0.0), (0.5, 0.0), (0.5, 1.0), (0.9, 1.0)]
+    breakpoints = fit_isotonic_regression(pairs)
+
+    assert apply_isotonic(0.5, breakpoints) == 0.5
+    assert apply_isotonic(0.1, breakpoints) <= 0.5
+    assert apply_isotonic(0.9, breakpoints) >= 0.5
+
+
 def test_fit_isotonic_regression_separable_data_produces_step_near_boundary() -> None:
     """A perfectly-separable synthetic dataset (all low scores benign, all
     high scores malicious) must isotonic-fit to something close to a step
@@ -500,8 +531,16 @@ def test_fit_platt_scaling_output_stays_within_unit_interval() -> None:
 
 def test_apply_platt_never_raises_on_extreme_inputs() -> None:
     # Extreme A/B/x combinations must not overflow math.exp.
+    # a*x = +1e20 in both cases below -- exercises only the +500 exponent
+    # clamp (p -> 0). [Review][Patch] Blind Hunter: the -500 clamp branch
+    # (p -> 1, via a very NEGATIVE a*x product) was never exercised despite
+    # this test's name/comment claiming bidirectional "extreme" coverage.
     assert 0.0 <= apply_platt(1e10, a=1e10, b=1e10) <= 1.0
     assert 0.0 <= apply_platt(-1e10, a=-1e10, b=-1e10) <= 1.0
+    # a*x = -1e20 here -- exercises the -500 clamp branch (p -> 1), and
+    # asserts the actual direction, not just "didn't crash".
+    assert apply_platt(1e10, a=-1e10, b=0.0) > 0.999
+    assert apply_platt(-1e10, a=1e10, b=0.0) > 0.999
 
 
 # --- fit_calibration_mapping orchestration + JSON I/O (Story 3.2, Task 3) -------
@@ -523,14 +562,37 @@ def test_fit_calibration_mapping_rejects_all_benign_pairs() -> None:
     # degenerate "always benign" calibration -- fitting requires both
     # outcome classes to be present, per AC1's "validated corpus" precondition.
     pairs = [(x / 100, 0.0) for x in range(0, 100)]
-    with pytest.raises(ValueError, match="same label"):
+    with pytest.raises(ValueError, match=r"\{0\.0, 1\.0\}"):
         fit_calibration_mapping(pairs)
 
 
 def test_fit_calibration_mapping_rejects_all_malicious_pairs() -> None:
     pairs = [(x / 100, 1.0) for x in range(0, 100)]
-    with pytest.raises(ValueError, match="same label"):
+    with pytest.raises(ValueError, match=r"\{0\.0, 1\.0\}"):
         fit_calibration_mapping(pairs)
+
+
+def test_fit_calibration_mapping_rejects_non_binary_labels() -> None:
+    # [Review][Patch] Blind Hunter: the old "at least 2 distinct labels" check
+    # accepted e.g. {0.0, 2.0} -- labels must be exactly {0.0, 1.0}.
+    pairs = [(0.1, 0.0), (0.2, 2.0)]
+    with pytest.raises(ValueError, match=r"\{0\.0, 1\.0\}"):
+        fit_calibration_mapping(pairs)
+
+
+def test_fit_calibration_mapping_deferral_threshold_derived_is_caller_supplied() -> None:
+    # [Review][Patch] Blind Hunter + Acceptance Auditor (AC2): previously
+    # hardcoded to 0.05 inside fit_calibration_mapping regardless of what the
+    # caller wanted, directly contradicting the function's own docstring
+    # claim that callers "are expected to set it explicitly". Now an actual
+    # parameter -- both the caller-supplied value and the default are proven.
+    pairs = _separable_pairs(99)
+
+    default_model = fit_calibration_mapping(pairs)
+    assert default_model["deferral_threshold_derived"] == 0.05
+
+    custom_model = fit_calibration_mapping(pairs, deferral_threshold_derived=0.12)
+    assert custom_model["deferral_threshold_derived"] == 0.12
 
 
 def test_fit_calibration_mapping_chooses_platt_below_isotonic_threshold() -> None:
@@ -588,3 +650,71 @@ def test_save_and_load_identity_placeholder_round_trips(tmp_path: Path) -> None:
     loaded = load_calibration_model(str(path))
 
     assert loaded == model
+
+
+def test_save_calibration_model_leaves_existing_file_untouched_on_replace_failure(
+    tmp_path: Path, mocker  # type: ignore[no-untyped-def]
+) -> None:
+    """[Review][Patch] Edge Case Hunter: save_calibration_model previously
+    wrote directly to the target path with no atomic swap -- a reader (e.g.
+    another process importing scoring.py) opening the file mid-write could
+    observe a truncated/partial JSON document. Now writes to a temp file in
+    the same directory and os.replace()s it into place; if the final rename
+    step itself fails, the target must still hold its ORIGINAL content --
+    proving the new data was staged separately and never touched the target
+    directly. (Mocking pathlib.Path.replace specifically, not
+    Path.write_text, so this test only passes if save_calibration_model
+    actually routes through a Path.replace atomic rename -- the old
+    direct-write implementation never calls it at all, so this would
+    incorrectly succeed with no exception raised under the pre-patch code.)
+    """
+    path = tmp_path / "calibration_model_v1.json"
+    original_model = fit_calibration_mapping(_separable_pairs(100))
+    save_calibration_model(original_model, str(path))
+    original_content = path.read_text(encoding="utf-8")
+
+    mocker.patch(
+        "pathlib.Path.replace", side_effect=OSError("simulated failure during atomic rename")
+    )
+    broken_model = fit_calibration_mapping(_separable_pairs(200))
+    with pytest.raises(OSError):
+        save_calibration_model(broken_model, str(path))
+
+    assert path.read_text(encoding="utf-8") == original_content
+
+
+def test_save_calibration_model_does_not_leave_stray_temp_file_on_success(tmp_path: Path) -> None:
+    model = fit_calibration_mapping(_separable_pairs(100))
+    path = tmp_path / "calibration_model_v1.json"
+
+    save_calibration_model(model, str(path))
+
+    assert {p.name for p in tmp_path.iterdir()} == {"calibration_model_v1.json"}
+
+
+def test_load_calibration_model_rejects_unsorted_isotonic_breakpoints(tmp_path: Path) -> None:
+    """[Review][Patch] Edge Case Hunter: apply_isotonic assumes its
+    breakpoints list is ascending (true only because fit_isotonic_regression
+    always produces sorted output) -- a hand-edited or corrupted file with
+    out-of-order breakpoints previously loaded without error and produced
+    silently non-monotonic calibrated output."""
+    path = tmp_path / "calibration_model_v1.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "method": "isotonic",
+                "fitted_at": "2026-01-01T00:00:00+00:00",
+                "sample_count": 2,
+                # deliberately out of order: second block's x_min < first block's x_max
+                "isotonic_breakpoints": [[0.5, 1.0, 0.9], [0.0, 0.4, 0.1]],
+                "platt_params": None,
+                "deferral_threshold_derived": 0.05,
+                "note": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sorted"):
+        load_calibration_model(str(path))

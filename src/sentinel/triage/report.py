@@ -11,9 +11,13 @@ from sentinel.triage.evidence import EvidenceItem
 
 class TriageReport(TypedDict):
     verdict: Literal["Malicious", "Benign", "Deferred"]
-    calibrated_confidence: float  # PROVISIONAL: this is the raw, uncalibrated score from
-    # compute_raw_score(), not real calibrated confidence. Epic 3's calibration harness
-    # (Story 3.2) does not exist yet. Replace this assignment when it does.
+    # [Review][Patch] Story 3.2's calibration harness now exists: worker.py
+    # assigns apply_calibration(raw_score), not the raw score itself, here.
+    # Numerically the two are still equal today only because the shipped
+    # calibration_model_v1.json is an explicit "identity" placeholder (see
+    # that file and scoring.py's apply_calibration) -- not because this
+    # field is still a raw-score stand-in.
+    calibrated_confidence: float
     evidence: list[EvidenceItem]
     schema_version: int
     message_hash: str
@@ -27,7 +31,7 @@ def render_markdown(report: TriageReport) -> str:
         lines.append("")
         lines.append(
             f"Coverage gap — evidence was insufficient for a confident verdict "
-            f"(raw score: {report['calibrated_confidence']:.3f})."
+            f"(calibrated confidence: {report['calibrated_confidence']:.3f})."
         )
 
     lines.append("")

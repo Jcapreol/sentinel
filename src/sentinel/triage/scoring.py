@@ -28,7 +28,15 @@ _CALIBRATION_MODEL: CalibrationModel = load_calibration_model(str(_CALIBRATION_M
 def apply_calibration(raw_score: float) -> float:
     """Maps a raw score (Story 1.1's compute_raw_score output) to a
     calibrated probability via the calibration model loaded at import time.
-    Always returns a value in [0.0, 1.0]."""
+    Always returns a value in [0.0, 1.0].
+
+    [Review][Patch] Dispatch is exhaustive over the three valid `method`
+    values, with an explicit `else: raise` for anything else -- an
+    unrecognized `method` (a typo, or a stale `platt_params`/
+    `isotonic_breakpoints` field left over from a hand-edit that changed
+    `method` without clearing the now-irrelevant params) must fail loudly,
+    not silently fall through to whichever branch's params happen to be
+    non-None."""
     method = _CALIBRATION_MODEL["method"]
     if method == "identity":
         return raw_score
@@ -36,9 +44,14 @@ def apply_calibration(raw_score: float) -> float:
         breakpoints = _CALIBRATION_MODEL["isotonic_breakpoints"]
         assert breakpoints is not None
         return apply_isotonic(raw_score, [(bp[0], bp[1], bp[2]) for bp in breakpoints])
-    platt_params = _CALIBRATION_MODEL["platt_params"]
-    assert platt_params is not None
-    return apply_platt(raw_score, platt_params["a"], platt_params["b"])
+    if method == "platt":
+        platt_params = _CALIBRATION_MODEL["platt_params"]
+        assert platt_params is not None
+        return apply_platt(raw_score, platt_params["a"], platt_params["b"])
+    raise ValueError(
+        f"calibration_model_v1.json has unrecognized method {method!r} -- expected "
+        "'identity', 'isotonic', or 'platt'"
+    )
 
 
 class InconclusiveScoreError(ValueError):
