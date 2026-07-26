@@ -1,7 +1,19 @@
 import subprocess
 from pathlib import Path
 
-from sentinel.triage.eval import load_corpus, validate_corpus
+import pytest
+
+from sentinel.triage.eval import (
+    apply_isotonic,
+    apply_platt,
+    fit_calibration_mapping,
+    fit_isotonic_regression,
+    fit_platt_scaling,
+    load_calibration_model,
+    load_corpus,
+    save_calibration_model,
+    validate_corpus,
+)
 
 _PROVENANCE_TEXT = (
     "Sourced from a synthetic test fixture generated for unit testing purposes. "
@@ -419,3 +431,160 @@ def test_load_corpus_matches_eml_extension_case_insensitively(tmp_path: Path) ->
     corpus = load_corpus(str(tmp_path))
 
     assert len(corpus["benign_tuning"]) == 2
+
+
+# --- Calibration fitting (Story 3.2) --------------------------------------------
+
+
+def test_fit_isotonic_regression_is_monotonically_non_decreasing() -> None:
+    """The fitted step function must never decrease as raw_score increases,
+    by definition of isotonic regression."""
+    pairs = [
+        (0.1, 0.0), (0.15, 1.0), (0.2, 0.0), (0.3, 0.0), (0.4, 1.0),
+        (0.5, 0.0), (0.6, 1.0), (0.7, 1.0), (0.8, 0.0), (0.9, 1.0), (0.95, 1.0),
+    ]
+    breakpoints = fit_isotonic_regression(pairs)
+
+    swept = [i / 100 for i in range(0, 101)]
+    calibrated = [apply_isotonic(x, breakpoints) for x in swept]
+    assert calibrated == sorted(calibrated)
+
+
+def test_fit_isotonic_regression_separable_data_produces_step_near_boundary() -> None:
+    """A perfectly-separable synthetic dataset (all low scores benign, all
+    high scores malicious) must isotonic-fit to something close to a step
+    function at the separation point."""
+    pairs = [(x / 100, 0.0) for x in range(0, 50)] + [(x / 100, 1.0) for x in range(50, 100)]
+    breakpoints = fit_isotonic_regression(pairs)
+
+    assert apply_isotonic(0.1, breakpoints) < 0.2
+    assert apply_isotonic(0.9, breakpoints) > 0.8
+
+
+def test_apply_isotonic_never_raises_on_out_of_range_input() -> None:
+    breakpoints = fit_isotonic_regression([(0.3, 0.0), (0.5, 0.5), (0.7, 1.0)])
+
+    below = apply_isotonic(-5.0, breakpoints)
+    above = apply_isotonic(5.0, breakpoints)
+
+    assert 0.0 <= below <= 1.0
+    assert 0.0 <= above <= 1.0
+
+
+def test_apply_isotonic_handles_empty_breakpoints_without_raising() -> None:
+    assert apply_isotonic(0.5, []) == 0.5
+
+
+def test_fit_platt_scaling_is_directionally_correct_on_separable_data() -> None:
+    """Higher raw scores in a perfectly-separable synthetic dataset must
+    calibrate to higher probabilities -- getting the sign convention
+    backwards would silently invert the calibration, not crash."""
+    pairs = [(x / 100, 0.0) for x in range(0, 50)] + [(x / 100, 1.0) for x in range(50, 100)]
+    a, b = fit_platt_scaling(pairs)
+
+    low = apply_platt(0.1, a, b)
+    high = apply_platt(0.9, a, b)
+    assert high > low
+    assert low < 0.5
+    assert high > 0.5
+
+
+def test_fit_platt_scaling_output_stays_within_unit_interval() -> None:
+    pairs = [(x / 100, 0.0) for x in range(0, 50)] + [(x / 100, 1.0) for x in range(50, 100)]
+    a, b = fit_platt_scaling(pairs)
+
+    for x in [-100.0, -1.0, 0.0, 0.5, 1.0, 100.0]:
+        result = apply_platt(x, a, b)
+        assert 0.0 <= result <= 1.0
+
+
+def test_apply_platt_never_raises_on_extreme_inputs() -> None:
+    # Extreme A/B/x combinations must not overflow math.exp.
+    assert 0.0 <= apply_platt(1e10, a=1e10, b=1e10) <= 1.0
+    assert 0.0 <= apply_platt(-1e10, a=-1e10, b=-1e10) <= 1.0
+
+
+# --- fit_calibration_mapping orchestration + JSON I/O (Story 3.2, Task 3) -------
+
+
+def _separable_pairs(count: int) -> list[tuple[float, float]]:
+    half = count // 2
+    return [(x / count, 0.0) for x in range(0, half)] + [(x / count, 1.0) for x in range(half, count)]
+
+
+def test_fit_calibration_mapping_rejects_empty_pairs() -> None:
+    with pytest.raises(ValueError, match="zero"):
+        fit_calibration_mapping([])
+
+
+def test_fit_calibration_mapping_rejects_all_benign_pairs() -> None:
+    # A real corpus with zero malicious samples (Story 3.1's current state,
+    # pending a phishing_pot license reply) must not silently produce a
+    # degenerate "always benign" calibration -- fitting requires both
+    # outcome classes to be present, per AC1's "validated corpus" precondition.
+    pairs = [(x / 100, 0.0) for x in range(0, 100)]
+    with pytest.raises(ValueError, match="same label"):
+        fit_calibration_mapping(pairs)
+
+
+def test_fit_calibration_mapping_rejects_all_malicious_pairs() -> None:
+    pairs = [(x / 100, 1.0) for x in range(0, 100)]
+    with pytest.raises(ValueError, match="same label"):
+        fit_calibration_mapping(pairs)
+
+
+def test_fit_calibration_mapping_chooses_platt_below_isotonic_threshold() -> None:
+    pairs = _separable_pairs(99)  # one below _MIN_SAMPLES_FOR_ISOTONIC (100)
+    model = fit_calibration_mapping(pairs)
+
+    assert model["method"] == "platt"
+    assert model["platt_params"] is not None
+    assert model["isotonic_breakpoints"] is None
+
+
+def test_fit_calibration_mapping_chooses_isotonic_at_threshold() -> None:
+    pairs = _separable_pairs(100)  # exactly _MIN_SAMPLES_FOR_ISOTONIC
+    model = fit_calibration_mapping(pairs)
+
+    assert model["method"] == "isotonic"
+    assert model["isotonic_breakpoints"] is not None
+    assert model["platt_params"] is None
+
+
+def test_fit_calibration_mapping_records_sample_count_and_version() -> None:
+    pairs = _separable_pairs(99)
+    model = fit_calibration_mapping(pairs)
+
+    assert model["sample_count"] == 99
+    assert model["version"] == 1
+    assert model["fitted_at"] is not None
+
+
+def test_save_and_load_calibration_model_round_trips(tmp_path: Path) -> None:
+    pairs = _separable_pairs(100)
+    model = fit_calibration_mapping(pairs)
+    path = tmp_path / "calibration_model_v1.json"
+
+    save_calibration_model(model, str(path))
+    loaded = load_calibration_model(str(path))
+
+    assert loaded == model
+
+
+def test_save_and_load_identity_placeholder_round_trips(tmp_path: Path) -> None:
+    model = {
+        "version": 1,
+        "method": "identity",
+        "fitted_at": None,
+        "sample_count": 0,
+        "isotonic_breakpoints": None,
+        "platt_params": None,
+        "deferral_threshold_derived": 0.05,
+        "note": "PLACEHOLDER",
+    }
+    path = tmp_path / "calibration_model_v1.json"
+
+    save_calibration_model(model, str(path))  # type: ignore[arg-type]
+    loaded = load_calibration_model(str(path))
+
+    assert loaded == model

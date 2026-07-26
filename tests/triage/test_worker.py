@@ -10,7 +10,7 @@ from sentinel.config import Config, ConfigError
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.ingest import FetchFailed, fetch_headers_for_messages
 from sentinel.triage.report import TriageReport
-from sentinel.triage.scoring import compute_raw_score, determine_verdict
+from sentinel.triage.scoring import apply_calibration, compute_raw_score, determine_verdict
 from sentinel.triage.store import (
     EvidenceRecord,
     is_message_processed,
@@ -88,6 +88,10 @@ def test_process_message_score_inside_deferral_band_defers() -> None:
     )
 
     assert report["verdict"] == "Deferred"
+    # calibrated_confidence == raw_score here because the shipped
+    # calibration_model_v1.json is the Story 3.2 "identity" placeholder --
+    # this assertion holds by that deliberate design, not by coincidence,
+    # and is expected to need updating once a real calibration model ships.
     assert abs(report["calibrated_confidence"] - 0.5) < 0.05
 
 
@@ -236,6 +240,10 @@ def test_process_message_aggregates_evidence_from_headers_watchman_and_cipher() 
     assert len([n for n in watchman_names if n == "stub_finding"]) >= 1
     # Combined score must reflect all three sources' weighted contribution,
     # not just the header's -- strictly more malicious-leaning than header alone.
+    # (Comparing calibrated_confidence directly is valid under the Story 3.2
+    # identity placeholder, since it's monotonic with raw_score by construction
+    # -- an isotonic/Platt model would preserve this ordering too, but not
+    # necessarily the exact values compared elsewhere in this file.)
     assert combined_report["calibrated_confidence"] > header_only_report["calibrated_confidence"]
 
 
@@ -334,8 +342,15 @@ def test_replay_matching_exits_zero(
 ) -> None:
     evidence = [make_evidence_item(name="spf", direction="malicious", weight=0.8)]
     raw_score = compute_raw_score(evidence)
-    verdict = determine_verdict(raw_score, deferral_band=store_config.deferral_threshold)
-    report = _make_report(verdict=verdict, calibrated_confidence=raw_score, evidence=evidence)
+    # calibrated_confidence == apply_calibration(raw_score), which numerically
+    # equals raw_score under the Story 3.2 "identity" placeholder -- writing it
+    # via apply_calibration (not raw_score directly) so this test keeps working
+    # unchanged once a real calibration model replaces the placeholder.
+    calibrated_confidence = apply_calibration(raw_score)
+    verdict = determine_verdict(calibrated_confidence, deferral_band=store_config.deferral_threshold)
+    report = _make_report(
+        verdict=verdict, calibrated_confidence=calibrated_confidence, evidence=evidence
+    )
     record = EvidenceRecord(
         message_id="m1",
         sender="alice@example.com",
@@ -445,9 +460,14 @@ def test_replay_uses_stored_deferral_threshold_not_live_config(
         make_evidence_item(name="spf", direction="malicious", weight=0.40),
     ]
     raw_score = compute_raw_score(evidence)
+    # See test_replay_matching_exits_zero's comment: written via
+    # apply_calibration (identity today) rather than raw_score directly.
+    calibrated_confidence = apply_calibration(raw_score)
     original_threshold_used = 0.01
-    verdict = determine_verdict(raw_score, deferral_band=original_threshold_used)
-    report = _make_report(verdict=verdict, calibrated_confidence=raw_score, evidence=evidence)
+    verdict = determine_verdict(calibrated_confidence, deferral_band=original_threshold_used)
+    report = _make_report(
+        verdict=verdict, calibrated_confidence=calibrated_confidence, evidence=evidence
+    )
     record = EvidenceRecord(
         message_id="m1",
         sender=None,
@@ -463,6 +483,55 @@ def test_replay_uses_stored_deferral_threshold_not_live_config(
         ["sentinel-triage", "--replay", "contenthash4", "--db-path", store_db_path],
     )
     mocker.patch("sentinel.triage.worker.load_config", return_value=live_config)
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+
+
+def test_replay_recomputes_calibration_not_raw_score(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    make_evidence_item,  # type: ignore[no-untyped-def]
+) -> None:
+    """Regression guard for the pre-Epic-3 landmine (deferred-work.md):
+    _run_replay must recompute calibration during replay and compare
+    calibrated-to-calibrated, not the stored calibrated_confidence against a
+    freshly recomputed RAW score. Proven by mocking apply_calibration to a
+    non-identity transform: the stored calibrated_confidence (0.75) and the
+    raw score (1.0) are then deliberately DIFFERENT numbers. If _run_replay
+    still compared against the raw score (the old landmine), this would
+    report a false mismatch; replaying under the same (mocked) calibration
+    must match instead."""
+    evidence = [make_evidence_item(name="spf", direction="malicious", weight=0.8)]
+    raw_score = compute_raw_score(evidence)
+    assert raw_score == 1.0  # sanity: single fully-malicious item saturates the score
+
+    mocker.patch(
+        "sentinel.triage.worker.apply_calibration", side_effect=lambda x: 0.5 + (x - 0.5) * 0.5
+    )
+    calibrated_confidence = 0.5 + (raw_score - 0.5) * 0.5
+    assert calibrated_confidence != raw_score  # the two quantities must genuinely differ here
+
+    verdict = determine_verdict(calibrated_confidence, deferral_band=store_config.deferral_threshold)
+    report = _make_report(
+        verdict=verdict, calibrated_confidence=calibrated_confidence, evidence=evidence
+    )
+    record = EvidenceRecord(
+        message_id="m1",
+        sender=None,
+        report=report,
+        deferral_threshold_used=store_config.deferral_threshold,
+    )
+    persist_evidence_record(store_db_path, "contenthash-calib", record, store_config)
+
+    mocker.patch(
+        "sys.argv",
+        ["sentinel-triage", "--replay", "contenthash-calib", "--db-path", store_db_path],
+    )
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
 
     with pytest.raises(SystemExit) as exc:
         main()
