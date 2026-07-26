@@ -246,6 +246,30 @@ def test_apply_calibration_against_real_committed_placeholder_is_identity() -> N
         assert apply_calibration(raw_score) == raw_score
 
 
+def test_apply_calibration_rejects_unrecognized_method(mocker: MockerFixture) -> None:
+    """[Review][Patch] Code review (Edge Case Hunter): apply_calibration had
+    no explicit elif/else on `method` -- an unrecognized value (e.g. a typo,
+    or a stale platt_params field left over from a hand-edit that changed
+    `method` without clearing it) silently fell through to the Platt branch
+    whenever platt_params happened to be non-None, producing a wrong
+    calibrated confidence with no error at all."""
+    mocker.patch(
+        "sentinel.triage.scoring._CALIBRATION_MODEL",
+        {
+            "version": 1,
+            "method": "unknown_v2",
+            "fitted_at": None,
+            "sample_count": 0,
+            "isotonic_breakpoints": None,
+            "platt_params": {"a": -5.0, "b": 2.5},  # stale leftover value -- must NOT be used
+            "deferral_threshold_derived": 0.05,
+            "note": None,
+        },
+    )
+    with pytest.raises(ValueError, match="unknown_v2"):
+        apply_calibration(0.5)
+
+
 def test_scoring_never_imports_confidence() -> None:
     source_path = Path(__file__).resolve().parents[2] / "src" / "sentinel" / "triage" / "scoring.py"
     tree = ast.parse(source_path.read_text())

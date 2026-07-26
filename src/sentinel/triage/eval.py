@@ -44,6 +44,7 @@ import hashlib
 import json
 import math
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, TypedDict
@@ -296,15 +297,34 @@ def fit_isotonic_regression(pairs: list[tuple[float, float]]) -> list[tuple[floa
     where label is 0.0 (benign) or 1.0 (malicious). Returns a list of
     (x_min, x_max, calibrated_value) breakpoints describing a monotonically
     non-decreasing step function -- the same algorithm scikit-learn's
-    IsotonicRegression uses internally, implemented from scratch here."""
+    IsotonicRegression uses internally, implemented from scratch here.
+
+    [Review][Patch] Pairs are pre-aggregated by exact raw_score before PAVA
+    runs: two pairs sharing the same raw_score but different labels are a
+    realistic occurrence (compute_raw_score is a coarse weighted sum over a
+    small set of evidence-weight combinations, so distinct emails plausibly
+    collapse to the same score), and without this aggregation step PAVA's
+    strict '>' merge condition does not guarantee same-x points end up in
+    one pooled block -- whether they merge depended on input order, and
+    when they didn't merge, apply_isotonic's scan silently returned only
+    the first of the two same-x_max blocks, permanently hiding the other
+    point's label. Aggregating first makes every x value in the PAVA loop
+    unique by construction, so this failure mode cannot occur, and the
+    result no longer depends on the caller's input order."""
     if not pairs:
         return []
-    sorted_pairs = sorted(pairs, key=lambda p: p[0])
+
+    grouped: dict[float, list[float]] = {}
+    for x, y in pairs:
+        grouped.setdefault(x, []).append(y)
+    aggregated = sorted(
+        ((x, sum(ys), float(len(ys))) for x, ys in grouped.items()), key=lambda t: t[0]
+    )
 
     # Stack of pooled blocks: [sum_y, count, x_min, x_max].
     stack: list[list[float]] = []
-    for x, y in sorted_pairs:
-        stack.append([y, 1.0, x, x])
+    for x, sum_y, count in aggregated:
+        stack.append([sum_y, count, x, x])
         while len(stack) > 1 and (stack[-2][0] / stack[-2][1]) > (stack[-1][0] / stack[-1][1]):
             last = stack.pop()
             stack[-1][0] += last[0]
@@ -406,14 +426,24 @@ class CalibrationModel(TypedDict):
     note: str | None
 
 
-def fit_calibration_mapping(pairs: list[tuple[float, float]]) -> CalibrationModel:
+def fit_calibration_mapping(
+    pairs: list[tuple[float, float]], deferral_threshold_derived: float = 0.05
+) -> CalibrationModel:
     """Chooses isotonic regression when at least `_MIN_SAMPLES_FOR_ISOTONIC`
     pairs are available, else falls back to Platt scaling -- matching AC1's
     "isotonic regression, with Platt scaling as fallback if the corpus is
-    too small." `deferral_threshold_derived` is not computed by this
-    function (that requires a real precision/recall sweep against a held-out
-    corpus, out of this story's scope per its Scope Boundary) -- callers
-    that persist the result are expected to set it explicitly.
+    too small." `deferral_threshold_derived` is NOT computed by this
+    function from `pairs` -- deriving it for real requires a precision/
+    recall sweep against a held-out corpus, out of this story's scope per
+    its Scope Boundary -- it is a caller-supplied pass-through value, stored
+    on the returned model as-is. [Review][Patch] Previously this was a
+    hardcoded 0.05 baked directly into both return branches below, which
+    directly contradicted this exact docstring paragraph (which already
+    claimed "callers ... are expected to set it explicitly") -- callers had
+    no way to actually set it, since it wasn't a parameter. The default of
+    0.05 here exists only to match `Config.deferral_threshold`'s own
+    pre-existing hardcoded default (see `deferred-work.md`'s manual-sync
+    tracking entry), not because 0.05 is derived from `pairs` in any way.
 
     Deliberately fails loudly (ValueError) rather than degrading gracefully
     when `pairs` is empty or contains only one distinct label: with a single
@@ -432,10 +462,10 @@ def fit_calibration_mapping(pairs: list[tuple[float, float]]) -> CalibrationMode
     if not pairs:
         raise ValueError("cannot fit a calibration mapping against zero (raw_score, label) pairs")
     labels = {label for _, label in pairs}
-    if len(labels) < 2:
+    if labels != {0.0, 1.0}:
         raise ValueError(
-            f"cannot fit a calibration mapping: all {len(pairs)} pairs share the same label "
-            f"({labels!r}) -- a real corpus must include both benign (0.0) and malicious (1.0) "
+            f"cannot fit a calibration mapping: labels must be exactly {{0.0, 1.0}} "
+            f"(benign, malicious), got {labels!r} -- a real corpus must include both "
             "outcomes, or the fit degrades to a trivial constant function that silently "
             "miscalibrates every future score"
         )
@@ -449,7 +479,7 @@ def fit_calibration_mapping(pairs: list[tuple[float, float]]) -> CalibrationMode
             sample_count=len(pairs),
             isotonic_breakpoints=[list(bp) for bp in breakpoints],
             platt_params=None,
-            deferral_threshold_derived=0.05,
+            deferral_threshold_derived=deferral_threshold_derived,
             note=None,
         )
     a, b = fit_platt_scaling(pairs)
@@ -460,23 +490,54 @@ def fit_calibration_mapping(pairs: list[tuple[float, float]]) -> CalibrationMode
         sample_count=len(pairs),
         isotonic_breakpoints=None,
         platt_params={"a": a, "b": b},
-        deferral_threshold_derived=0.05,
+        deferral_threshold_derived=deferral_threshold_derived,
         note=None,
     )
 
 
 def save_calibration_model(model: CalibrationModel, path: str) -> None:
-    Path(path).write_text(json.dumps(model, indent=2), encoding="utf-8")
+    """[Review][Patch] Writes to a temp file in the same directory, then
+    atomically renames it into place via Path.replace() -- writing directly
+    to `path` would let a concurrent reader (e.g. another process's
+    scoring.py import-time load) observe a truncated/partial JSON document
+    if it opened the file mid-write. Nothing in this codebase currently
+    calls this against the live, imported calibration_model_v1.json, but
+    the swap is cheap and matches this project's existing atomic-write
+    precedent (triage/store.py's persist_evidence_record). Uses
+    pathlib.Path.replace() rather than os.replace() -- functionally
+    identical (Path.replace() calls os.replace() internally), but avoids an
+    `import os` in this file: test_triage_imports_no_remediation_capable_
+    library (FR32) bans smtplib/subprocess/os from every file under
+    triage/, structurally enforcing "no raw OS-level process control
+    capability" -- a file-rename utility method doesn't need to defeat
+    that guardrail to get atomicity."""
+    target = Path(path)
+    tmp_path = target.with_name(f"{target.name}.tmp-{uuid.uuid4().hex}")
+    tmp_path.write_text(json.dumps(model, indent=2), encoding="utf-8")
+    tmp_path.replace(target)
 
 
 def load_calibration_model(path: str) -> CalibrationModel:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    isotonic_breakpoints = data["isotonic_breakpoints"]
+    if isotonic_breakpoints is not None:
+        # [Review][Patch] apply_isotonic assumes an ascending-x_max order --
+        # true only because fit_isotonic_regression's own output is always
+        # sorted. A hand-edited or corrupted file with out-of-order
+        # breakpoints previously loaded without error and produced silently
+        # non-monotonic calibrated output rather than a defined failure.
+        x_maxes = [bp[1] for bp in isotonic_breakpoints]
+        if x_maxes != sorted(x_maxes):
+            raise ValueError(
+                f"{path}: isotonic_breakpoints must be sorted ascending by x_max, "
+                f"got {isotonic_breakpoints!r}"
+            )
     return CalibrationModel(
         version=data["version"],
         method=data["method"],
         fitted_at=data["fitted_at"],
         sample_count=data["sample_count"],
-        isotonic_breakpoints=data["isotonic_breakpoints"],
+        isotonic_breakpoints=isotonic_breakpoints,
         platt_params=data["platt_params"],
         deferral_threshold_derived=data["deferral_threshold_derived"],
         note=data["note"],

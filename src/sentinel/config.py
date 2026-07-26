@@ -20,8 +20,16 @@ class Config:
     gmail_credentials_path: str | None = None
     gmail_monitored_mailbox: str | None = None
     poll_interval_seconds: int = 300
-    deferral_threshold: float = 0.05  # PROVISIONAL: pre-Epic-3 placeholder — FR15 wants this
-    # eval-harness-derived, but the eval harness (Story 3.2) doesn't exist yet. Revisit then.
+    # [Review][Patch] Story 3.2's eval harness now exists (calibration_model_v1.json,
+    # loaded/applied by triage/scoring.py), but this default is still a hardcoded
+    # literal, not dynamically read from it -- config.py is a foundation-layer file
+    # and deliberately does not import from triage/scoring.py or triage/eval.py (see
+    # project-context.md's import hierarchy). calibration_model_v1.json's own
+    # deferral_threshold_derived field documents what the calibration run recommends
+    # (currently 0.05, matching this default, by deliberate placeholder design);
+    # syncing a future non-0.05 recommendation into this literal is a manual step,
+    # tracked in deferred-work.md, not automatic.
+    deferral_threshold: float = 0.05
     evidence_encryption_key: str | None = None
     retention_days: int = 30
     eval_corpus_path: str | None = None
