@@ -41,9 +41,12 @@ to the repository (AR12) -- referenced only via EVAL_CORPUS_PATH.
 """
 
 import hashlib
+import json
+import math
 import re
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from sentinel.triage.ingest import extract_email_content
 
@@ -272,3 +275,209 @@ def validate_corpus(corpus: Corpus) -> CorpusValidationResult:
     _check_provenance(Path(corpus["root"]), reasons)
     _check_benign_diversity(corpus, reasons)
     return CorpusValidationResult(is_valid=not reasons, reasons=reasons)
+
+
+# --- Calibration mapping fitting (Story 3.2) ------------------------------------
+#
+# Pure Python, no new dependency (numpy/scikit-learn) -- matches this
+# project's consistent zero-new-dependency discipline across every prior
+# story. Isotonic regression is fit via the Pool Adjacent Violators Algorithm
+# (PAVA); Platt scaling is fit via simple batch gradient descent on a
+# 2-parameter logistic. Both operate on synthetic (raw_score, label) pairs in
+# this story's own tests -- fitting against a REAL corpus requires running
+# the full triage pipeline (network calls to Watchman/Cipher) against real
+# email content, which is both explicitly excluded from CI (architecture
+# doc's own stated strategy) and currently impossible anyway (Story 3.1's
+# real corpus has zero malicious samples). See triage-3-2's Scope Boundary.
+
+
+def fit_isotonic_regression(pairs: list[tuple[float, float]]) -> list[tuple[float, float, float]]:
+    """Pool Adjacent Violators Algorithm (PAVA). `pairs` are (raw_score, label)
+    where label is 0.0 (benign) or 1.0 (malicious). Returns a list of
+    (x_min, x_max, calibrated_value) breakpoints describing a monotonically
+    non-decreasing step function -- the same algorithm scikit-learn's
+    IsotonicRegression uses internally, implemented from scratch here."""
+    if not pairs:
+        return []
+    sorted_pairs = sorted(pairs, key=lambda p: p[0])
+
+    # Stack of pooled blocks: [sum_y, count, x_min, x_max].
+    stack: list[list[float]] = []
+    for x, y in sorted_pairs:
+        stack.append([y, 1.0, x, x])
+        while len(stack) > 1 and (stack[-2][0] / stack[-2][1]) > (stack[-1][0] / stack[-1][1]):
+            last = stack.pop()
+            stack[-1][0] += last[0]
+            stack[-1][1] += last[1]
+            stack[-1][3] = last[3]
+
+    return [(block[2], block[3], block[0] / block[1]) for block in stack]
+
+
+def apply_isotonic(raw_score: float, breakpoints: list[tuple[float, float, float]]) -> float:
+    """Never raises -- an empty breakpoint list (e.g. fit against zero
+    samples) or an out-of-range raw_score both degrade to a defined value
+    rather than an exception: the neutral prior for no breakpoints at all,
+    clamped to the nearest edge block's value when raw_score falls outside
+    every fitted block's range.
+
+    Pooled blocks are not contiguous -- PAVA only records the x range of the
+    training points actually pooled into each block, so there are gaps
+    between one block's x_max and the next block's x_min wherever no training
+    point landed. A raw_score falling in such a gap is resolved to the first
+    block whose x_max it does not exceed, i.e. the step function is extended
+    leftward from each block up to (and including) its x_max -- this keeps
+    the output non-decreasing in raw_score, which an exact x_min<=x<=x_max
+    membership test (falling through to the last block on a gap miss) does
+    not guarantee."""
+    if not breakpoints:
+        return 0.5
+    for _x_min, x_max, value in breakpoints:
+        if raw_score <= x_max:
+            return value
+    return breakpoints[-1][2]
+
+
+_EXP_ARG_CLAMP = 500.0  # math.exp overflows well before this; keeps apply_platt exception-free
+
+
+def fit_platt_scaling(
+    pairs: list[tuple[float, float]], iterations: int = 1000, learning_rate: float = 0.1
+) -> tuple[float, float]:
+    """Fits P(malicious) = 1 / (1 + exp(A * raw_score + B)) via batch gradient
+    descent on cross-entropy loss. Standard Platt-scaling sign convention
+    (matches scikit-learn's): A is typically NEGATIVE for a
+    positively-correlated raw score -- higher raw score should mean higher
+    P(malicious), which requires exp(A*x+B) to SHRINK as x grows, i.e. A < 0.
+    Getting this sign backwards produces an inversely-correlated, silently
+    wrong calibration, not a crash -- see this story's directional-sanity
+    tests."""
+    if not pairs:
+        return 0.0, 0.0
+    a, b = 0.0, 0.0
+    n = float(len(pairs))
+    for _ in range(iterations):
+        grad_a = 0.0
+        grad_b = 0.0
+        for x, y in pairs:
+            p = _sigmoid_platt(x, a, b)
+            grad_a += (p - y) * x
+            grad_b += p - y
+        # P = 1/(1+exp(a*x+b)) is a DECREASING function of z=a*x+b, unlike the
+        # textbook sigmoid(z)=1/(1+exp(-z)); differentiating cross-entropy loss
+        # through that sign flip gives dL/da = (y-p)*x, so the descent step is
+        # a -= lr*(-grad_a) = a += lr*grad_a (grad_a accumulated as (p-y)*x
+        # above). Using "-=" here would climb the loss instead of descending
+        # it, inverting the fitted calibration without raising any error.
+        a += learning_rate * grad_a / n
+        b += learning_rate * grad_b / n
+    return a, b
+
+
+def _sigmoid_platt(x: float, a: float, b: float) -> float:
+    exponent = max(-_EXP_ARG_CLAMP, min(_EXP_ARG_CLAMP, a * x + b))
+    return 1.0 / (1.0 + math.exp(exponent))
+
+
+def apply_platt(raw_score: float, a: float, b: float) -> float:
+    """Never raises -- the exponent is clamped before calling math.exp,
+    guarding against overflow for extreme A/B/raw_score combinations."""
+    return _sigmoid_platt(raw_score, a, b)
+
+
+# PROVISIONAL, not calibrated -- same "not yet grounded in a real corpus"
+# framing as this module's other constants. Below this many (raw_score,
+# label) pairs, isotonic regression's step function is prone to overfitting
+# noise into spurious breakpoints; Platt scaling's 2-parameter logistic is
+# the more stable fallback for small samples, per AC1's literal wording.
+_MIN_SAMPLES_FOR_ISOTONIC = 100
+
+_CALIBRATION_MODEL_VERSION = 1
+
+
+class CalibrationModel(TypedDict):
+    version: int
+    method: Literal["isotonic", "platt", "identity"]
+    fitted_at: str | None
+    sample_count: int
+    isotonic_breakpoints: list[list[float]] | None
+    platt_params: dict[str, float] | None
+    deferral_threshold_derived: float
+    note: str | None
+
+
+def fit_calibration_mapping(pairs: list[tuple[float, float]]) -> CalibrationModel:
+    """Chooses isotonic regression when at least `_MIN_SAMPLES_FOR_ISOTONIC`
+    pairs are available, else falls back to Platt scaling -- matching AC1's
+    "isotonic regression, with Platt scaling as fallback if the corpus is
+    too small." `deferral_threshold_derived` is not computed by this
+    function (that requires a real precision/recall sweep against a held-out
+    corpus, out of this story's scope per its Scope Boundary) -- callers
+    that persist the result are expected to set it explicitly.
+
+    Deliberately fails loudly (ValueError) rather than degrading gracefully
+    when `pairs` is empty or contains only one distinct label: with a single
+    label, both fit_isotonic_regression and fit_platt_scaling "succeed"
+    without raising, but the result is a degenerate constant function (e.g.
+    calibrating every raw_score to "definitely benign" regardless of input)
+    -- silently wrong, not a crash, the same failure shape this codebase
+    already treats as unacceptable elsewhere (see fit_platt_scaling's own
+    sign-convention warning). AC1's precondition is a *validated* corpus
+    (both classes present, per Story 3.1's validate_corpus); this function
+    operates on plain (score, label) pairs, decoupled from Corpus/
+    CorpusValidationResult, so it cannot re-run that validation itself --
+    but it can and does refuse the one specific failure mode that would
+    otherwise let an unvalidated, single-class corpus silently overwrite a
+    safe placeholder with an actively harmful calibration."""
+    if not pairs:
+        raise ValueError("cannot fit a calibration mapping against zero (raw_score, label) pairs")
+    labels = {label for _, label in pairs}
+    if len(labels) < 2:
+        raise ValueError(
+            f"cannot fit a calibration mapping: all {len(pairs)} pairs share the same label "
+            f"({labels!r}) -- a real corpus must include both benign (0.0) and malicious (1.0) "
+            "outcomes, or the fit degrades to a trivial constant function that silently "
+            "miscalibrates every future score"
+        )
+    fitted_at = datetime.now(timezone.utc).isoformat()
+    if len(pairs) >= _MIN_SAMPLES_FOR_ISOTONIC:
+        breakpoints = fit_isotonic_regression(pairs)
+        return CalibrationModel(
+            version=_CALIBRATION_MODEL_VERSION,
+            method="isotonic",
+            fitted_at=fitted_at,
+            sample_count=len(pairs),
+            isotonic_breakpoints=[list(bp) for bp in breakpoints],
+            platt_params=None,
+            deferral_threshold_derived=0.05,
+            note=None,
+        )
+    a, b = fit_platt_scaling(pairs)
+    return CalibrationModel(
+        version=_CALIBRATION_MODEL_VERSION,
+        method="platt",
+        fitted_at=fitted_at,
+        sample_count=len(pairs),
+        isotonic_breakpoints=None,
+        platt_params={"a": a, "b": b},
+        deferral_threshold_derived=0.05,
+        note=None,
+    )
+
+
+def save_calibration_model(model: CalibrationModel, path: str) -> None:
+    Path(path).write_text(json.dumps(model, indent=2), encoding="utf-8")
+
+
+def load_calibration_model(path: str) -> CalibrationModel:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return CalibrationModel(
+        version=data["version"],
+        method=data["method"],
+        fitted_at=data["fitted_at"],
+        sample_count=data["sample_count"],
+        isotonic_breakpoints=data["isotonic_breakpoints"],
+        platt_params=data["platt_params"],
+        deferral_threshold_derived=data["deferral_threshold_derived"],
+        note=data["note"],
+    )

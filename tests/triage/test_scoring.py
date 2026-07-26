@@ -5,10 +5,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from pytest_mock import MockerFixture
 
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.scoring import (
     InconclusiveScoreError,
+    apply_calibration,
     compute_raw_score,
     determine_verdict,
 )
@@ -163,6 +165,85 @@ def test_determine_verdict_rejects_threshold_out_of_range() -> None:
 def test_determine_verdict_rejects_deferral_band_out_of_range() -> None:
     with pytest.raises(ValueError, match="deferral_band"):
         determine_verdict(0.7, deferral_band=-0.1)
+
+
+def test_apply_calibration_dispatches_to_identity(mocker: MockerFixture) -> None:
+    mocker.patch(
+        "sentinel.triage.scoring._CALIBRATION_MODEL",
+        {
+            "version": 1,
+            "method": "identity",
+            "fitted_at": None,
+            "sample_count": 0,
+            "isotonic_breakpoints": None,
+            "platt_params": None,
+            "deferral_threshold_derived": 0.05,
+            "note": None,
+        },
+    )
+    assert apply_calibration(0.37) == 0.37
+
+
+def test_apply_calibration_dispatches_to_isotonic(mocker: MockerFixture) -> None:
+    mocker.patch(
+        "sentinel.triage.scoring._CALIBRATION_MODEL",
+        {
+            "version": 1,
+            "method": "isotonic",
+            "fitted_at": "2026-01-01T00:00:00+00:00",
+            "sample_count": 100,
+            "isotonic_breakpoints": [[0.0, 0.4, 0.1], [0.5, 1.0, 0.9]],
+            "platt_params": None,
+            "deferral_threshold_derived": 0.05,
+            "note": None,
+        },
+    )
+    assert apply_calibration(0.2) == 0.1
+    assert apply_calibration(0.7) == 0.9
+
+
+def test_apply_calibration_dispatches_to_platt(mocker: MockerFixture) -> None:
+    mocker.patch(
+        "sentinel.triage.scoring._CALIBRATION_MODEL",
+        {
+            "version": 1,
+            "method": "platt",
+            "fitted_at": "2026-01-01T00:00:00+00:00",
+            "sample_count": 50,
+            "isotonic_breakpoints": None,
+            "platt_params": {"a": -5.0, "b": 2.5},
+            "deferral_threshold_derived": 0.05,
+            "note": None,
+        },
+    )
+    result = apply_calibration(0.5)
+    assert 0.0 <= result <= 1.0
+
+
+def test_apply_calibration_output_always_within_unit_interval(mocker: MockerFixture) -> None:
+    mocker.patch(
+        "sentinel.triage.scoring._CALIBRATION_MODEL",
+        {
+            "version": 1,
+            "method": "platt",
+            "fitted_at": "2026-01-01T00:00:00+00:00",
+            "sample_count": 50,
+            "isotonic_breakpoints": None,
+            "platt_params": {"a": 1e10, "b": 1e10},
+            "deferral_threshold_derived": 0.05,
+            "note": None,
+        },
+    )
+    for raw_score in [-1e10, -1.0, 0.0, 0.5, 1.0, 1e10]:
+        result = apply_calibration(raw_score)
+        assert 0.0 <= result <= 1.0
+
+
+def test_apply_calibration_against_real_committed_placeholder_is_identity() -> None:
+    # No mocking -- proves the actual shipped calibration_model_v1.json behaves
+    # as documented (identity), not just that the dispatch logic is correct.
+    for raw_score in [0.0, 0.1, 0.37, 0.5, 0.9, 1.0]:
+        assert apply_calibration(raw_score) == raw_score
 
 
 def test_scoring_never_imports_confidence() -> None:

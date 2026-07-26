@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "method": "identity",
+  "fitted_at": null,
+  "sample_count": 0,
+  "isotonic_breakpoints": null,
+  "platt_params": null,
+  "deferral_threshold_derived": 0.05,
+  "note": "PLACEHOLDER — no real calibration fit has been performed yet. Story 3.1's real corpus (benign_corpus_raw/) has zero malicious samples pending a phishing_pot license reply, so AC1's 'fit against a validated corpus' precondition cannot be satisfied yet. calibrated_confidence intentionally equals the raw score until a real fit replaces this file. deferral_threshold_derived matches config.py's pre-existing hardcoded default (0.05) to preserve current behavior — update both together once a real calibration run justifies a different value."
+}

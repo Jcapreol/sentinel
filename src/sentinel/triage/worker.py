@@ -30,7 +30,12 @@ from sentinel.triage.ingest import (
     poll_new_messages,
 )
 from sentinel.triage.report import TriageReport
-from sentinel.triage.scoring import InconclusiveScoreError, compute_raw_score, determine_verdict
+from sentinel.triage.scoring import (
+    InconclusiveScoreError,
+    apply_calibration,
+    compute_raw_score,
+    determine_verdict,
+)
 from sentinel.triage.store import (
     EvidenceRecord,
     is_message_processed,
@@ -144,16 +149,17 @@ def process_message(
 
     evidence = header_evidence + watchman_evidence + cipher_evidence
     raw_score = compute_raw_score(evidence)
+    calibrated_confidence = apply_calibration(raw_score)
 
     verdict: Literal["Malicious", "Benign", "Deferred"]
     try:
-        verdict = determine_verdict(raw_score, deferral_band=config.deferral_threshold)
+        verdict = determine_verdict(calibrated_confidence, deferral_band=config.deferral_threshold)
     except InconclusiveScoreError:
         verdict = "Deferred"
 
     return TriageReport(
         verdict=verdict,
-        calibrated_confidence=raw_score,
+        calibrated_confidence=calibrated_confidence,
         evidence=evidence,
         schema_version=1,
         message_hash=message_hash,
@@ -409,17 +415,21 @@ def _run_replay(message_hash: str, db_path: str, config: Config) -> None:
         )
         sys.exit(1)
 
-    # PRE-EPIC-3 LANDMINE (see deferred-work.md, scoped to Story 3.2): this
-    # compares original_report["calibrated_confidence"] against a freshly
-    # recomputed RAW score. That only works today because calibrated_confidence
-    # is currently a placeholder equal to the raw score. Once real calibration
-    # ships, calibrated_confidence will correctly diverge from the raw score by
-    # design, and every --replay call will report a false mismatch here.
+    # Story 3.2 resolves the pre-Epic-3 landmine tracked in deferred-work.md
+    # (option (b) of the two documented there): replay now recomputes
+    # calibration too and compares calibrated-to-calibrated, not
+    # calibrated-to-raw. There is only one calibration model version in
+    # existence so far (the identity placeholder), so "which version was
+    # active at original-processing time" (option (a)) is not yet a
+    # meaningful distinction to test against -- revisit if/when a second
+    # calibration_model_v2.json (or a versioned-model-selection mechanism)
+    # is ever introduced.
     recomputed_score = compute_raw_score(original_report["evidence"])
+    recomputed_calibrated = apply_calibration(recomputed_score)
     verdict: Literal["Malicious", "Benign", "Deferred"]
     try:
         verdict = determine_verdict(
-            recomputed_score, deferral_band=record["deferral_threshold_used"]
+            recomputed_calibrated, deferral_band=record["deferral_threshold_used"]
         )
     except InconclusiveScoreError:
         verdict = "Deferred"
@@ -428,10 +438,10 @@ def _run_replay(message_hash: str, db_path: str, config: Config) -> None:
     print(f"Original verdict:   {original_report['verdict']}")
     print(f"Recomputed verdict: {recomputed_verdict}")
     print(f"Original score:     {original_report['calibrated_confidence']:.4f}")
-    print(f"Recomputed score:   {recomputed_score:.4f}")
+    print(f"Recomputed score:   {recomputed_calibrated:.4f}")
 
     mismatch = original_report["verdict"] != recomputed_verdict or not math.isclose(
-        original_report["calibrated_confidence"], recomputed_score, abs_tol=1e-9
+        original_report["calibrated_confidence"], recomputed_calibrated, abs_tol=1e-9
     )
     if mismatch:
         print(
