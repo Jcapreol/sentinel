@@ -107,6 +107,30 @@ def test_gmail_fields_and_poll_interval_parsed_when_set(
     assert config.poll_interval_seconds == 60
 
 
+def test_eval_corpus_path_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.delenv("EVAL_CORPUS_PATH", raising=False)
+
+    config = load()
+
+    assert config.eval_corpus_path is None
+
+
+def test_eval_corpus_path_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.setenv("EVAL_CORPUS_PATH", "/data/eval-corpus")
+
+    config = load()
+
+    assert config.eval_corpus_path == "/data/eval-corpus"
+
+
 def test_load_succeeds_without_any_gmail_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """CLI/web dashboard must keep working with zero Gmail configuration."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")

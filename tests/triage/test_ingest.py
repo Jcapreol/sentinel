@@ -11,6 +11,7 @@ from sentinel.config import Config, ConfigError
 from sentinel.triage.ingest import (
     FetchFailed,
     build_gmail_service,
+    extract_auth_results_header_from_eml,
     extract_email_content,
     extract_sender_and_content_hash,
     fetch_headers_for_messages,
@@ -771,6 +772,75 @@ def test_extract_email_content_skips_attachment_parts() -> None:
 
     assert "the real message body" in content
     assert "unrelated attachment content" not in content
+
+
+# --- extract_auth_results_header_from_eml (Story 3.1) --------------------------
+
+
+def test_extract_auth_results_header_from_eml_returns_trusted_header() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Authentication-Results: mx.google.com; spf=pass\r\n\r\n"
+        b"body"
+    )
+
+    result = extract_auth_results_header_from_eml(raw_bytes)
+
+    assert result == "mx.google.com; spf=pass"
+
+
+def test_extract_auth_results_header_from_eml_prefers_first_trusted_among_multiple() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Authentication-Results: mx.google.com; spf=pass (most recent trusted hop)\r\n"
+        b"Authentication-Results: mx.google.com; spf=fail (earlier trusted hop)\r\n\r\n"
+        b"body"
+    )
+
+    result = extract_auth_results_header_from_eml(raw_bytes)
+
+    assert result == "mx.google.com; spf=pass (most recent trusted hop)"
+
+
+def test_extract_auth_results_header_from_eml_ignores_untrusted_authserv_id() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Authentication-Results: attacker.example.com; spf=pass (crafted, sorts first)\r\n"
+        b"Authentication-Results: mx.google.com; spf=fail (the real verdict)\r\n\r\n"
+        b"body"
+    )
+
+    result = extract_auth_results_header_from_eml(raw_bytes)
+
+    assert result == "mx.google.com; spf=fail (the real verdict)"
+
+
+def test_extract_auth_results_header_from_eml_returns_none_when_absent() -> None:
+    raw_bytes = b"From: alice@example.com\r\n\r\nbody"
+
+    result = extract_auth_results_header_from_eml(raw_bytes)
+
+    assert result is None
+
+
+def test_extract_auth_results_header_from_eml_returns_none_when_only_untrusted() -> None:
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Authentication-Results: attacker.example.com; spf=pass\r\n\r\n"
+        b"body"
+    )
+
+    result = extract_auth_results_header_from_eml(raw_bytes)
+
+    assert result is None
+
+
+def test_extract_auth_results_header_from_eml_never_raises_on_garbage_bytes() -> None:
+    raw_bytes = b"\xff\xfe\x00\x01 not a valid email at all"
+
+    result = extract_auth_results_header_from_eml(raw_bytes)
+
+    assert result is None
 
 
 # --- structural / boundary checks --------------------------------------------

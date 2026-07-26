@@ -24,6 +24,7 @@ class Config:
     # eval-harness-derived, but the eval harness (Story 3.2) doesn't exist yet. Revisit then.
     evidence_encryption_key: str | None = None
     retention_days: int = 30
+    eval_corpus_path: str | None = None
 
 
 def load() -> Config:
@@ -78,4 +79,5 @@ def load() -> Config:
         deferral_threshold=deferral_threshold,
         evidence_encryption_key=os.environ.get("SENTINEL_EVIDENCE_KEY"),
         retention_days=retention_days,
+        eval_corpus_path=os.environ.get("EVAL_CORPUS_PATH"),
     )

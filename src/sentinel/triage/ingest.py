@@ -169,6 +169,26 @@ def poll_new_messages(
     return messages, current_history_id
 
 
+def _select_trusted_auth_header(candidate_values: list[str]) -> str | None:
+    """A message can carry more than one Authentication-Results header (one per
+    relay hop). Prepend order alone isn't sufficient to trust a header — a
+    crafted header could be positioned to sort first. Instead, match each
+    header's authserv-id (the token before the first ';') against the
+    monitored mailbox's own trusted receiving MTA, and only ever return a
+    header that matches. Among multiple genuinely-trusted headers, the first
+    one wins (each hop prepends its own, so the first trusted header is the
+    most recent hop's verdict). Shared by both the Gmail-API path
+    (get_authentication_results_header) and the raw-.eml-file path
+    (extract_auth_results_header_from_eml, Story 3.1) -- this trust-selection
+    logic must not be duplicated.
+    """
+    for value in candidate_values:
+        authserv_id = value.split(";", 1)[0].strip().lower()
+        if authserv_id == _TRUSTED_AUTHSERV_ID:
+            return value
+    return None
+
+
 def get_authentication_results_header(
     service: Any, mailbox: str, message_id: str
 ) -> str | None:
@@ -180,24 +200,31 @@ def get_authentication_results_header(
             metadataHeaders=["Authentication-Results"],
         )
     )
-    # A message can carry more than one Authentication-Results header (one per
-    # relay hop). Prepend order alone isn't sufficient to trust a header — a
-    # crafted header could be positioned to sort first. Instead, match each
-    # header's authserv-id (the token before the first ';') against the
-    # monitored mailbox's own trusted receiving MTA, and only ever return a
-    # header that matches. Among multiple genuinely-trusted headers, the first
-    # one wins (each hop prepends its own, so the first trusted header is the
-    # most recent hop's verdict).
-    for header in message.get("payload", {}).get("headers", []):
-        if header.get("name", "").lower() != "authentication-results":
-            continue
-        value = header.get("value")
-        if value is None:
-            continue
-        authserv_id = value.split(";", 1)[0].strip().lower()
-        if authserv_id == _TRUSTED_AUTHSERV_ID:
-            return str(value)
-    return None
+    candidate_values = [
+        str(header["value"])
+        for header in message.get("payload", {}).get("headers", [])
+        if header.get("name", "").lower() == "authentication-results"
+        and header.get("value") is not None
+    ]
+    return _select_trusted_auth_header(candidate_values)
+
+
+def extract_auth_results_header_from_eml(raw_bytes: bytes) -> str | None:
+    """Pure function, no network call. Extracts the trusted Authentication-Results
+    header value from a raw .eml file's bytes (e.g. an eval corpus sample),
+    reusing the exact same trust-selection logic as the live Gmail-API path
+    (get_authentication_results_header) via _select_trusted_auth_header --
+    this security-relevant selection logic is not duplicated. Never raises --
+    returns None on any parse failure or absence, matching this module's
+    "pure function, best-effort" discipline (extract_sender_and_content_hash,
+    extract_email_content).
+    """
+    try:
+        parsed = email.message_from_bytes(raw_bytes)
+        candidate_values = [str(v) for v in parsed.get_all("Authentication-Results", [])]
+        return _select_trusted_auth_header(candidate_values)
+    except Exception:
+        return None
 
 
 def fetch_headers_for_messages(
