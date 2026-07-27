@@ -150,6 +150,42 @@ def load_corpus(corpus_path: str) -> Corpus:
     )
 
 
+def sample_corpus_files(
+    files: list[CorpusFile], sample_size: int | None
+) -> list[CorpusFile]:
+    """Deterministic selection by ascending content_hash -- NOT random.sample,
+    which would need a seed to be reproducible and adds seed-management
+    discipline this project hasn't needed elsewhere. Re-running with the same
+    sample_size against the same files always selects the same subset,
+    regardless of the input list's order (Story 3.3's `fit_real_calibration_
+    model.py` relies on this for a cost-bounded, reproducible-in-*which-
+    files-get-sampled* real-corpus fitting run -- NOT a guarantee that the
+    resulting fitted CalibrationModel is reproducible: WatchmanAgent's LLM
+    call has no temperature pinned, so two runs over the identical sampled
+    files can still produce different evidence/raw_scores and therefore a
+    different fit).
+
+    Generic over any list[CorpusFile] -- deliberately has no awareness of
+    tuning/held_out. Callers are responsible for only ever passing a
+    corpus's *_tuning lists here: `held_out` must remain completely unseen
+    by calibration fitting (reserved for a future evaluation harness), and
+    that guarantee has to be structural at the call site, not enforced
+    inside this generic sampling function.
+
+    [Review][Patch] Rejects a negative sample_size (ValueError) rather than
+    silently falling through to Python's slice semantics, where e.g.
+    `sorted(files, ...)[:-1]` means "all but the last element" -- the
+    opposite of what a negative "how many files to sample" input should
+    ever produce, and directly reachable via `fit_real_calibration_model.py`'s
+    --sample-size-per-class CLI flag with no other validation anywhere."""
+    if sample_size is not None and sample_size < 0:
+        raise ValueError(f"sample_size must be non-negative or None, got {sample_size!r}")
+    sorted_files = sorted(files, key=lambda f: f["content_hash"])
+    if sample_size is None or sample_size >= len(files):
+        return sorted_files
+    return sorted_files[:sample_size]
+
+
 def _check_class_presence(corpus: Corpus, reasons: list[str]) -> None:
     """Counts unique content, not raw file count -- N copies of the identical
     file (duplicate harvesting, a harvest-script retry bug) must not satisfy
@@ -200,6 +236,26 @@ def _check_split_integrity(corpus: Corpus, reasons: list[str]) -> None:
             "held_out split (possibly across different classes) -- zero overlap required "
             "between anything reserved for calibration tuning and the held-out evaluation set"
         )
+
+    # [Review][Patch] Same-split cross-class overlap: identical content
+    # present in BOTH classes' tuning (or both classes' held_out) is a
+    # contradictory-label case the check above never catches (it only
+    # compares tuning-vs-held_out, never tuning-vs-tuning). Undetected, this
+    # would feed fit_calibration_mapping (Story 3.2/3.3) the identical
+    # raw_score twice with opposite labels (0.0 and 1.0), corrupting the fit
+    # -- Story 3.3's fit_real_calibration_model.py is the first code path
+    # that actually runs validate_corpus -> fit_calibration_mapping against
+    # real, human-sourced corpus data end-to-end, making this exploitable.
+    for split_name in _SPLITS:
+        benign_hashes = {f["content_hash"] for f in corpus[f"benign_{split_name}"]}  # type: ignore[literal-required]
+        malicious_hashes = {f["content_hash"] for f in corpus[f"malicious_{split_name}"]}  # type: ignore[literal-required]
+        class_overlap = benign_hashes & malicious_hashes
+        if class_overlap:
+            reasons.append(
+                f"{len(class_overlap)} file(s) with identical content appear in BOTH benign/"
+                f"{split_name} and malicious/{split_name} -- contradictory labels for the same "
+                "content within the same split, which would corrupt a calibration fit"
+            )
 
 
 def _check_provenance(root: Path, reasons: list[str]) -> None:
