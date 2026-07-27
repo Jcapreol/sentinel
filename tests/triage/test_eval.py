@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from sentinel.triage.eval import (
+    CorpusFile,
     apply_isotonic,
     apply_platt,
     fit_calibration_mapping,
@@ -12,6 +13,7 @@ from sentinel.triage.eval import (
     fit_platt_scaling,
     load_calibration_model,
     load_corpus,
+    sample_corpus_files,
     save_calibration_model,
     validate_corpus,
 )
@@ -50,7 +52,16 @@ def _write_class(
     all files in order to control content-level diversity (see
     _PHISHING_ADJACENT_PATTERN); defaults to a plain, non-phishing-adjacent
     body. `duplicate_across_splits=True` makes the first held_out file byte-
-    identical to the first tuning file (to test overlap detection)."""
+    identical to the first tuning file (to test overlap detection).
+
+    [Review][Patch] The uniqueness marker includes `cls`, not just a
+    per-call counter -- two separate _write_class calls (e.g. "benign" then
+    "malicious") each reset their own counter to 0, so a counter-only marker
+    let two different classes produce byte-identical files whenever they
+    landed on the same counter value AND the same cycled body text (this
+    silently happened in _write_valid_corpus's default bodies args, and was
+    only caught once validate_corpus gained a same-split cross-class overlap
+    check -- see test_same_split_cross_class_overlap_is_rejected)."""
     if include_provenance:
         (root / cls).mkdir(parents=True, exist_ok=True)
         (root / cls / "PROVENANCE.md").write_text(provenance_text or "", encoding="utf-8")
@@ -58,7 +69,7 @@ def _write_class(
     body_choices = bodies or [_PLAIN_BODY]
     counter = 0
     for i in range(tuning_count):
-        body = f"{body_choices[i % len(body_choices)]} (unique marker {counter})"
+        body = f"{body_choices[i % len(body_choices)]} (unique marker {cls}-{counter})"
         _write_eml(root / cls / "tuning" / f"{cls}-tuning-{i}.eml", f"Subject {counter}", body)
         counter += 1
     for i in range(held_out_count):
@@ -69,7 +80,7 @@ def _write_class(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(first_tuning)
             continue
-        body = f"{body_choices[i % len(body_choices)]} (unique marker {counter})"
+        body = f"{body_choices[i % len(body_choices)]} (unique marker {cls}-{counter})"
         _write_eml(root / cls / "held_out" / f"{cls}-held_out-{i}.eml", f"Subject {counter}", body)
         counter += 1
 
@@ -413,6 +424,30 @@ def test_cross_class_overlap_between_tuning_and_held_out_is_rejected(tmp_path: P
     assert any("tuning" in r.lower() and "held_out" in r.lower() for r in result["reasons"])
 
 
+def test_same_split_cross_class_overlap_is_rejected(tmp_path: Path) -> None:
+    """[Review] A file mistakenly present in BOTH benign/tuning AND
+    malicious/tuning (contradictory labels for identical content, within the
+    SAME split) must be caught -- the pre-existing overlap check only
+    compared tuning-vs-held_out (across classes), never tuning-vs-tuning or
+    held_out-vs-held_out across classes. Real risk: Story 3.3's
+    fit_real_calibration_model.py is the first code path that actually runs
+    validate_corpus -> fit_calibration_mapping against real, human-sourced
+    corpus data end-to-end -- an undetected same-split cross-class overlap
+    would silently feed fit_calibration_mapping the identical raw_score
+    twice with contradictory labels (0.0 and 1.0), corrupting the fit."""
+    _write_valid_corpus(tmp_path)
+
+    benign_tuning_first = sorted((tmp_path / "benign" / "tuning").glob("*.eml"))[0]
+    malicious_tuning_first = sorted((tmp_path / "malicious" / "tuning").glob("*.eml"))[0]
+    malicious_tuning_first.write_bytes(benign_tuning_first.read_bytes())
+
+    corpus = load_corpus(str(tmp_path))
+    result = validate_corpus(corpus)
+
+    assert result["is_valid"] is False
+    assert any("benign" in r.lower() and "malicious" in r.lower() for r in result["reasons"])
+
+
 def test_load_corpus_never_raises_on_directory_listing_permission_error(tmp_path: Path, mocker) -> None:  # type: ignore[no-untyped-def]
     _write_eml(tmp_path / "benign" / "tuning" / "a.eml", "subj", "body")
     mocker.patch("pathlib.Path.iterdir", side_effect=PermissionError("simulated"))
@@ -718,3 +753,58 @@ def test_load_calibration_model_rejects_unsorted_isotonic_breakpoints(tmp_path: 
 
     with pytest.raises(ValueError, match="sorted"):
         load_calibration_model(str(path))
+
+
+# --- sample_corpus_files deterministic stratified sampling (Story 3.3, Task 2) --
+
+
+def _files(*hashes: str) -> list[CorpusFile]:
+    return [CorpusFile(path=f"/fake/{h}.eml", content_hash=h) for h in hashes]
+
+
+def test_sample_corpus_files_returns_everything_when_sample_size_exceeds_available() -> None:
+    files = _files("bbb", "aaa", "ccc")
+    result = sample_corpus_files(files, sample_size=10)
+
+    assert len(result) == 3
+    assert {f["content_hash"] for f in result} == {"aaa", "bbb", "ccc"}
+
+
+def test_sample_corpus_files_none_sample_size_returns_everything() -> None:
+    files = _files("bbb", "aaa", "ccc")
+    result = sample_corpus_files(files, sample_size=None)
+
+    assert len(result) == 3
+    assert {f["content_hash"] for f in result} == {"aaa", "bbb", "ccc"}
+
+
+def test_sample_corpus_files_smaller_sample_is_deterministic_regardless_of_input_order() -> None:
+    ascending = _files("aaa", "bbb", "ccc", "ddd", "eee")
+    shuffled = _files("ddd", "aaa", "eee", "ccc", "bbb")
+
+    result_a = sample_corpus_files(ascending, sample_size=2)
+    result_b = sample_corpus_files(shuffled, sample_size=2)
+
+    assert result_a == result_b
+    assert [f["content_hash"] for f in result_a] == ["aaa", "bbb"]
+
+
+def test_sample_corpus_files_repeated_calls_are_stable() -> None:
+    files = _files("bbb", "aaa", "ccc", "ddd")
+
+    first = sample_corpus_files(files, sample_size=2)
+    second = sample_corpus_files(files, sample_size=2)
+
+    assert first == second
+
+
+def test_sample_corpus_files_rejects_negative_sample_size() -> None:
+    """[Review][Patch] A negative sample_size previously fell through to
+    Python's slice semantics ([:-1] means "all but the last element"), so
+    e.g. sample_size=-1 against 10 files silently returned 9 -- not an
+    error, not an empty selection, not anything resembling "sample -1
+    files." Directly reachable via fit_real_calibration_model.py's
+    --sample-size-per-class CLI flag with no other validation anywhere."""
+    files = _files("aaa", "bbb", "ccc")
+    with pytest.raises(ValueError, match="non-negative"):
+        sample_corpus_files(files, sample_size=-1)

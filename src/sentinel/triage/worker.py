@@ -73,6 +73,65 @@ def _require_valid_poll_interval(config: Config) -> None:
         )
 
 
+def gather_evidence_and_raw_score(
+    auth_results_header: str | None,
+    email_content: str,
+    watchman: SentinelAgent,
+    cipher: SentinelAgent,
+) -> tuple[list[EvidenceItem], float]:
+    """Pure refactor extracted from process_message (Story 3.3): header +
+    Watchman + Cipher evidence gathering, merged into a raw_score via
+    compute_raw_score. Deliberately stops here -- does NOT call
+    apply_calibration/determine_verdict -- so this is reusable by
+    fit_real_calibration_model.py's corpus-fitting script, which needs the
+    raw score as fit_calibration_mapping's training input and cannot call
+    apply_calibration first (the calibration model being fit doesn't exist
+    yet -- that would be circular). process_message remains the only caller
+    that goes on to compute calibrated_confidence/verdict from this."""
+    header_evidence = investigate_header_authentication(auth_results_header)
+
+    # Watchman (LLM behavioral analysis) and Cipher (VT/AbuseIPDB/URLhaus
+    # reputation lookups) run concurrently, mirroring main.py's run_analysis
+    # precedent exactly. Both shipped SentinelAgent implementations are
+    # guaranteed to never raise and always populate `evidence` -- but
+    # this function is deliberately typed against the bare SentinelAgent
+    # Protocol (not the concrete classes), which enforces neither guarantee.
+    # A third-party agent violating either one degrades to a coverage-gap
+    # evidence item here, matching every other failure path in this
+    # pipeline, rather than crashing (2026-07-23 code-review patch).
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        watchman_future = executor.submit(watchman.analyze, email_content)
+        cipher_future = executor.submit(cipher.analyze, email_content)
+        try:
+            watchman_evidence = watchman_future.result().get("evidence", [])
+        except Exception as e:
+            watchman_evidence = [
+                EvidenceItem(
+                    name="watchman_analysis",
+                    finding=f"Watchman analysis crashed unexpectedly: {type(e).__name__} — "
+                    "behavioral analysis unavailable",
+                    weight=0.0,
+                    direction="neutral",
+                )
+            ]
+        try:
+            cipher_evidence = cipher_future.result().get("evidence", [])
+        except Exception as e:
+            cipher_evidence = [
+                EvidenceItem(
+                    name="cipher_analysis",
+                    finding=f"Cipher analysis crashed unexpectedly: {type(e).__name__} — "
+                    "threat intelligence lookup unavailable",
+                    weight=0.0,
+                    direction="neutral",
+                )
+            ]
+
+    evidence = header_evidence + watchman_evidence + cipher_evidence
+    raw_score = compute_raw_score(evidence)
+    return evidence, raw_score
+
+
 def process_message(
     message_id: str,
     auth_results_header: str | None | FetchFailed,
@@ -108,47 +167,9 @@ def process_message(
             timestamp=timestamp,
         )
 
-    header_evidence = investigate_header_authentication(auth_results_header)
-
-    # Watchman (LLM behavioral analysis) and Cipher (VT/AbuseIPDB/URLhaus
-    # reputation lookups) run concurrently, mirroring main.py's run_analysis
-    # precedent exactly. Both shipped SentinelAgent implementations are
-    # guaranteed to never raise and always populate `evidence` -- but
-    # process_message is deliberately typed against the bare SentinelAgent
-    # Protocol (not the concrete classes), which enforces neither guarantee.
-    # A third-party agent violating either one degrades to a coverage-gap
-    # evidence item here, matching every other failure path in this
-    # pipeline, rather than crashing (2026-07-23 code-review patch).
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        watchman_future = executor.submit(watchman.analyze, email_content)
-        cipher_future = executor.submit(cipher.analyze, email_content)
-        try:
-            watchman_evidence = watchman_future.result().get("evidence", [])
-        except Exception as e:
-            watchman_evidence = [
-                EvidenceItem(
-                    name="watchman_analysis",
-                    finding=f"Watchman analysis crashed unexpectedly: {type(e).__name__} — "
-                    "behavioral analysis unavailable",
-                    weight=0.0,
-                    direction="neutral",
-                )
-            ]
-        try:
-            cipher_evidence = cipher_future.result().get("evidence", [])
-        except Exception as e:
-            cipher_evidence = [
-                EvidenceItem(
-                    name="cipher_analysis",
-                    finding=f"Cipher analysis crashed unexpectedly: {type(e).__name__} — "
-                    "threat intelligence lookup unavailable",
-                    weight=0.0,
-                    direction="neutral",
-                )
-            ]
-
-    evidence = header_evidence + watchman_evidence + cipher_evidence
-    raw_score = compute_raw_score(evidence)
+    evidence, raw_score = gather_evidence_and_raw_score(
+        auth_results_header, email_content, watchman, cipher
+    )
     calibrated_confidence = apply_calibration(raw_score)
 
     verdict: Literal["Malicious", "Benign", "Deferred"]
