@@ -8,6 +8,8 @@ from sentinel.triage.eval import (
     CorpusFile,
     apply_isotonic,
     apply_platt,
+    compute_auc_roc,
+    compute_ece,
     fit_calibration_mapping,
     fit_isotonic_regression,
     fit_platt_scaling,
@@ -808,3 +810,132 @@ def test_sample_corpus_files_rejects_negative_sample_size() -> None:
     files = _files("aaa", "bbb", "ccc")
     with pytest.raises(ValueError, match="non-negative"):
         sample_corpus_files(files, sample_size=-1)
+
+
+# --- compute_ece (Story 3.4, Task 1) ---------------------------------------------
+
+
+def _perfectly_calibrated_pairs() -> list[tuple[float, float]]:
+    # 5 bins of 10 samples each; every sample in a bin shares the bin's exact
+    # midpoint confidence, and the positive count within the bin exactly
+    # matches that midpoint (e.g. midpoint 0.3 -> 3/10 positive) -- so
+    # avg_confidence == actual_positive_fraction == midpoint for every bin,
+    # by construction, giving an exact ECE of 0.0.
+    pairs: list[tuple[float, float]] = []
+    for midpoint, positive_count in [(0.1, 1), (0.3, 3), (0.5, 5), (0.7, 7), (0.9, 9)]:
+        for i in range(10):
+            label = 1.0 if i < positive_count else 0.0
+            pairs.append((midpoint, label))
+    return pairs
+
+
+def test_compute_ece_perfectly_calibrated_data_is_near_zero() -> None:
+    result = compute_ece(_perfectly_calibrated_pairs())
+    assert result["ece"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_compute_ece_badly_miscalibrated_data_is_large() -> None:
+    # Confidence always 0.9 (high), but only 50% actual positive -- a
+    # confidently wrong predictor. |0.9 - 0.5| = 0.4.
+    pairs = [(0.9, 1.0 if i % 2 == 0 else 0.0) for i in range(20)]
+    result = compute_ece(pairs)
+    assert result["ece"] > 0.3
+
+
+def test_compute_ece_excludes_inconclusive_bins_from_the_figure() -> None:
+    """A bin with fewer than _MIN_SAMPLES_PER_ECE_BIN samples must be
+    excluded from the ece figure, not silently folded in -- construct a case
+    where including vs excluding the small bin would change the numeric
+    result, and assert the exclusion actually happened."""
+    conclusive_pairs = _perfectly_calibrated_pairs()  # ece contribution 0.0, bins at 0.1/0.3/0.5/0.7/0.9
+    # 2 samples (< the 5-sample minimum) in bin [0.0, 0.1) -- otherwise
+    # empty, so this doesn't merge into any conclusive bin -- badly
+    # miscalibrated (confidence 0.05, but both labeled malicious): if
+    # wrongly included, this would pull the overall ECE up significantly
+    # from 0.0.
+    inconclusive_pairs = [(0.05, 1.0), (0.05, 1.0)]
+
+    result_without = compute_ece(conclusive_pairs)
+    result_with = compute_ece(conclusive_pairs + inconclusive_pairs)
+
+    assert result_with["ece"] == pytest.approx(result_without["ece"], abs=1e-9)
+    inconclusive_bins = [b for b in result_with["bins"] if b["inconclusive"]]
+    assert len(inconclusive_bins) == 1
+    assert inconclusive_bins[0]["count"] == 2
+    assert result_with["excluded_sample_count"] == 2
+
+
+def test_compute_ece_handles_empty_predictions_without_raising() -> None:
+    result = compute_ece([])
+    assert result["ece"] == 0.0
+    assert result["bins"] == []
+    assert result["excluded_sample_count"] == 0
+
+
+def test_compute_ece_counts_out_of_range_confidence_in_excluded_sample_count() -> None:
+    """[Review] An out-of-range confidence (outside [0.0, 1.0]) matches no
+    bin's condition and was previously dropped from bins, from the ece sum,
+    AND from excluded_sample_count -- contradicting the docstring's
+    explicit claim that excluded samples are "not silently dropped without
+    a trace." apply_calibration is documented to always produce [0.0, 1.0],
+    but this is a defensive guarantee, not an assumption to trust blindly."""
+    pairs = [(1.5, 1.0)] + [(0.5, 0.0)] * 5
+    result = compute_ece(pairs)
+
+    assert sum(b["count"] for b in result["bins"]) == 5  # only the in-range samples binned
+    assert result["excluded_sample_count"] == 1  # the out-of-range sample is accounted for
+
+
+# --- compute_auc_roc (Story 3.4, Task 2) -----------------------------------------
+
+
+def test_compute_auc_roc_perfectly_separable_data_is_near_one() -> None:
+    pairs = [(x / 100, 0.0) for x in range(0, 50)] + [(x / 100, 1.0) for x in range(50, 100)]
+    assert compute_auc_roc(pairs) == pytest.approx(1.0)
+
+
+def test_compute_auc_roc_reversed_data_is_near_zero() -> None:
+    # High confidence -> benign, low confidence -> malicious: perfectly
+    # anti-correlated with the true label.
+    pairs = [(x / 100, 1.0) for x in range(0, 50)] + [(x / 100, 0.0) for x in range(50, 100)]
+    assert compute_auc_roc(pairs) == pytest.approx(0.0)
+
+
+def test_compute_auc_roc_uncorrelated_data_is_near_chance_level() -> None:
+    pairs = [(x / 100, float(x % 2)) for x in range(100)]
+    auc = compute_auc_roc(pairs)
+    assert 0.35 <= auc <= 0.65
+
+
+def test_compute_auc_roc_handles_ties_without_raising() -> None:
+    """[Review] Strengthened: the original assertion (0.0 <= auc <= 1.0) is
+    near-vacuous since AUC is bounded to [0,1] by construction of the
+    formula -- a subtly wrong tie-averaging implementation (e.g. an
+    off-by-one in the average-rank calculation) would very likely still
+    land inside [0,1] and pass. This fully-tied input (2 positive, 2
+    negative, all at one confidence) has an exact hand-computable expected
+    value of 0.5 -- every pair is a "tie", which by definition contributes
+    0.5 (neither concordant nor discordant) to the U-statistic."""
+    pairs = [(0.5, 0.0), (0.5, 1.0), (0.5, 0.0), (0.5, 1.0)]
+    assert compute_auc_roc(pairs) == pytest.approx(0.5)
+
+
+def test_compute_auc_roc_partial_tie_matches_hand_computed_value() -> None:
+    # 1 negative at 0.3 (unambiguously below the tie), 2 tied negatives and
+    # 2 tied positives at 0.6, 1 positive at 0.9 (unambiguously above).
+    # n_pos=3, n_neg=3. Pairwise concordance (positive > negative counts as
+    # 1, tie counts as 0.5): the untied 0.9-positive beats all 3 negatives
+    # (3.0); each tied 0.6-positive beats the 0.3-negative (1.0 each) and
+    # ties the two 0.6-negatives (0.5 each) -- (1.0 + 0.5 + 0.5) = 2.0 per
+    # tied positive, x2 = 4.0. Total concordance = 3.0 + 4.0 = 7.0 out of
+    # n_pos*n_neg = 9 -> AUC = 7/9.
+    pairs = [(0.3, 0.0), (0.6, 0.0), (0.6, 0.0), (0.6, 1.0), (0.6, 1.0), (0.9, 1.0)]
+    assert compute_auc_roc(pairs) == pytest.approx(7 / 9)
+
+
+def test_compute_auc_roc_single_class_returns_chance_level() -> None:
+    assert compute_auc_roc([(0.1, 0.0), (0.5, 0.0), (0.9, 0.0)]) == 0.5
+
+
+def test_compute_auc_roc_empty_input_returns_chance_level() -> None:
+    assert compute_auc_roc([]) == 0.5

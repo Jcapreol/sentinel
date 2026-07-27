@@ -598,3 +598,135 @@ def load_calibration_model(path: str) -> CalibrationModel:
         deferral_threshold_derived=data["deferral_threshold_derived"],
         note=data["note"],
     )
+
+
+# --- Evaluation harness: ECE, AUC-ROC (Story 3.4) -------------------------------
+#
+# Pure statistics functions, no dependency on scoring.py -- deliberately, to
+# avoid a circular import (scoring.py already imports from this module; see
+# Story 3.3's Dev Notes for the same reasoning applied to
+# gather_evidence_and_raw_score). Tested against synthetic (confidence,
+# label) pairs only, per AR13 -- the live-corpus run stays out of CI.
+
+_MIN_SAMPLES_PER_ECE_BIN = 5  # PROVISIONAL, not calibrated -- see this module's other constants
+
+
+class ECEBin(TypedDict):
+    bin_range: tuple[float, float]
+    count: int
+    avg_confidence: float
+    actual_positive_fraction: float
+    inconclusive: bool
+
+
+class ECEResult(TypedDict):
+    ece: float
+    bins: list[ECEBin]
+    excluded_sample_count: int
+
+
+def compute_ece(
+    predictions: list[tuple[float, float]],
+    num_bins: int = 10,
+    min_bin_size: int = _MIN_SAMPLES_PER_ECE_BIN,
+) -> ECEResult:
+    """Expected Calibration Error, num_bins equal-width buckets over
+    [0.0, 1.0]. `predictions` are (calibrated_confidence, true_label) pairs,
+    true_label 0.0 (benign) or 1.0 (malicious) -- same pair convention as
+    fit_calibration_mapping.
+
+    A bin with fewer than min_bin_size samples is flagged inconclusive
+    (FR30) and EXCLUDED from the `ece` figure -- not silently folded in
+    (which would let a handful of noisy samples swing the headline number)
+    and not silently dropped without a trace (excluded_sample_count reports
+    exactly how many samples were excluded and why). [Review] A confidence
+    outside [0.0, 1.0] matches no bin's condition and is likewise counted in
+    excluded_sample_count, not silently dropped -- apply_calibration is
+    documented to always produce [0.0, 1.0] (a defensive guarantee, not an
+    assumption this function trusts blindly)."""
+    bins: list[ECEBin] = []
+    excluded_sample_count = 0
+    weighted_error_sum = 0.0
+    conclusive_sample_count = 0
+    binned_count = 0
+
+    for i in range(num_bins):
+        bin_min = i / num_bins
+        bin_max = (i + 1) / num_bins
+        in_bin = [
+            (conf, label)
+            for conf, label in predictions
+            if (bin_min <= conf < bin_max) or (i == num_bins - 1 and conf == bin_max)
+        ]
+        if not in_bin:
+            continue
+        count = len(in_bin)
+        binned_count += count
+        avg_confidence = sum(conf for conf, _label in in_bin) / count
+        actual_positive_fraction = sum(label for _conf, label in in_bin) / count
+        inconclusive = count < min_bin_size
+        bins.append(
+            ECEBin(
+                bin_range=(bin_min, bin_max),
+                count=count,
+                avg_confidence=avg_confidence,
+                actual_positive_fraction=actual_positive_fraction,
+                inconclusive=inconclusive,
+            )
+        )
+        if inconclusive:
+            excluded_sample_count += count
+        else:
+            weighted_error_sum += count * abs(avg_confidence - actual_positive_fraction)
+            conclusive_sample_count += count
+
+    excluded_sample_count += len(predictions) - binned_count  # out-of-[0,1] confidences
+    ece = weighted_error_sum / conclusive_sample_count if conclusive_sample_count else 0.0
+    return ECEResult(ece=ece, bins=bins, excluded_sample_count=excluded_sample_count)
+
+
+# PROVISIONAL, not calibrated -- the threshold run_evaluation_harness.py (Task 3)
+# uses to decide "the discrimination metric confirms the system isn't a flat
+# predictor" (AC3). A truly random/flat predictor has AUC ~= 0.5; a small
+# provisional margin above that (rather than checking > 0.5 exactly) avoids a
+# noise-driven false pass on a genuinely uninformative system.
+_MIN_AUC_FOR_NON_FLAT = 0.55
+
+
+def compute_auc_roc(predictions: list[tuple[float, float]]) -> float:
+    """AUC-ROC via the Mann-Whitney U statistic: rank all predictions by
+    confidence ascending (average rank for ties), AUC = (sum of ranks of the
+    positive-class samples - n_pos*(n_pos+1)/2) / (n_pos * n_neg). Never
+    raises -- returns 0.5 (chance level, not an error) if predictions is
+    empty or only one class is present, since AUC is undefined with a
+    single class (matches apply_isotonic/apply_platt's "never raises on
+    degenerate input, degrade to a defined value" precedent)."""
+    if not predictions:
+        return 0.5
+
+    sorted_predictions = sorted(predictions, key=lambda p: p[0])
+    n = len(sorted_predictions)
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j < n and sorted_predictions[j][0] == sorted_predictions[i][0]:
+            j += 1
+        # Tied confidences share the average of their rank positions
+        # (1-indexed) -- standard tie-breaking for the Mann-Whitney U /
+        # AUC-ROC formula, not an arbitrary/unstable ordering.
+        average_rank = (i + 1 + j) / 2.0
+        for k in range(i, j):
+            ranks[k] = average_rank
+        i = j
+
+    n_pos = sum(1 for _conf, label in sorted_predictions if label == 1.0)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    sum_positive_ranks = sum(
+        rank for rank, (_conf, label) in zip(ranks, sorted_predictions) if label == 1.0
+    )
+    u_statistic = sum_positive_ranks - n_pos * (n_pos + 1) / 2.0
+    return u_statistic / (n_pos * n_neg)
