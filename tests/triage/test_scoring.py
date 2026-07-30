@@ -239,11 +239,24 @@ def test_apply_calibration_output_always_within_unit_interval(mocker: MockerFixt
         assert 0.0 <= result <= 1.0
 
 
-def test_apply_calibration_against_real_committed_placeholder_is_identity() -> None:
-    # No mocking -- proves the actual shipped calibration_model_v1.json behaves
-    # as documented (identity), not just that the dispatch logic is correct.
-    for raw_score in [0.0, 0.1, 0.37, 0.5, 0.9, 1.0]:
-        assert apply_calibration(raw_score) == raw_score
+def test_apply_calibration_against_real_committed_model_is_non_identity_and_monotonic() -> None:
+    """The committed calibration_model_v1.json is now a real fit
+    (fit_real_calibration_model.py, run 2026-07-28) -- retired the old
+    "is identity" assertion this test used to make, since that premise is
+    now correctly obsolete by design, not a regression. No mocking --
+    proves two real properties of the ACTUAL shipped file: (1) it's
+    genuinely non-identity (at least one swept input differs from its own
+    raw value), and (2) it's monotonically non-decreasing in raw_score --
+    a real calibration curve must never invert (a higher raw_score
+    producing a LOWER calibrated_confidence would be a fitting bug, not
+    just an uncalibrated placeholder)."""
+    swept = [i / 100 for i in range(0, 101)]
+    calibrated = [apply_calibration(x) for x in swept]
+
+    assert any(c != x for c, x in zip(calibrated, swept)), "expected a non-identity calibration curve"
+    assert calibrated == sorted(calibrated), (
+        "calibrated_confidence must be monotonically non-decreasing in raw_score"
+    )
 
 
 def test_apply_calibration_rejects_unrecognized_method(mocker: MockerFixture) -> None:

@@ -75,12 +75,49 @@ def test_process_message_no_header_defers() -> None:
     assert len(report["evidence"]) > 0
 
 
+def test_process_message_no_informative_evidence_defers_structurally_even_if_calibration_saturates(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Fix] Regression test for the exact bug that just occurred in
+    production: a real fitted calibration curve that saturates hard to
+    0.0/1.0 (a pure step function, never landing anywhere near the neutral
+    prior) silently defeated deferral_band-based protection for the
+    zero-evidence case -- apply_calibration(0.5) == 1.0 under the real
+    committed model, so a message with NO real evidence anywhere got
+    verdict="Malicious" instead of "Deferred". This proves the NEW
+    structural bypass (mirroring the FetchFailed precedent) protects the
+    zero-evidence case independent of calibration behavior entirely --
+    even with apply_calibration mocked to ALWAYS return 1.0 (the worst
+    case, maximally "confident"-looking saturation), a message with no
+    informative evidence anywhere (no header, neutral Watchman/Cipher)
+    must still defer. This is what stops it from silently regressing
+    again the way it just did, no matter how a future calibration fit
+    happens to shape its curve."""
+    mocker.patch("sentinel.triage.worker.apply_calibration", return_value=1.0)
+
+    report = process_message("m1", None, "", _neutral_agent, _neutral_agent, _config())
+
+    assert report["verdict"] == "Deferred"
+
+
 def test_process_message_score_inside_deferral_band_defers() -> None:
     # dmarc=pass (benign, weight 0.45) vs spf=fail (malicious, weight 0.40) yields
-    # a raw score of ~0.4706 — not exactly neutral, but within the default 0.05
-    # deferral_band around 0.5. Proves the config.deferral_threshold -> worker ->
-    # scoring.py wiring actually defers on a close-but-not-exact score, not just
-    # on the exact-neutral case already covered by test_process_message_no_header_defers.
+    # a raw score close to 0.5 (weak-but-PRESENT, nearly-canceling directional
+    # evidence) -- within the default 0.05 deferral_band around 0.5. Proves the
+    # config.deferral_threshold -> worker -> scoring.py wiring actually defers
+    # on a close-but-not-exact score, not just on the exact-neutral case
+    # already covered by test_process_message_no_header_defers.
+    #
+    # [Fix] Previously deliberately left failing: the real fitted calibration
+    # model committed 2026-07-28 is a hard 0.0/1.0 step function (the corpus
+    # has no ambiguous/conflicting-evidence examples for PAVA to fit a middle
+    # output to), so this raw score calibrated to a confident 1.0 -- no
+    # deferral_band value on the CALIBRATED score could catch it, since 0.0
+    # and 1.0 are both always exactly 0.5 from the neutral prior under that
+    # curve shape. Resolved by a second structural deferral gate in
+    # process_message that checks raw_score directly, before apply_calibration
+    # ever runs -- a stopgap pending a broader calibration corpus (see
+    # deferred-work.md), not a permanent design choice.
     header = "dmarc=pass; spf=fail"
 
     report = process_message(
@@ -88,11 +125,30 @@ def test_process_message_score_inside_deferral_band_defers() -> None:
     )
 
     assert report["verdict"] == "Deferred"
-    # calibrated_confidence == raw_score here because the shipped
-    # calibration_model_v1.json is the Story 3.2 "identity" placeholder --
-    # this assertion holds by that deliberate design, not by coincidence,
-    # and is expected to need updating once a real calibration model ships.
     assert abs(report["calibrated_confidence"] - 0.5) < 0.05
+
+
+def test_process_message_conflicting_evidence_defers_structurally_even_if_calibration_saturates(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Fix] Regression test for the second half of the production incident:
+    weak-but-PRESENT, nearly-canceling directional evidence (dmarc=pass vs
+    spf=fail) is real signal, so the all-neutral bypass correctly does not
+    catch it -- but the real fitted calibration curve cannot yet be trusted to
+    preserve that uncertainty (it's a hard 0.0/1.0 step function with no
+    middle output). This proves the NEW raw-score structural deferral gate
+    protects this case independent of calibration behavior entirely -- even
+    with apply_calibration mocked to ALWAYS return 1.0 (the worst case), a
+    message whose evidence nearly cancels around the neutral prior must still
+    defer."""
+    mocker.patch("sentinel.triage.worker.apply_calibration", return_value=1.0)
+    header = "dmarc=pass; spf=fail"
+
+    report = process_message(
+        "m1", header, "", _neutral_agent, _neutral_agent, _config(deferral_threshold=0.05)
+    )
+
+    assert report["verdict"] == "Deferred"
 
 
 def test_process_message_never_raises_inconclusive_score_error() -> None:
@@ -238,13 +294,21 @@ def test_process_message_aggregates_evidence_from_headers_watchman_and_cipher() 
     # SentinelAgent Protocol-level aggregation (per the Testing Standards
     # section above), not either concrete agent's exact evidence naming.
     assert len([n for n in watchman_names if n == "stub_finding"]) >= 1
-    # Combined score must reflect all three sources' weighted contribution,
-    # not just the header's -- strictly more malicious-leaning than header alone.
-    # (Comparing calibrated_confidence directly is valid under the Story 3.2
-    # identity placeholder, since it's monotonic with raw_score by construction
-    # -- an isotonic/Platt model would preserve this ordering too, but not
-    # necessarily the exact values compared elsewhere in this file.)
-    assert combined_report["calibrated_confidence"] > header_only_report["calibrated_confidence"]
+    # [Fix] Combined score must reflect all three sources' weighted
+    # contribution, not just the header's -- strictly more malicious-leaning
+    # than header alone. Retargeted to RAW score (via compute_raw_score on
+    # each report's own returned `evidence`, not a reimplementation) rather
+    # than calibrated_confidence: a real fitted calibration curve is only
+    # guaranteed monotonic non-decreasing, not STRICTLY increasing -- once a
+    # saturating curve maps two genuinely different raw scores into the same
+    # output bucket (e.g. a hard step function's two possible outputs, 0.0
+    # or 1.0), the calibrated values legitimately tie even though evidence
+    # aggregation worked correctly. Evidence aggregation's actual guarantee
+    # is about the RAW weighted sum, which calibration is never required to
+    # preserve strict ordering through.
+    header_only_raw = compute_raw_score(header_only_report["evidence"])
+    combined_raw = compute_raw_score(combined_report["evidence"])
+    assert combined_raw > header_only_raw
 
 
 def test_process_message_agent_crash_degrades_to_coverage_gap_not_raising() -> None:

@@ -170,6 +170,69 @@ def process_message(
     evidence, raw_score = gather_evidence_and_raw_score(
         auth_results_header, email_content, watchman, cipher
     )
+
+    # [Fix] Structural "no informative evidence" bypass, mirroring the
+    # FetchFailed precedent above: if every evidence item found is
+    # direction="neutral" -- no real signal anywhere, not even a failed or
+    # conflicting check -- route directly to Deferred BEFORE calibration/
+    # determine_verdict ever run. This protects the zero-evidence case
+    # independent of how the calibration curve behaves, present or future.
+    # Previously this relied entirely on calibrated_confidence landing
+    # within deferral_band of the neutral prior via determine_verdict --
+    # correct only as long as apply_calibration behaved like an
+    # (approximately) monotonic, non-saturating curve. A real fitted
+    # isotonic model can legitimately be a hard step function that never
+    # outputs anything near 0.5 (see deferred-work.md's corpus-composition
+    # entry) -- apply_calibration(0.5) landing on 1.0 rather than ~0.5
+    # silently defeated deferral_band-based protection entirely, giving a
+    # message with NO real evidence a confident "Malicious" verdict. All
+    # comparisons below operate on `direction` only, structurally, with no
+    # dependency on calibrated_confidence or deferral_band at all -- this
+    # can't be defeated by any future calibration curve's shape.
+    if all(item["direction"] == "neutral" for item in evidence):
+        return TriageReport(
+            verdict="Deferred",
+            calibrated_confidence=0.5,
+            evidence=evidence,
+            schema_version=1,
+            message_hash=message_hash,
+            timestamp=timestamp,
+        )
+
+    # [Fix] Structural "conflicting-but-uncertain evidence" deferral, parallel
+    # to the all-neutral bypass above but keyed on raw_score instead of
+    # `direction`: weak-but-PRESENT directional evidence that nearly cancels
+    # (e.g. dmarc=pass vs spf=fail) is real signal, so the all-neutral check
+    # above correctly does not catch it -- but the real fitted calibration
+    # curve is not yet trustworthy to preserve that uncertainty either. The
+    # committed corpus (fit_real_calibration_model.py, 2026-07-28) contains no
+    # ambiguous/conflicting-evidence examples, so PAVA had nothing to fit a
+    # middle output to and produced a pure 0.0/1.0 step function -- a
+    # raw_score of ~0.47 (barely leaning malicious) calibrates to a
+    # confident-looking 1.0, indistinguishable from a raw_score of 1.0.
+    # Deferring here on the RAW score -- before apply_calibration ever runs --
+    # routes around that untrustworthy curve entirely. Reuses
+    # config.deferral_threshold as the band width so operators tune one knob,
+    # not two; determine_verdict's own calibrated-score deferral_band check
+    # below is left in place as defense-in-depth (now largely redundant
+    # against the current curve, but harmless, and would matter again against
+    # a future curve shape that isn't a hard step).
+    #
+    # This is deliberately a stopgap, not a permanent design choice: it exists
+    # because the calibration corpus lacks ambiguous/conflicting-evidence
+    # examples (tracked in deferred-work.md). Once that corpus is broadened, a
+    # real fit should again be able to preserve this uncertainty on its own,
+    # and this raw-score gate should be revisited.
+    if math.isclose(raw_score, 0.5, abs_tol=1e-9) or abs(raw_score - 0.5) < config.deferral_threshold:
+        return TriageReport(
+            verdict="Deferred",
+            calibrated_confidence=0.5,
+            evidence=evidence,
+            schema_version=1,
+            message_hash=message_hash,
+            timestamp=timestamp,
+        )
+
     calibrated_confidence = apply_calibration(raw_score)
 
     verdict: Literal["Malicious", "Benign", "Deferred"]
