@@ -2,7 +2,10 @@
 .claude/settings.local.json
 .claude/skills/
 _bmad/
-_bmad-output/
+_bmad-output/*
+!_bmad-output/implementation-artifacts/
+_bmad-output/implementation-artifacts/*
+!_bmad-output/implementation-artifacts/deferred-work.md
 
 # Environment & secrets
 .env
