@@ -1,8 +1,10 @@
 import httpx
+import pytest
 from pytest_mock import MockerFixture
 
 from sentinel.cipher import CipherAgent
 from sentinel.config import Config
+from sentinel.triage.script_guard import ApiCallBudgetExceededError, CachedLookup, LookupCache
 from sentinel.verdict import SentinelAgent
 
 
@@ -728,3 +730,194 @@ def test_cipher_urlhaus_ok_status_with_zero_url_count_is_not_misleading_finding(
     uh_item = next(i for i in result["evidence"] if i["name"] == "urlhaus_finding")
     assert uh_item["weight"] == 0.10
     assert uh_item["direction"] == "neutral"
+
+
+# --- Story 4.2: lookup cache + budget enforcement (real-corpus scripts only) ---
+
+_DOMAIN_ALERT = "Suspicious activity involving evilcorp-malware.example.com from workstation"
+
+
+def _populate_full_cache(cache: LookupCache, indicator_type: str, indicator_value: str) -> None:
+    cache.put(
+        indicator_type, indicator_value, "virustotal",
+        CachedLookup(weight=0.70, direction="malicious", finding="cached VT finding"),
+    )
+    cache.put(
+        indicator_type, indicator_value, "abuseipdb",
+        CachedLookup(weight=0.65, direction="malicious", finding="cached AbuseIPDB finding"),
+    )
+    cache.put(
+        indicator_type, indicator_value, "urlhaus",
+        CachedLookup(weight=0.60, direction="malicious", finding="cached URLhaus finding"),
+    )
+
+
+def test_cipher_cache_hit_returns_cached_result_without_calling_httpx_client(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str, tmp_path
+) -> None:
+    cache = LookupCache(str(tmp_path / "cache.db"), ttl_seconds=3600)
+    _populate_full_cache(cache, "ip", "185.220.101.45")
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+
+    agent = CipherAgent(config=fake_config, cache=cache)
+    result = agent.analyze(sample_alert)
+
+    mock_client.get.assert_not_called()
+    mock_client.post.assert_not_called()
+    vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
+    ab_item = next(i for i in result["evidence"] if i["name"] == "abuseipdb_finding")
+    uh_item = next(i for i in result["evidence"] if i["name"] == "urlhaus_finding")
+    assert vt_item["weight"] == 0.70 and vt_item["finding"] == "cached VT finding"
+    assert ab_item["weight"] == 0.65 and ab_item["finding"] == "cached AbuseIPDB finding"
+    assert uh_item["weight"] == 0.60 and uh_item["finding"] == "cached URLhaus finding"
+
+
+def test_cipher_cache_miss_calls_through_and_populates_cache(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str, tmp_path
+) -> None:
+    cache = LookupCache(str(tmp_path / "cache.db"), ttl_seconds=3600)
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 5, "suspicious": 0}}}
+    }
+    ab_response = mocker.MagicMock()
+    ab_response.status_code = 200
+    ab_response.json.return_value = {"data": {"abuseConfidenceScore": 80, "totalReports": 3}}
+    mock_client.get.side_effect = [vt_response, ab_response]
+    uh_response = mocker.MagicMock()
+    uh_response.status_code = 200
+    uh_response.json.return_value = {"query_status": "no_results"}
+    mock_client.post.return_value = uh_response
+
+    agent = CipherAgent(config=fake_config, cache=cache)
+    agent.analyze(sample_alert)
+
+    mock_client.get.assert_called()
+    assert cache.get("ip", "185.220.101.45", "virustotal") is not None
+    assert cache.get("ip", "185.220.101.45", "abuseipdb") is not None
+    assert cache.get("ip", "185.220.101.45", "urlhaus") is not None
+
+
+def test_cipher_budget_check_and_record_called_before_each_real_http_call_on_a_miss(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str, tmp_path
+) -> None:
+    cache = LookupCache(str(tmp_path / "cache.db"), ttl_seconds=3600)
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    ok_response = mocker.MagicMock()
+    ok_response.status_code = 200
+    ok_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 0, "suspicious": 0}}},
+        "abuseConfidenceScore": 0,
+        "totalReports": 0,
+        "query_status": "no_results",
+    }
+    mock_client.get.return_value = ok_response
+    mock_client.post.return_value = ok_response
+    budget = mocker.MagicMock()
+
+    agent = CipherAgent(config=fake_config, cache=cache, budget=budget)
+    agent.analyze(sample_alert)
+
+    sources_checked = {call.args[0] for call in budget.check_and_record.call_args_list}
+    assert sources_checked == {"virustotal", "abuseipdb", "urlhaus"}
+
+
+def test_cipher_budget_not_checked_for_cache_hits(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str, tmp_path
+) -> None:
+    cache = LookupCache(str(tmp_path / "cache.db"), ttl_seconds=3600)
+    _populate_full_cache(cache, "ip", "185.220.101.45")
+    mocker.patch("sentinel.cipher.httpx.Client")
+    budget = mocker.MagicMock()
+
+    agent = CipherAgent(config=fake_config, cache=cache, budget=budget)
+    agent.analyze(sample_alert)
+
+    budget.check_and_record.assert_not_called()
+
+
+def _budget_that_rejects(mocker: MockerFixture, rejected_source: str):  # type: ignore[no-untyped-def]
+    budget = mocker.MagicMock()
+
+    def side_effect(source: str, *_args: object, **_kwargs: object) -> None:
+        if source == rejected_source:
+            raise ApiCallBudgetExceededError(f"ceiling reached for {source}")
+
+    budget.check_and_record.side_effect = side_effect
+    return budget
+
+
+def test_cipher_budget_exceeded_on_virustotal_via_ip_propagates_uncaught(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """Regression guard for the exact swallowing bug this story's design
+    caught during drafting: _analyze_ip's VT except Exception: block must
+    NOT convert ApiCallBudgetExceededError into a neutral coverage-gap
+    EvidenceItem -- it must propagate all the way out of analyze()."""
+    mocker.patch("sentinel.cipher.httpx.Client")
+    budget = _budget_that_rejects(mocker, "virustotal")
+
+    agent = CipherAgent(config=fake_config, budget=budget)
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        agent.analyze(sample_alert)
+
+
+def test_cipher_budget_exceeded_on_abuseipdb_via_ip_propagates_uncaught(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 0, "suspicious": 0}}}
+    }
+    mock_client.get.return_value = vt_response
+    budget = _budget_that_rejects(mocker, "abuseipdb")
+
+    agent = CipherAgent(config=fake_config, budget=budget)
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        agent.analyze(sample_alert)
+
+
+def test_cipher_budget_exceeded_on_urlhaus_via_ip_propagates_uncaught(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    ok_response = mocker.MagicMock()
+    ok_response.status_code = 200
+    ok_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 0, "suspicious": 0}}},
+        "abuseConfidenceScore": 0,
+        "totalReports": 0,
+    }
+    mock_client.get.return_value = ok_response
+    budget = _budget_that_rejects(mocker, "urlhaus")
+
+    agent = CipherAgent(config=fake_config, budget=budget)
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        agent.analyze(sample_alert)
+
+
+def test_cipher_budget_exceeded_on_virustotal_via_domain_propagates_uncaught(
+    mocker: MockerFixture, fake_config: Config
+) -> None:
+    """Distinct code site from the IP-path VT test above (_analyze_domain
+    has its own separate VT try/except block) -- proves that site is
+    guarded too, not just _analyze_ip's."""
+    mocker.patch("sentinel.cipher.httpx.Client")
+    budget = _budget_that_rejects(mocker, "virustotal")
+
+    agent = CipherAgent(config=fake_config, budget=budget)
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        agent.analyze(_DOMAIN_ALERT)

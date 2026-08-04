@@ -17,6 +17,18 @@ secrets/
 # Evidence store — encrypted customer data, never committed
 data/
 
+# Real-corpus script state (Story 4.2): Cipher lookup cache + API call budget,
+# and the duplicate-run lock file — local, generated, never committed.
+# Scoped to calibration_model_v1.json's own lock file specifically, not a
+# bare *.lock -- that would also silently ignore unrelated legitimate lock
+# files (e.g. poetry.lock, yarn.lock) if this repo ever adds one (code
+# review 2026-08-03). Every lock file this codebase's acquire_run_lock
+# creates is named f"{resource_path}.lock", and the only resource_path in
+# practice is calibration_model_v1.json (both fit_real_calibration_model.py
+# and run_evaluation_harness.py lock on it).
+.sentinel_script_state.db
+calibration_model_v1.json.lock
+
 # Python
 __pycache__/
 *.py[cod]

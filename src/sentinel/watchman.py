@@ -2,9 +2,11 @@ import json
 import re
 
 import anthropic
+from anthropic.types import MessageParam
 
 from sentinel.config import Config
 from sentinel.triage.evidence import EvidenceItem
+from sentinel.triage.script_guard import ApiCallBudget, ApiCallBudgetExceededError
 from sentinel.verdict import AgentResult, BlindSpot
 
 _MODEL = "claude-haiku-4-5-20251001"
@@ -124,8 +126,21 @@ def _build_evidence(findings: list[str], confidence: str | None) -> list[Evidenc
 
 
 class WatchmanAgent:
-    def __init__(self, config: Config) -> None:
+    """`temperature`/`budget` are Story 4.2 additions -- both default to
+    `None`/off. Only fit_real_calibration_model.py/run_evaluation_harness.py
+    ever pass them; worker.py's live-triage `WatchmanAgent(config)` call
+    sites are unmodified, so live triage's non-deterministic temperature and
+    absence of a call ceiling are provably unaffected (AC5)."""
+
+    def __init__(
+        self,
+        config: Config,
+        temperature: float | None = None,
+        budget: ApiCallBudget | None = None,
+    ) -> None:
         self._config = config
+        self._temperature = temperature
+        self._budget = budget
         self._client = anthropic.Anthropic(
             api_key=config.anthropic_api_key,
             timeout=config.timeout_seconds,
@@ -133,17 +148,37 @@ class WatchmanAgent:
 
     def analyze(self, input_data: str) -> AgentResult:
         try:
-            response = self._client.messages.create(
-                model=_MODEL,
-                max_tokens=1024,
-                system=_SYSTEM,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": _PROMPT_TEMPLATE.format(alert=input_data),
-                    }
-                ],
-            )
+            if self._budget is not None:
+                # Checked immediately before the one real external call this
+                # method makes -- never after. Raises ApiCallBudgetExceededError,
+                # which the `except Exception:` below must NOT catch (see the
+                # guard immediately preceding it).
+                self._budget.check_and_record("watchman")
+            messages: list[MessageParam] = [
+                {
+                    "role": "user",
+                    "content": _PROMPT_TEMPLATE.format(alert=input_data),
+                }
+            ]
+            # Two explicit calls, not a **kwargs dict -- passing temperature=None
+            # to the Anthropic SDK is not the same as omitting it, and a loosely
+            # typed kwargs dict doesn't satisfy messages.create's keyword-only
+            # overloads under mypy --strict.
+            if self._temperature is not None:
+                response = self._client.messages.create(
+                    model=_MODEL,
+                    max_tokens=1024,
+                    system=_SYSTEM,
+                    messages=messages,
+                    temperature=self._temperature,
+                )
+            else:
+                response = self._client.messages.create(
+                    model=_MODEL,
+                    max_tokens=1024,
+                    system=_SYSTEM,
+                    messages=messages,
+                )
             raw_text: str = response.content[0].text  # type: ignore[union-attr]
             # Strip markdown code fences Claude sometimes adds despite instructions
             cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text.strip())
@@ -210,6 +245,12 @@ class WatchmanAgent:
                 error="malformed_output",
                 evidence=_coverage_gap_evidence(reason),
             )
+        except ApiCallBudgetExceededError:
+            # Story 4.2: must propagate uncaught, never converted into a
+            # coverage-gap AgentResult -- the generic `except Exception:`
+            # below would otherwise silently swallow it, defeating AC3's
+            # "not silently truncating results" requirement.
+            raise
         except Exception:
             reason = "Watchman analysis failed — behavioral analysis unavailable"
             return AgentResult(

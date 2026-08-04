@@ -26,6 +26,10 @@ if str(_REPO_ROOT) not in sys.path:
 import run_evaluation_harness as script  # noqa: E402
 
 from sentinel.triage.eval import CalibrationModel, Corpus, load_corpus  # noqa: E402
+from sentinel.triage.script_guard import (  # noqa: E402
+    ApiCallBudgetExceededError,
+    acquire_run_lock,
+)
 from sentinel.triage.worker import gather_evidence_and_raw_score  # noqa: E402
 
 _PLAIN_BODY = "Hi, just checking in about our meeting tomorrow. Thanks!"
@@ -488,6 +492,7 @@ def _mock_main_dependencies(
     calibration_model: CalibrationModel,
     watchman: MagicMock,
     cipher: MagicMock,
+    tmp_path: Path,
 ) -> None:
     mocker.patch("run_evaluation_harness.WatchmanAgent", return_value=watchman)
     mocker.patch("run_evaluation_harness.CipherAgent", return_value=cipher)
@@ -497,14 +502,22 @@ def _mock_main_dependencies(
         "run_evaluation_harness.load_config",
         return_value=mocker.Mock(eval_corpus_path=None, deferral_threshold=0.05),
     )
+    # Story 4.2: redirect the run lock + shared cache/budget state DB into
+    # tmp_path -- without this, main() would touch real files at the repo
+    # root (a transient calibration_model_v1.json.lock plus, once any test
+    # actually exercises the cache/budget, .sentinel_script_state.db).
+    mocker.patch(
+        "run_evaluation_harness._CALIBRATION_MODEL_PATH", str(tmp_path / "calibration_model_v1.json")
+    )
+    mocker.patch("run_evaluation_harness._STATE_DB_PATH", str(tmp_path / "state.db"))
 
 
 def test_warns_and_exits_2_when_calibration_model_is_identity(  # type: ignore[no-untyped-def]
-    valid_corpus, mocker, capsys
+    valid_corpus, mocker, capsys, tmp_path
 ) -> None:
     watchman = _mock_agent()
     cipher = _mock_agent()
-    _mock_main_dependencies(mocker, valid_corpus, _IDENTITY_MODEL, watchman, cipher)
+    _mock_main_dependencies(mocker, valid_corpus, _IDENTITY_MODEL, watchman, cipher, tmp_path)
     mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "3"])
 
     with pytest.raises(SystemExit) as exc:
@@ -520,11 +533,11 @@ def test_warns_and_exits_2_when_calibration_model_is_identity(  # type: ignore[n
 
 
 def test_no_placeholder_warning_when_calibration_model_is_a_real_fit(  # type: ignore[no-untyped-def]
-    valid_corpus, mocker, capsys
+    valid_corpus, mocker, capsys, tmp_path
 ) -> None:
     watchman = _mock_agent()
     cipher = _mock_agent()
-    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher)
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
     mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "3"])
 
     with pytest.raises(SystemExit) as exc:
@@ -538,7 +551,7 @@ def test_no_placeholder_warning_when_calibration_model_is_a_real_fit(  # type: i
 
 
 def test_main_exits_0_when_gate_is_met(  # type: ignore[no-untyped-def]
-    valid_corpus, mocker, capsys
+    valid_corpus, mocker, capsys, tmp_path
 ) -> None:
     """[Review] Task 4's original gate-met/not-met tests only asserted on
     report["gate_met"] via script.run() directly -- never through main()'s
@@ -548,7 +561,7 @@ def test_main_exits_0_when_gate_is_met(  # type: ignore[no-untyped-def]
     note on test_run_reports_gate_met_for_well_calibrated_high_discrimination_data."""
     watchman = _mock_agent()
     cipher = _mock_agent()
-    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher)
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
     mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     # 5 per class -- exactly _MIN_SAMPLES_PER_ECE_BIN, so both bins are
     # conclusive (not just correctly separated, per Patch 1's new guard).
@@ -567,13 +580,13 @@ def test_main_exits_0_when_gate_is_met(  # type: ignore[no-untyped-def]
 
 
 def test_main_exits_1_when_gate_is_not_met(  # type: ignore[no-untyped-def]
-    valid_corpus, mocker, capsys
+    valid_corpus, mocker, capsys, tmp_path
 ) -> None:
     """[Fix] check_structural_deferral is patched to False -- see the
     identical note on test_run_reports_gate_met_for_well_calibrated_high_discrimination_data."""
     watchman = _mock_agent()
     cipher = _mock_agent()
-    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher)
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
     mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     # 5 per class (conclusive bins) so this genuinely tests "anti-correlated
     # data fails the gate", not merely "inconclusive data can't pass".
@@ -603,7 +616,7 @@ def test_main_exits_3_not_1_when_corpus_is_invalid(  # type: ignore[no-untyped-d
     invalid_corpus = load_corpus(str(tmp_path))
     watchman = _mock_agent()
     cipher = _mock_agent()
-    _mock_main_dependencies(mocker, invalid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher)
+    _mock_main_dependencies(mocker, invalid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
     mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "3"])
 
     with pytest.raises(SystemExit) as exc:
@@ -612,6 +625,101 @@ def test_main_exits_3_not_1_when_corpus_is_invalid(  # type: ignore[no-untyped-d
     assert exc.value.code == 3
     captured = capsys.readouterr()
     assert "Release gate" not in captured.out
+
+
+# --- Story 4.2: run lock, cache/budget wiring, budget-exceeded exit code -----
+
+
+def test_main_passes_temperature_cache_budget_to_agents(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, tmp_path
+) -> None:
+    watchman_cls = mocker.patch(
+        "run_evaluation_harness.WatchmanAgent", return_value=_mock_agent()
+    )
+    cipher_cls = mocker.patch(
+        "run_evaluation_harness.CipherAgent", return_value=_mock_agent()
+    )
+    mocker.patch("run_evaluation_harness.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "run_evaluation_harness.load_calibration_model", return_value=_REAL_ISOTONIC_MODEL
+    )
+    mocker.patch(
+        "run_evaluation_harness.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None, deferral_threshold=0.05),
+    )
+    mocker.patch(
+        "run_evaluation_harness._CALIBRATION_MODEL_PATH", str(tmp_path / "calibration_model_v1.json")
+    )
+    mocker.patch("run_evaluation_harness._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "3"])
+
+    with pytest.raises(SystemExit):
+        script.main()
+
+    _config, watchman_kwargs = watchman_cls.call_args
+    assert watchman_kwargs["temperature"] == 0
+    assert watchman_kwargs["budget"] is not None
+    _config, cipher_kwargs = cipher_cls.call_args
+    assert cipher_kwargs["cache"] is not None
+    assert cipher_kwargs["budget"] is not None
+    assert watchman_kwargs["budget"] is cipher_kwargs["budget"]
+
+
+def test_main_second_concurrent_invocation_fails_before_load_corpus_or_load_calibration_model(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, tmp_path
+) -> None:
+    """This script only ever READS calibration_model_v1.json (never
+    writes it) -- the 2026-07-30 incident this closes was two concurrent
+    invocations of this exact read-only script. Proves the lock fires
+    before EITHER load_corpus OR load_calibration_model is reached, not
+    just before run()."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    load_corpus_spy = mocker.patch(
+        "run_evaluation_harness.load_corpus", return_value=valid_corpus
+    )
+    load_calibration_model_spy = mocker.patch(
+        "run_evaluation_harness.load_calibration_model", return_value=_REAL_ISOTONIC_MODEL
+    )
+    mocker.patch("run_evaluation_harness.WatchmanAgent", return_value=watchman)
+    mocker.patch("run_evaluation_harness.CipherAgent", return_value=cipher)
+    mocker.patch(
+        "run_evaluation_harness.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None, deferral_threshold=0.05),
+    )
+    resource_path = str(tmp_path / "calibration_model_v1.json")
+    mocker.patch("run_evaluation_harness._CALIBRATION_MODEL_PATH", resource_path)
+    mocker.patch("run_evaluation_harness._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch("sys.argv", ["run_evaluation_harness.py"])
+
+    with acquire_run_lock(resource_path):
+        with pytest.raises(SystemExit) as exc:
+            script.main()
+
+    assert exc.value.code == 4
+    load_corpus_spy.assert_not_called()
+    load_calibration_model_spy.assert_not_called()
+    watchman.analyze.assert_not_called()
+    cipher.analyze.assert_not_called()
+
+
+def test_main_budget_exceeded_exits_three_with_no_report_printed(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, capsys, tmp_path
+) -> None:
+    watchman = _mock_agent()
+    watchman.analyze.side_effect = ApiCallBudgetExceededError("ceiling reached")
+    cipher = _mock_agent()
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
+    mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "3"])
+
+    with pytest.raises(SystemExit) as exc:
+        script.main()
+
+    assert exc.value.code == 3
+    captured = capsys.readouterr()
+    assert "Release gate" not in captured.out
+    # The lock must still be released even though the run aborted.
+    assert not Path(f"{tmp_path / 'calibration_model_v1.json'}.lock").exists()
 
 
 def _tuning_key_references(tree: ast.AST) -> list[str]:

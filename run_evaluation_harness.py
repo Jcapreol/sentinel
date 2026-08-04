@@ -62,9 +62,13 @@ EXIT CODES
     1  Release gate NOT MET (a real, non-placeholder measurement)
     2  Ran against the identity placeholder -- no real verdict possible
     3  Could not measure at all (invalid corpus, misconfigured
-       deferral_threshold, or every sampled file's pipeline call failed) --
-       distinct from 1 so an automated caller can tell "infra/setup
-       problem" apart from "the model's calibration genuinely regressed"
+       deferral_threshold, every sampled file's pipeline call failed, or
+       the configured --api-call-ceiling was reached mid-run) -- distinct
+       from 1 so an automated caller can tell "infra/setup problem" apart
+       from "the model's calibration genuinely regressed"
+    4  Could not acquire the run lock -- another invocation of this script,
+       or of fit_real_calibration_model.py, is already running against the
+       same calibration_model_v1.json (Story 4.2)
 
 USAGE
 -----
@@ -100,6 +104,15 @@ from sentinel.triage.eval import (
     validate_corpus,
 )
 from sentinel.triage.ingest import extract_auth_results_header_from_eml, extract_email_content
+from sentinel.triage.script_guard import (
+    DEFAULT_API_CEILING_WINDOW_HOURS,
+    DEFAULT_CACHE_TTL_SECONDS,
+    ApiCallBudget,
+    ApiCallBudgetExceededError,
+    LockAlreadyHeldError,
+    LookupCache,
+    acquire_run_lock,
+)
 from sentinel.triage.scoring import InconclusiveScoreError, apply_calibration, determine_verdict
 from sentinel.triage.worker import check_structural_deferral, gather_evidence_and_raw_score
 from sentinel.verdict import SentinelAgent
@@ -110,6 +123,15 @@ _DEFAULT_SAMPLE_SIZE_PER_CLASS = 200
 # fit_real_calibration_model.py's _DEFAULT_OUTPUT_PATH -- a CWD-dependent
 # path would be a real footgun here too.
 _CALIBRATION_MODEL_PATH = str(Path(__file__).resolve().parent / "calibration_model_v1.json")
+# Story 4.2: shared with fit_real_calibration_model.py's identical constant
+# -- both real-corpus scripts benefit from the same Cipher-lookup cache
+# across separate invocations.
+_STATE_DB_PATH = str(Path(__file__).resolve().parent / ".sentinel_script_state.db")
+# [Review][Patch] Shared with fit_real_calibration_model.py via
+# script_guard.py -- previously duplicated verbatim in both scripts (code
+# review 2026-08-03).
+_DEFAULT_CACHE_TTL_SECONDS = DEFAULT_CACHE_TTL_SECONDS
+_DEFAULT_API_CEILING_WINDOW_HOURS = DEFAULT_API_CEILING_WINDOW_HOURS
 
 # PROVISIONAL, not calibrated -- matches AC3's own "or the provisional
 # figure in effect at the time" wording.
@@ -130,10 +152,16 @@ def _score_one_file(
     corpus_file: CorpusFile, watchman: SentinelAgent, cipher: SentinelAgent, deferral_band: float
 ) -> float | None:
     """Runs one file through the pipeline, returning its calibrated_confidence,
-    or None on any failure (skip, don't abort the whole run) -- identical
-    per-file failure-isolation discipline to fit_real_calibration_model.py's
-    (post-code-review) _score_one_file: both extraction calls AND the
-    pipeline call are guarded, not just the pipeline call.
+    or None on any failure EXCEPT ApiCallBudgetExceededError, which
+    propagates uncaught to abort the whole run instead (Story 4.2, AC3 --
+    see the dedicated except clause below). [Review][Patch] This docstring
+    previously claimed "None on any failure" unconditionally, which was
+    stale even at the time it was written -- the ApiCallBudgetExceededError
+    carve-out already existed a few lines down (code review 2026-08-03).
+    Otherwise identical per-file failure-isolation discipline to
+    fit_real_calibration_model.py's (post-code-review) _score_one_file: both
+    extraction calls AND the pipeline call are guarded, not just the
+    pipeline call.
 
     [Fix] Now calls check_structural_deferral (src/sentinel/triage/worker.py)
     before apply_calibration, matching process_message's real order --
@@ -163,6 +191,11 @@ def _score_one_file(
         # calibration_model_v1.json), but this function's own docstring
         # promises "None on any failure" unconditionally.
         return apply_calibration(raw_score)
+    except ApiCallBudgetExceededError:
+        # Story 4.2: must propagate uncaught, never treated as "this one
+        # file failed, skip it and keep going" -- a budget-exceeded run
+        # aborts entirely (AC3).
+        raise
     except Exception as e:
         print(
             f"  WARNING: pipeline failed for {corpus_file['path']}: "
@@ -402,34 +435,76 @@ def main() -> None:
             f"{_DEFAULT_SAMPLE_SIZE_PER_CLASS})"
         ),
     )
+    parser.add_argument(
+        "--cache-ttl-seconds",
+        type=float,
+        default=_DEFAULT_CACHE_TTL_SECONDS,
+        help=(
+            "how long a cached Cipher lookup stays valid, shared with "
+            f"fit_real_calibration_model.py (default: {_DEFAULT_CACHE_TTL_SECONDS:.0f}s / 24h)"
+        ),
+    )
+    parser.add_argument(
+        "--api-call-ceiling",
+        type=int,
+        default=None,
+        help="combined Watchman+Cipher external API call ceiling per window (default: disabled)",
+    )
+    parser.add_argument(
+        "--api-ceiling-window-hours",
+        type=float,
+        default=_DEFAULT_API_CEILING_WINDOW_HOURS,
+        help=f"rolling window in hours --api-call-ceiling applies to (default: {_DEFAULT_API_CEILING_WINDOW_HOURS})",
+    )
     args = parser.parse_args()
 
-    config = load_config()
-    corpus_path = args.corpus_path or _default_corpus_path(config)
-    corpus = load_corpus(corpus_path)
-    calibration_model = load_calibration_model(_CALIBRATION_MODEL_PATH)
-    watchman: SentinelAgent = WatchmanAgent(config)
-    cipher: SentinelAgent = CipherAgent(config)
-
+    # Story 4.2: the lock is acquired as the first real action -- before
+    # load_config, before load_corpus, before load_calibration_model, before
+    # anything else -- keyed by _CALIBRATION_MODEL_PATH. This script only
+    # ever READS that file (never writes it), but the lock must still fire:
+    # the 2026-07-30 incident this closes was two concurrent invocations of
+    # this exact read-only script, burning real API spend redundantly.
     try:
-        report = run(
-            corpus,
-            calibration_model,
-            args.sample_size_per_class,
-            config.deferral_threshold,
-            watchman,
-            cipher,
-        )
-    except ValueError as e:
+        with acquire_run_lock(_CALIBRATION_MODEL_PATH):
+            config = load_config()
+            corpus_path = args.corpus_path or _default_corpus_path(config)
+            corpus = load_corpus(corpus_path)
+            calibration_model = load_calibration_model(_CALIBRATION_MODEL_PATH)
+            cache = LookupCache(_STATE_DB_PATH, ttl_seconds=args.cache_ttl_seconds)
+            budget = ApiCallBudget(
+                _STATE_DB_PATH,
+                ceiling=args.api_call_ceiling,
+                window_seconds=args.api_ceiling_window_hours * 3600,
+            )
+            watchman: SentinelAgent = WatchmanAgent(config, temperature=0, budget=budget)
+            cipher: SentinelAgent = CipherAgent(config, cache=cache, budget=budget)
+
+            report = run(
+                corpus,
+                calibration_model,
+                args.sample_size_per_class,
+                config.deferral_threshold,
+                watchman,
+                cipher,
+            )
+    except LockAlreadyHeldError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(4)
+    except (ValueError, ApiCallBudgetExceededError) as e:
         print(str(e), file=sys.stderr)
         # [Review] Exit code 3, NOT 1 -- distinct from "measured, gate
-        # genuinely not met" (see the 0/1/2/3 docstring above). This branch
-        # fires when run() raised before ever producing a report (invalid
-        # corpus, bad deferral_band, or zero collected pairs) -- no
-        # measurement happened at all, so this must not be conflated with a
-        # real quality failure. An automated caller checking only the exit
-        # code needs to be able to tell "infra/setup problem" apart from
-        # "the model's calibration regressed."
+        # genuinely not met" (see the EXIT CODES docstring above). This
+        # branch fires when run() raised before ever RETURNING A REPORT
+        # (invalid corpus, bad deferral_band, zero collected pairs, or a
+        # budget-ceiling abort mid-run, Story 4.2). [Review][Patch] Fixed
+        # self-contradictory phrasing (code review 2026-08-03): a
+        # budget-ceiling abort "mid-run" means some files WERE scored before
+        # the abort -- what's true is that no REPORT was ever produced or
+        # printed (run() aborts before aggregating/returning one), not that
+        # zero measurement occurred. Either way this must not be conflated
+        # with a real quality failure -- an automated caller checking only
+        # the exit code needs to be able to tell "infra/setup problem" apart
+        # from "the model's calibration regressed."
         sys.exit(3)
 
     _print_report(report)

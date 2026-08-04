@@ -25,6 +25,10 @@ if str(_REPO_ROOT) not in sys.path:
 import fit_real_calibration_model as script  # noqa: E402
 
 from sentinel.triage.eval import load_corpus  # noqa: E402
+from sentinel.triage.script_guard import (  # noqa: E402
+    ApiCallBudgetExceededError,
+    acquire_run_lock,
+)
 
 _PLAIN_BODY = "Hi, just checking in about our meeting tomorrow. Thanks!"
 _PHISHING_ADJACENT_BODY = (
@@ -226,6 +230,9 @@ def test_main_dry_run_does_not_write_output(
         "fit_real_calibration_model.load_config",
         return_value=mocker.Mock(eval_corpus_path=None),
     )
+    # Story 4.2: redirect the shared cache/budget state DB into tmp_path --
+    # without this, main() would touch a real file at the repo root.
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
     mocker.patch(
         "sys.argv",
         [
@@ -257,6 +264,7 @@ def test_main_writes_output_without_dry_run(
         "fit_real_calibration_model.load_config",
         return_value=mocker.Mock(eval_corpus_path=None),
     )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
     mocker.patch(
         "sys.argv",
         [
@@ -271,6 +279,183 @@ def test_main_writes_output_without_dry_run(
     script.main()
 
     assert output_path.exists()
+
+
+def test_main_passes_temperature_cache_budget_to_agents(  # type: ignore[no-untyped-def]
+    valid_corpus, tmp_path: Path, mocker
+) -> None:
+    output_path = tmp_path / "calibration_model_v1.json"
+    watchman_cls = mocker.patch(
+        "fit_real_calibration_model.WatchmanAgent", return_value=_mock_agent()
+    )
+    cipher_cls = mocker.patch(
+        "fit_real_calibration_model.CipherAgent", return_value=_mock_agent()
+    )
+    mocker.patch("fit_real_calibration_model.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch(
+        "sys.argv",
+        [
+            "fit_real_calibration_model.py",
+            "--sample-size-per-class",
+            "3",
+            "--output",
+            str(output_path),
+            "--cache-ttl-seconds",
+            "120",
+        ],
+    )
+
+    script.main()
+
+    _config, watchman_kwargs = watchman_cls.call_args
+    assert watchman_kwargs["temperature"] == 0
+    assert watchman_kwargs["budget"] is not None
+    _config, cipher_kwargs = cipher_cls.call_args
+    assert cipher_kwargs["cache"] is not None
+    assert cipher_kwargs["budget"] is not None
+    # The two agents must share the SAME budget object -- AC3's "Watchman +
+    # Cipher combined" ceiling only holds if both report to one instance.
+    assert watchman_kwargs["budget"] is cipher_kwargs["budget"]
+
+
+def test_main_second_concurrent_invocation_fails_before_any_pipeline_work(  # type: ignore[no-untyped-def]
+    valid_corpus, tmp_path: Path, mocker
+) -> None:
+    output_path = tmp_path / "calibration_model_v1.json"
+    load_corpus_spy = mocker.patch(
+        "fit_real_calibration_model.load_corpus", return_value=valid_corpus
+    )
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch(
+        "sys.argv",
+        ["fit_real_calibration_model.py", "--output", str(output_path)],
+    )
+
+    with acquire_run_lock(str(output_path)):
+        with pytest.raises(SystemExit) as exc:
+            script.main()
+
+    assert exc.value.code == 1
+    load_corpus_spy.assert_not_called()
+
+
+def test_main_writes_output_while_lock_is_still_held(
+    valid_corpus, tmp_path: Path, mocker  # type: ignore[no-untyped-def]
+) -> None:
+    """Regression test for code review finding 2026-08-03:
+    save_calibration_model previously ran AFTER the lock's `with` block had
+    already exited, so the actual file write wasn't protected by the lock at
+    all -- defeating the lock's stated purpose for this script. Proven by
+    asserting the lock file still exists at the exact moment
+    save_calibration_model is called, not just that it's gone afterward."""
+    output_path = tmp_path / "calibration_model_v1.json"
+    lock_path = Path(f"{output_path}.lock")
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    mocker.patch("fit_real_calibration_model.WatchmanAgent", return_value=watchman)
+    mocker.patch("fit_real_calibration_model.CipherAgent", return_value=cipher)
+    mocker.patch("fit_real_calibration_model.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch(
+        "sys.argv",
+        ["fit_real_calibration_model.py", "--sample-size-per-class", "3", "--output", str(output_path)],
+    )
+    lock_existed_at_write_time = {}
+    real_save = script.save_calibration_model
+
+    def spy_save(model, path):  # type: ignore[no-untyped-def]
+        lock_existed_at_write_time["value"] = lock_path.exists()
+        return real_save(model, path)
+
+    mocker.patch("fit_real_calibration_model.save_calibration_model", side_effect=spy_save)
+
+    script.main()
+
+    assert lock_existed_at_write_time["value"] is True
+    assert not lock_path.exists()  # released once main() fully completes
+
+
+def test_main_resolves_output_path_before_acquiring_the_lock(
+    valid_corpus, tmp_path: Path, mocker  # type: ignore[no-untyped-def]
+) -> None:
+    """Regression test for code review finding 2026-08-03: the lock was
+    previously keyed on the raw, unresolved args.output CLI value, so two
+    invocations targeting the same real file via different path spellings
+    would compute different lock file names and both succeed -- defeating
+    Design Decision 2's "resolved path" requirement and the cross-script
+    race protection it exists to provide."""
+    output_path = tmp_path / "calibration_model_v1.json"
+    unresolved_output = str(tmp_path / "subdir" / ".." / "calibration_model_v1.json")
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    mocker.patch("fit_real_calibration_model.WatchmanAgent", return_value=watchman)
+    mocker.patch("fit_real_calibration_model.CipherAgent", return_value=cipher)
+    mocker.patch("fit_real_calibration_model.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    lock_spy = mocker.patch(
+        "fit_real_calibration_model.acquire_run_lock", side_effect=acquire_run_lock
+    )
+    mocker.patch(
+        "sys.argv",
+        [
+            "fit_real_calibration_model.py",
+            "--sample-size-per-class",
+            "3",
+            "--output",
+            unresolved_output,
+        ],
+    )
+
+    script.main()
+
+    lock_spy.assert_called_once_with(str(Path(unresolved_output).resolve()))
+    assert str(Path(unresolved_output).resolve()) == str(output_path)
+    assert output_path.exists()
+
+
+def test_main_budget_exceeded_exits_one_with_no_output_written(  # type: ignore[no-untyped-def]
+    valid_corpus, tmp_path: Path, mocker
+) -> None:
+    output_path = tmp_path / "calibration_model_v1.json"
+    watchman = _mock_agent()
+    watchman.analyze.side_effect = ApiCallBudgetExceededError("ceiling reached")
+    mocker.patch("fit_real_calibration_model.WatchmanAgent", return_value=watchman)
+    mocker.patch("fit_real_calibration_model.CipherAgent", return_value=_mock_agent())
+    mocker.patch("fit_real_calibration_model.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch(
+        "sys.argv",
+        ["fit_real_calibration_model.py", "--sample-size-per-class", "3", "--output", str(output_path)],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        script.main()
+
+    assert exc.value.code == 1
+    assert not output_path.exists()
+    # The lock must still be released even though the run aborted.
+    assert not Path(f"{output_path}.lock").exists()
 
 
 def _held_out_key_references(tree: ast.AST) -> list[str]:
