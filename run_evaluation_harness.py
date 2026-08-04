@@ -101,7 +101,7 @@ from sentinel.triage.eval import (
 )
 from sentinel.triage.ingest import extract_auth_results_header_from_eml, extract_email_content
 from sentinel.triage.scoring import InconclusiveScoreError, apply_calibration, determine_verdict
-from sentinel.triage.worker import gather_evidence_and_raw_score
+from sentinel.triage.worker import check_structural_deferral, gather_evidence_and_raw_score
 from sentinel.verdict import SentinelAgent
 from sentinel.watchman import WatchmanAgent
 
@@ -127,13 +127,23 @@ def _default_corpus_path(config: Config) -> str:
 
 
 def _score_one_file(
-    corpus_file: CorpusFile, watchman: SentinelAgent, cipher: SentinelAgent
+    corpus_file: CorpusFile, watchman: SentinelAgent, cipher: SentinelAgent, deferral_band: float
 ) -> float | None:
     """Runs one file through the pipeline, returning its calibrated_confidence,
     or None on any failure (skip, don't abort the whole run) -- identical
     per-file failure-isolation discipline to fit_real_calibration_model.py's
     (post-code-review) _score_one_file: both extraction calls AND the
-    pipeline call are guarded, not just the pipeline call."""
+    pipeline call are guarded, not just the pipeline call.
+
+    [Fix] Now calls check_structural_deferral (src/sentinel/triage/worker.py)
+    before apply_calibration, matching process_message's real order --
+    previously this function called apply_calibration directly, bypassing
+    process_message entirely, so it never exercised either structural
+    pre-calibration deferral gate even after both were added to the live
+    pipeline (2026-07-30 incident). A structurally-deferred file returns 0.5,
+    matching process_message's own calibrated_confidence convention for a
+    Deferred report, instead of whatever apply_calibration alone would have
+    said."""
     try:
         raw_bytes = Path(corpus_file["path"]).read_bytes()
     except OSError as e:
@@ -143,9 +153,11 @@ def _score_one_file(
     try:
         auth_header = extract_auth_results_header_from_eml(raw_bytes)
         email_content = extract_email_content(raw_bytes)
-        _evidence, raw_score = gather_evidence_and_raw_score(
+        evidence, raw_score = gather_evidence_and_raw_score(
             auth_header, email_content, watchman, cipher
         )
+        if check_structural_deferral(evidence, raw_score, deferral_band):
+            return 0.5
         # [Review] apply_calibration is now inside this try too -- it only
         # raises for an unrecognized `method` (a hand-edited/corrupted
         # calibration_model_v1.json), but this function's own docstring
@@ -165,11 +177,18 @@ def collect_pairs(
     sampled_malicious: list[CorpusFile],
     watchman: SentinelAgent,
     cipher: SentinelAgent,
+    deferral_band: float = 0.0,
 ) -> list[tuple[float, float]]:
     """Runs the triage pipeline against each sampled file, pairing its
     calibrated_confidence with its class label (0.0 benign, 1.0 malicious).
     Only ever called with *_held_out lists -- see this file's module
-    docstring."""
+    docstring.
+
+    [Fix] deferral_band defaults to 0.0 (only the all-neutral structural
+    gate applies; the conflicting-but-uncertain gate never fires) rather
+    than being required, so existing direct callers of this function that
+    don't care about the deferral band keep working unchanged -- run()
+    always passes its own validated deferral_band explicitly."""
     targets: list[tuple[CorpusFile, float]] = [(f, 0.0) for f in sampled_benign] + [
         (f, 1.0) for f in sampled_malicious
     ]
@@ -182,7 +201,7 @@ def collect_pairs(
             f"[{index}/{total}] processing {corpus_file['content_hash'][:12]}...",
             file=sys.stderr,
         )
-        calibrated_confidence = _score_one_file(corpus_file, watchman, cipher)
+        calibrated_confidence = _score_one_file(corpus_file, watchman, cipher, deferral_band)
         if calibrated_confidence is not None:
             pairs.append((calibrated_confidence, label))
             if label == 0.0:
@@ -286,7 +305,7 @@ def run(
         file=sys.stderr,
     )
 
-    pairs = collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    pairs = collect_pairs(sampled_benign, sampled_malicious, watchman, cipher, deferral_band)
     if not pairs:
         raise ValueError(
             "Collected zero (confidence, label) pairs -- either zero files were sampled "

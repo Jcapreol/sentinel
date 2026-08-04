@@ -132,6 +132,63 @@ def gather_evidence_and_raw_score(
     return evidence, raw_score
 
 
+def check_structural_deferral(
+    evidence: list[EvidenceItem], raw_score: float, deferral_band: float
+) -> bool:
+    """Two structural pre-calibration deferral gates (2026-07-30 calibration
+    saturation incident), extracted out of process_message so process_message
+    (the live pipeline) and run_evaluation_harness.py (the offline
+    release-gate measurement) can never structurally diverge again. Before
+    this extraction, the harness called apply_calibration/determine_verdict/
+    gather_evidence_and_raw_score directly, bypassing process_message
+    entirely -- so it never exercised either gate below, and its reported
+    ECE/AUC-ROC/deferral rate stayed bit-for-bit identical before and after
+    both gates were added to the live pipeline. Both callers now call this
+    same function. Returns True if either gate fires; the caller builds
+    whatever "Deferred" shape it needs (a TriageReport for process_message,
+    a calibrated_confidence of 0.5 for the harness's pairs -- matching
+    process_message's own convention for a structurally-deferred report)
+    rather than this function producing one, since the two callers need
+    different result shapes.
+
+    Gate 1 (all-neutral evidence): if every evidence item found is
+    direction="neutral" -- no real signal anywhere, not even a failed or
+    conflicting check -- this is a zero-evidence case. Previously this
+    relied entirely on calibrated_confidence landing within deferral_band of
+    the neutral prior via determine_verdict -- correct only as long as
+    apply_calibration behaved like an (approximately) monotonic,
+    non-saturating curve. A real fitted isotonic model can legitimately be a
+    hard step function that never outputs anything near 0.5 (see
+    deferred-work.md's corpus-composition entry) -- apply_calibration(0.5)
+    landing on 1.0 rather than ~0.5 silently defeated deferral_band-based
+    protection entirely, giving a message with NO real evidence a confident
+    "Malicious" verdict. This check operates on `direction` only,
+    structurally, with no dependency on calibrated_confidence or
+    deferral_band at all -- it can't be defeated by any future calibration
+    curve's shape.
+
+    Gate 2 (conflicting-but-uncertain evidence): weak-but-PRESENT
+    directional evidence that nearly cancels (e.g. dmarc=pass vs spf=fail)
+    is real signal, so Gate 1 correctly does not catch it -- but the real
+    fitted calibration curve is not yet trustworthy to preserve that
+    uncertainty either. The committed corpus (fit_real_calibration_model.py,
+    2026-07-28) contains no ambiguous/conflicting-evidence examples, so PAVA
+    had nothing to fit a middle output to and produced a pure 0.0/1.0 step
+    function -- a raw_score of ~0.47 (barely leaning malicious) calibrates
+    to a confident-looking 1.0, indistinguishable from a raw_score of 1.0.
+    Checking raw_score directly -- before apply_calibration ever runs --
+    routes around that untrustworthy curve entirely. This is deliberately a
+    stopgap, not a permanent design choice: it exists because the
+    calibration corpus lacks ambiguous/conflicting-evidence examples
+    (tracked in deferred-work.md). Once that corpus is broadened, a real fit
+    should again be able to preserve this uncertainty on its own, and this
+    gate should be revisited.
+    """
+    if all(item["direction"] == "neutral" for item in evidence):
+        return True
+    return math.isclose(raw_score, 0.5, abs_tol=1e-9) or abs(raw_score - 0.5) < deferral_band
+
+
 def process_message(
     message_id: str,
     auth_results_header: str | None | FetchFailed,
@@ -171,59 +228,15 @@ def process_message(
         auth_results_header, email_content, watchman, cipher
     )
 
-    # [Fix] Structural "no informative evidence" bypass, mirroring the
-    # FetchFailed precedent above: if every evidence item found is
-    # direction="neutral" -- no real signal anywhere, not even a failed or
-    # conflicting check -- route directly to Deferred BEFORE calibration/
-    # determine_verdict ever run. This protects the zero-evidence case
-    # independent of how the calibration curve behaves, present or future.
-    # Previously this relied entirely on calibrated_confidence landing
-    # within deferral_band of the neutral prior via determine_verdict --
-    # correct only as long as apply_calibration behaved like an
-    # (approximately) monotonic, non-saturating curve. A real fitted
-    # isotonic model can legitimately be a hard step function that never
-    # outputs anything near 0.5 (see deferred-work.md's corpus-composition
-    # entry) -- apply_calibration(0.5) landing on 1.0 rather than ~0.5
-    # silently defeated deferral_band-based protection entirely, giving a
-    # message with NO real evidence a confident "Malicious" verdict. All
-    # comparisons below operate on `direction` only, structurally, with no
-    # dependency on calibrated_confidence or deferral_band at all -- this
-    # can't be defeated by any future calibration curve's shape.
-    if all(item["direction"] == "neutral" for item in evidence):
-        return TriageReport(
-            verdict="Deferred",
-            calibrated_confidence=0.5,
-            evidence=evidence,
-            schema_version=1,
-            message_hash=message_hash,
-            timestamp=timestamp,
-        )
-
-    # [Fix] Structural "conflicting-but-uncertain evidence" deferral, parallel
-    # to the all-neutral bypass above but keyed on raw_score instead of
-    # `direction`: weak-but-PRESENT directional evidence that nearly cancels
-    # (e.g. dmarc=pass vs spf=fail) is real signal, so the all-neutral check
-    # above correctly does not catch it -- but the real fitted calibration
-    # curve is not yet trustworthy to preserve that uncertainty either. The
-    # committed corpus (fit_real_calibration_model.py, 2026-07-28) contains no
-    # ambiguous/conflicting-evidence examples, so PAVA had nothing to fit a
-    # middle output to and produced a pure 0.0/1.0 step function -- a
-    # raw_score of ~0.47 (barely leaning malicious) calibrates to a
-    # confident-looking 1.0, indistinguishable from a raw_score of 1.0.
-    # Deferring here on the RAW score -- before apply_calibration ever runs --
-    # routes around that untrustworthy curve entirely. Reuses
-    # config.deferral_threshold as the band width so operators tune one knob,
-    # not two; determine_verdict's own calibrated-score deferral_band check
-    # below is left in place as defense-in-depth (now largely redundant
-    # against the current curve, but harmless, and would matter again against
-    # a future curve shape that isn't a hard step).
-    #
-    # This is deliberately a stopgap, not a permanent design choice: it exists
-    # because the calibration corpus lacks ambiguous/conflicting-evidence
-    # examples (tracked in deferred-work.md). Once that corpus is broadened, a
-    # real fit should again be able to preserve this uncertainty on its own,
-    # and this raw-score gate should be revisited.
-    if math.isclose(raw_score, 0.5, abs_tol=1e-9) or abs(raw_score - 0.5) < config.deferral_threshold:
+    # [Fix] Two structural pre-calibration deferral gates (all-neutral
+    # evidence, and conflicting-but-uncertain evidence) -- see
+    # check_structural_deferral's docstring for the full incident writeup.
+    # Both route directly to Deferred BEFORE apply_calibration/
+    # determine_verdict ever run, independent of how the calibration curve
+    # behaves, present or future. Shared with run_evaluation_harness.py's
+    # _score_one_file so the live pipeline and the offline release-gate
+    # measurement can never structurally diverge on this again.
+    if check_structural_deferral(evidence, raw_score, config.deferral_threshold):
         return TriageReport(
             verdict="Deferred",
             calibrated_confidence=0.5,

@@ -313,12 +313,21 @@ def test_collect_pairs_skips_file_when_apply_calibration_raises(  # type: ignore
     but apply_calibration was called outside the try block -- if it ever
     raised (e.g. an unrecognized `method` in a hand-edited/corrupted
     calibration_model_v1.json), the exception would propagate out of
-    collect_pairs's loop uncaught, aborting the whole run."""
+    collect_pairs's loop uncaught, aborting the whole run.
+
+    [Fix] check_structural_deferral is patched to False here -- this
+    fixture's synthetic .eml files carry no Authentication-Results header
+    and the mocked agents contribute zero evidence, so every sampled file is
+    genuinely all-neutral and would otherwise be structurally deferred
+    before apply_calibration is ever reached, defeating this test's actual
+    point (the exception-handling path around apply_calibration itself, not
+    structural deferral -- that has its own dedicated test below)."""
     watchman = _mock_agent()
     cipher = _mock_agent()
     sampled_benign = valid_corpus["benign_held_out"][:2]
     sampled_malicious = valid_corpus["malicious_held_out"][:2]
 
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     mocker.patch(
         "run_evaluation_harness.apply_calibration",
         side_effect=RuntimeError("simulated: unrecognized calibration method"),
@@ -329,15 +338,69 @@ def test_collect_pairs_skips_file_when_apply_calibration_raises(  # type: ignore
     assert pairs == []
 
 
+def test_collect_pairs_defers_structurally_for_all_neutral_evidence_even_if_calibration_saturates(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker
+) -> None:
+    """[Fix] Regression test for the exact gap that just caused this harness
+    to report a bit-for-bit identical ECE/AUC-ROC/deferral rate before and
+    after tonight's structural deferral fix in process_message: this harness
+    called apply_calibration/gather_evidence_and_raw_score directly,
+    bypassing process_message entirely, so it never exercised either
+    structural pre-calibration deferral gate. Both gates are now extracted
+    into check_structural_deferral (src/sentinel/triage/worker.py) and
+    called from _score_one_file too, in the same order process_message uses
+    (before apply_calibration).
+
+    This fixture's synthetic .eml files carry no Authentication-Results
+    header, and the mocked watchman/cipher agents contribute zero evidence
+    (see _mock_agent) -- every sampled file is genuinely all-neutral
+    evidence, a real held_out sample this structural gate is meant to catch.
+    Mocking apply_calibration to always return 1.0 (the same worst-case
+    pattern as worker.py's own regression tests -- maximally
+    "confident"-looking saturation) proves the harness now reports these
+    files as Deferred (calibrated_confidence 0.5, process_message's own
+    convention) rather than whatever apply_calibration alone would have
+    said."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    sampled_benign = valid_corpus["benign_held_out"][:2]
+    sampled_malicious = valid_corpus["malicious_held_out"][:2]
+    apply_calibration_spy = mocker.patch(
+        "run_evaluation_harness.apply_calibration", return_value=1.0
+    )
+
+    pairs = script.collect_pairs(
+        sampled_benign, sampled_malicious, watchman, cipher, deferral_band=0.05
+    )
+
+    assert len(pairs) == 4
+    assert all(confidence == 0.5 for confidence, _label in pairs)
+    apply_calibration_spy.assert_not_called()
+    # The deferral rate this harness reports must move off 0.0000 for a
+    # sample like this -- the exact number CI caught as suspiciously
+    # unchanged before this fix.
+    assert (
+        script.compute_deferral_rate([c for c, _label in pairs], deferral_band=0.05) == 1.0
+    )
+
+
 def test_run_reports_gate_met_for_well_calibrated_high_discrimination_data(  # type: ignore[no-untyped-def]
     valid_corpus, mocker
 ) -> None:
     """Constructs a controlled scenario via a patched apply_calibration:
     benign files get low confidence (0.05), malicious files get high
     confidence (0.95) -- perfect separation, near-zero ECE, AUC ~= 1.0.
-    Gate must be MET."""
+    Gate must be MET.
+
+    [Fix] check_structural_deferral is patched to False -- this fixture's
+    synthetic files are genuinely all-neutral evidence and would otherwise
+    be structurally deferred to confidence 0.5 before the patched
+    apply_calibration is ever reached, collapsing this controlled scenario
+    into a degenerate one. This test is about calibration/gate logic, not
+    structural deferral -- that has its own dedicated test below."""
     watchman = _mock_agent()
     cipher = _mock_agent()
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     confidences = iter([0.05] * 5 + [0.95] * 5)
     mocker.patch(
         "run_evaluation_harness.apply_calibration", side_effect=lambda raw_score: next(confidences)
@@ -364,9 +427,13 @@ def test_run_never_reports_gate_met_when_every_ece_bin_is_inconclusive(  # type:
     malicious sample (sample_size_per_class=1), correctly ordered, lands
     both in singleton (inconclusive, count=1 < _MIN_SAMPLES_PER_ECE_BIN=5)
     bins -- ece=0.0 and auc_roc=1.0 from just 2 samples, which without this
-    guard would report "Release gate: MET" from essentially zero evidence."""
+    guard would report "Release gate: MET" from essentially zero evidence.
+
+    [Fix] check_structural_deferral is patched to False -- see the identical
+    note on test_run_reports_gate_met_for_well_calibrated_high_discrimination_data."""
     watchman = _mock_agent()
     cipher = _mock_agent()
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     confidences = iter([0.2, 0.8])  # 1 benign (low), 1 malicious (high)
     mocker.patch(
         "run_evaluation_harness.apply_calibration", side_effect=lambda raw_score: next(confidences)
@@ -391,9 +458,13 @@ def test_run_reports_gate_not_met_for_anti_correlated_data(  # type: ignore[no-u
     """The mirror scenario: benign files get HIGH confidence, malicious
     files get LOW confidence -- perfectly anti-correlated with the true
     label, AUC-ROC ~= 0.0, well below _MIN_AUC_FOR_NON_FLAT. Gate must be
-    NOT MET."""
+    NOT MET.
+
+    [Fix] check_structural_deferral is patched to False -- see the identical
+    note on test_run_reports_gate_met_for_well_calibrated_high_discrimination_data."""
     watchman = _mock_agent()
     cipher = _mock_agent()
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     confidences = iter([0.95] * 5 + [0.05] * 5)
     mocker.patch(
         "run_evaluation_harness.apply_calibration", side_effect=lambda raw_score: next(confidences)
@@ -471,10 +542,14 @@ def test_main_exits_0_when_gate_is_met(  # type: ignore[no-untyped-def]
 ) -> None:
     """[Review] Task 4's original gate-met/not-met tests only asserted on
     report["gate_met"] via script.run() directly -- never through main()'s
-    actual sys.exit mapping. This proves the real, end-to-end exit code."""
+    actual sys.exit mapping. This proves the real, end-to-end exit code.
+
+    [Fix] check_structural_deferral is patched to False -- see the identical
+    note on test_run_reports_gate_met_for_well_calibrated_high_discrimination_data."""
     watchman = _mock_agent()
     cipher = _mock_agent()
     _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher)
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     # 5 per class -- exactly _MIN_SAMPLES_PER_ECE_BIN, so both bins are
     # conclusive (not just correctly separated, per Patch 1's new guard).
     confidences = iter([0.05] * 5 + [0.95] * 5)
@@ -494,9 +569,12 @@ def test_main_exits_0_when_gate_is_met(  # type: ignore[no-untyped-def]
 def test_main_exits_1_when_gate_is_not_met(  # type: ignore[no-untyped-def]
     valid_corpus, mocker, capsys
 ) -> None:
+    """[Fix] check_structural_deferral is patched to False -- see the
+    identical note on test_run_reports_gate_met_for_well_calibrated_high_discrimination_data."""
     watchman = _mock_agent()
     cipher = _mock_agent()
     _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher)
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
     # 5 per class (conclusive bins) so this genuinely tests "anti-correlated
     # data fails the gate", not merely "inconclusive data can't pass".
     confidences = iter([0.95] * 5 + [0.05] * 5)  # anti-correlated
