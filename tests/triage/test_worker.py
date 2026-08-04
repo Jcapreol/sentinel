@@ -17,7 +17,13 @@ from sentinel.triage.store import (
     persist_evidence_record,
     read_evidence_record,
 )
-from sentinel.triage.worker import main, process_message, run_continuous_loop, run_poll_cycle
+from sentinel.triage.worker import (
+    check_structural_deferral,
+    main,
+    process_message,
+    run_continuous_loop,
+    run_poll_cycle,
+)
 from sentinel.verdict import AgentResult, SentinelAgent
 
 
@@ -149,6 +155,41 @@ def test_process_message_conflicting_evidence_defers_structurally_even_if_calibr
     )
 
     assert report["verdict"] == "Deferred"
+
+
+def test_check_structural_deferral_true_for_all_neutral_evidence(
+    make_evidence_item,  # type: ignore[no-untyped-def]
+) -> None:
+    evidence = [make_evidence_item(name="spf", direction="neutral", weight=0.10)]
+
+    assert check_structural_deferral(evidence, raw_score=0.5, deferral_band=0.0) is True
+
+
+def test_check_structural_deferral_true_at_exact_neutral_prior_regardless_of_band(
+    make_evidence_item,  # type: ignore[no-untyped-def]
+) -> None:
+    # Directional (non-neutral) evidence, but raw_score==0.5 exactly -- Gate 1
+    # (all-neutral) does not apply, but Gate 2's math.isclose check must still
+    # catch this even with deferral_band=0.0 (the narrowest possible band).
+    evidence = [make_evidence_item(name="spf", direction="malicious", weight=0.4)]
+
+    assert check_structural_deferral(evidence, raw_score=0.5, deferral_band=0.0) is True
+
+
+def test_check_structural_deferral_true_for_raw_score_within_band(
+    make_evidence_item,  # type: ignore[no-untyped-def]
+) -> None:
+    evidence = [make_evidence_item(name="spf", direction="malicious", weight=0.4)]
+
+    assert check_structural_deferral(evidence, raw_score=0.47, deferral_band=0.05) is True
+
+
+def test_check_structural_deferral_false_for_directional_evidence_outside_band(
+    make_evidence_item,  # type: ignore[no-untyped-def]
+) -> None:
+    evidence = [make_evidence_item(name="spf", direction="malicious", weight=0.8)]
+
+    assert check_structural_deferral(evidence, raw_score=0.9, deferral_band=0.05) is False
 
 
 def test_process_message_never_raises_inconclusive_score_error() -> None:
