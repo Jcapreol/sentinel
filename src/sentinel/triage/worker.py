@@ -30,6 +30,7 @@ from sentinel.triage.ingest import (
     poll_new_messages,
 )
 from sentinel.triage.report import TriageReport
+from sentinel.triage.script_guard import ApiCallBudgetExceededError
 from sentinel.triage.scoring import (
     InconclusiveScoreError,
     apply_calibration,
@@ -104,6 +105,28 @@ def gather_evidence_and_raw_score(
         cipher_future = executor.submit(cipher.analyze, email_content)
         try:
             watchman_evidence = watchman_future.result().get("evidence", [])
+        except ApiCallBudgetExceededError:
+            # Story 4.2: must propagate uncaught -- the generic except below
+            # would otherwise convert a real-corpus script's budget-ceiling
+            # abort into an ordinary "crashed unexpectedly" coverage-gap
+            # item, letting the run silently continue past its configured
+            # budget (AC3). Only fires for the two real-corpus scripts --
+            # worker.py's own live-triage WatchmanAgent(config)/
+            # CipherAgent(config) never construct a budget object, so this
+            # branch is unreachable from process_message.
+            #
+            # Known, accepted limitation (code review, 2026-08-03): cipher_future
+            # is already running concurrently at this point and is NOT cancelled
+            # or awaited before this re-raises -- ThreadPoolExecutor cannot
+            # forcibly cancel an in-flight task. Cipher's own budget check may
+            # already have passed before Watchman's rejection is known here, so
+            # a few extra real API calls (VT/AbuseIPDB/URLhaus, up to 3) can
+            # slip through uncounted at the moment of abort. Deliberately not
+            # fixed with cross-thread cancellation coordination -- the bound is
+            # small (one file's worth of in-flight calls, not a systemic
+            # overshoot) and real coordination is disproportionate complexity
+            # for a boundary case. See deferred-work.md.
+            raise
         except Exception as e:
             watchman_evidence = [
                 EvidenceItem(
@@ -116,6 +139,8 @@ def gather_evidence_and_raw_score(
             ]
         try:
             cipher_evidence = cipher_future.result().get("evidence", [])
+        except ApiCallBudgetExceededError:
+            raise  # Story 4.2: see the identical guard above for watchman_evidence
         except Exception as e:
             cipher_evidence = [
                 EvidenceItem(

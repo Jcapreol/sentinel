@@ -62,11 +62,24 @@ from sentinel.triage.eval import (
     validate_corpus,
 )
 from sentinel.triage.ingest import extract_auth_results_header_from_eml, extract_email_content
+from sentinel.triage.script_guard import (
+    DEFAULT_API_CEILING_WINDOW_HOURS,
+    DEFAULT_CACHE_TTL_SECONDS,
+    ApiCallBudget,
+    ApiCallBudgetExceededError,
+    LockAlreadyHeldError,
+    LookupCache,
+    acquire_run_lock,
+)
 from sentinel.triage.worker import gather_evidence_and_raw_score
 from sentinel.verdict import SentinelAgent
 from sentinel.watchman import WatchmanAgent
 
 _DEFAULT_SAMPLE_SIZE_PER_CLASS = 200
+# [Review][Patch] Shared with run_evaluation_harness.py via script_guard.py --
+# previously duplicated verbatim in both scripts (code review 2026-08-03).
+_DEFAULT_CACHE_TTL_SECONDS = DEFAULT_CACHE_TTL_SECONDS
+_DEFAULT_API_CEILING_WINDOW_HOURS = DEFAULT_API_CEILING_WINDOW_HOURS
 # [Review][Patch] Absolute, anchored at this script's own location -- not a
 # bare relative "calibration_model_v1.json", which only resolves to repo
 # root when invoked from the repo root. Mirrors scoring.py's
@@ -76,6 +89,11 @@ _DEFAULT_SAMPLE_SIZE_PER_CLASS = 200
 # script exists for -- accidentally writing to (or reading a stale summary
 # from) the wrong location should not be possible by default.
 _DEFAULT_OUTPUT_PATH = str(Path(__file__).resolve().parent / "calibration_model_v1.json")
+# Story 4.2: shared Cipher-lookup-cache + API-call-budget state, same
+# absolute-path-anchored-at-this-script's-own-location reasoning as
+# _DEFAULT_OUTPUT_PATH. Shared with run_evaluation_harness.py -- both real-
+# corpus scripts benefit from the same cache across separate invocations.
+_STATE_DB_PATH = str(Path(__file__).resolve().parent / ".sentinel_script_state.db")
 
 
 def _default_corpus_path(config: Config) -> str:
@@ -116,6 +134,12 @@ def _score_one_file(
         _evidence, raw_score = gather_evidence_and_raw_score(
             auth_header, email_content, watchman, cipher
         )
+    except ApiCallBudgetExceededError:
+        # Story 4.2: must propagate uncaught, never treated as "this one
+        # file failed, skip it and keep going" -- a budget-exceeded run
+        # aborts entirely (AC3), it does not silently continue past the
+        # configured ceiling one file at a time.
+        raise
     except Exception as e:
         print(
             f"  WARNING: pipeline failed for {corpus_file['path']}: "
@@ -226,17 +250,72 @@ def main() -> None:
         action="store_true",
         help="run the full pipeline and print the fitted model's summary, but do not write --output",
     )
+    parser.add_argument(
+        "--cache-ttl-seconds",
+        type=float,
+        default=_DEFAULT_CACHE_TTL_SECONDS,
+        help=(
+            "how long a cached Cipher lookup stays valid, shared with "
+            f"run_evaluation_harness.py (default: {_DEFAULT_CACHE_TTL_SECONDS:.0f}s / 24h)"
+        ),
+    )
+    parser.add_argument(
+        "--api-call-ceiling",
+        type=int,
+        default=None,
+        help="combined Watchman+Cipher external API call ceiling per window (default: disabled)",
+    )
+    parser.add_argument(
+        "--api-ceiling-window-hours",
+        type=float,
+        default=_DEFAULT_API_CEILING_WINDOW_HOURS,
+        help=f"rolling window in hours --api-call-ceiling applies to (default: {_DEFAULT_API_CEILING_WINDOW_HOURS})",
+    )
     args = parser.parse_args()
 
-    config = load_config()
-    corpus_path = args.corpus_path or _default_corpus_path(config)
-    corpus = load_corpus(corpus_path)
-    watchman: SentinelAgent = WatchmanAgent(config)
-    cipher: SentinelAgent = CipherAgent(config)
+    # [Review][Patch] Resolved ONCE, up front -- used for both the lock key
+    # and the eventual write. Previously the lock was keyed on the raw,
+    # unresolved args.output CLI string, so two invocations targeting the
+    # same real file via different path spellings (relative vs absolute, a
+    # "./x" vs "x") would compute different lock file names and both
+    # succeed, defeating Design Decision 2's "resolved path" requirement
+    # (code review 2026-08-03).
+    resolved_output = str(Path(args.output).resolve())
 
+    # Story 4.2: the lock is acquired as the first real action -- before
+    # load_config, before load_corpus, before anything else -- keyed by
+    # resolved_output (the resource this script writes). Not just a write
+    # guard: it also protects against a second concurrent invocation
+    # burning real API spend redundantly, the harm AC1 names first.
+    #
+    # [Review][Patch] save_calibration_model now runs INSIDE this lock
+    # (below) -- previously it ran after the `with` block had already
+    # exited, so the actual file write this lock exists to protect wasn't
+    # covered by it at all, defeating the lock's purpose for the one
+    # operation that matters most (code review 2026-08-03).
     try:
-        model = run(corpus, args.sample_size_per_class, watchman, cipher)
-    except ValueError as e:
+        with acquire_run_lock(resolved_output):
+            config = load_config()
+            corpus_path = args.corpus_path or _default_corpus_path(config)
+            corpus = load_corpus(corpus_path)
+            cache = LookupCache(_STATE_DB_PATH, ttl_seconds=args.cache_ttl_seconds)
+            budget = ApiCallBudget(
+                _STATE_DB_PATH,
+                ceiling=args.api_call_ceiling,
+                window_seconds=args.api_ceiling_window_hours * 3600,
+            )
+            watchman: SentinelAgent = WatchmanAgent(config, temperature=0, budget=budget)
+            cipher: SentinelAgent = CipherAgent(config, cache=cache, budget=budget)
+
+            model = run(corpus, args.sample_size_per_class, watchman, cipher)
+
+            if not args.dry_run:
+                save_calibration_model(model, resolved_output)
+    except (ValueError, LockAlreadyHeldError, ApiCallBudgetExceededError) as e:
+        # Reuses this script's one existing failure code (1) for all three --
+        # "could not run the pipeline at all," the same class as an invalid
+        # corpus. Each exception's own message stays distinct even though
+        # the exit code is shared.
         print(str(e), file=sys.stderr)
         sys.exit(1)
 
@@ -244,12 +323,11 @@ def main() -> None:
 
     if args.dry_run:
         print()
-        print(f"--dry-run: NOT writing to {args.output}")
+        print(f"--dry-run: NOT writing to {resolved_output}")
         return
 
-    save_calibration_model(model, args.output)
     print()
-    print(f"Written to {args.output}")
+    print(f"Written to {resolved_output}")
 
 
 if __name__ == "__main__":

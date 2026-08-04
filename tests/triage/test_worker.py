@@ -10,6 +10,7 @@ from sentinel.config import Config, ConfigError
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.ingest import FetchFailed, fetch_headers_for_messages
 from sentinel.triage.report import TriageReport
+from sentinel.triage.script_guard import ApiCallBudgetExceededError
 from sentinel.triage.scoring import apply_calibration, compute_raw_score, determine_verdict
 from sentinel.triage.store import (
     EvidenceRecord,
@@ -19,6 +20,7 @@ from sentinel.triage.store import (
 )
 from sentinel.triage.worker import (
     check_structural_deferral,
+    gather_evidence_and_raw_score,
     main,
     process_message,
     run_continuous_loop,
@@ -190,6 +192,42 @@ def test_check_structural_deferral_false_for_directional_evidence_outside_band(
     evidence = [make_evidence_item(name="spf", direction="malicious", weight=0.8)]
 
     assert check_structural_deferral(evidence, raw_score=0.9, deferral_band=0.05) is False
+
+
+def test_gather_evidence_and_raw_score_propagates_watchman_budget_exceeded_uncaught() -> None:
+    """Story 4.2 regression guard: found during that story's implementation
+    -- this function's own except Exception: blocks around
+    watchman_future.result()/cipher_future.result() previously swallowed
+    ANY exception (including ApiCallBudgetExceededError) into a normal
+    "crashed unexpectedly" coverage-gap EvidenceItem, silently letting a
+    real-corpus script continue past its configured API call ceiling one
+    file at a time -- exactly what AC3 forbids. Confirmed via
+    fit_real_calibration_model.py's own test suite actually running to
+    completion and writing an output file when it should have aborted,
+    before this fix. Only reachable when a caller's agent raises
+    ApiCallBudgetExceededError (the two real-corpus scripts); worker.py's
+    own live-triage WatchmanAgent(config)/CipherAgent(config) never
+    construct a budget object, so this can never fire from process_message."""
+
+    class _BudgetExceededAgent:
+        def analyze(self, input_data: str) -> AgentResult:
+            raise ApiCallBudgetExceededError("ceiling reached")
+
+    budget_exceeded_agent: SentinelAgent = _BudgetExceededAgent()
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        gather_evidence_and_raw_score(None, "content", budget_exceeded_agent, _neutral_agent)
+
+
+def test_gather_evidence_and_raw_score_propagates_cipher_budget_exceeded_uncaught() -> None:
+    class _BudgetExceededAgent:
+        def analyze(self, input_data: str) -> AgentResult:
+            raise ApiCallBudgetExceededError("ceiling reached")
+
+    budget_exceeded_agent: SentinelAgent = _BudgetExceededAgent()
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        gather_evidence_and_raw_score(None, "content", _neutral_agent, budget_exceeded_agent)
 
 
 def test_process_message_never_raises_inconclusive_score_error() -> None:
@@ -1485,3 +1523,64 @@ def test_triage_imports_no_remediation_capable_library() -> None:
                 assert node.module not in forbidden, (
                     f"{source_path.name} imports from {node.module}"
                 )
+
+
+_LIVE_TRIAGE_AGENT_FORBIDDEN_KWARGS = {"temperature", "cache", "budget"}
+
+
+def _live_triage_agent_construction_kwargs(tree: ast.AST) -> list[str]:
+    """Scans an AST for WatchmanAgent(...)/CipherAgent(...) calls and returns
+    a description of any temperature/cache/budget keyword argument found --
+    the three Story 4.2 params that must never reach worker.py's live-triage
+    agent construction sites (AC5). Structural, not behavioral: proves the
+    SOURCE CODE never wires these in, matching this codebase's established
+    permanent-guard standard (test_triage_imports_no_remediation_capable_
+    library above; the held_out/tuning AST guards in fit_real_calibration_
+    model.py's and run_evaluation_harness.py's own test suites)."""
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"WatchmanAgent", "CipherAgent"}
+        ):
+            for kw in node.keywords:
+                if kw.arg in _LIVE_TRIAGE_AGENT_FORBIDDEN_KWARGS:
+                    violations.append(f"{node.func.id}(..., {kw.arg}=...)")
+    return violations
+
+
+def test_worker_never_passes_temperature_cache_budget_to_live_triage_agents() -> None:
+    """[Story 4.2, AC5] Permanent structural guard: worker.py's live-triage
+    WatchmanAgent(config)/CipherAgent(config) call sites (run_continuous_
+    loop, --once dispatch) must never pass temperature/cache/budget --
+    doing so would silently wire live triage into the real-corpus-script-
+    only mechanisms (pinned temperature, Cipher caching, the API call
+    ceiling) AC5 requires stay opt-in, with no other test positioned to
+    catch it. This is the proof for the specific claim Task 3's Dev Notes
+    make ("structurally unreachable from process_message") -- not just
+    asserted in a summary."""
+    source_path = Path(__file__).resolve().parents[2] / "src" / "sentinel" / "triage" / "worker.py"
+    tree = ast.parse(source_path.read_text())
+
+    violations = _live_triage_agent_construction_kwargs(tree)
+
+    assert violations == [], (
+        f"worker.py passes a Story 4.2 param to a live-triage agent construction: {violations!r} "
+        "-- this would silently change live triage behavior, violating AC5"
+    )
+
+
+def test_live_triage_agent_guard_detects_temperature_kwarg() -> None:
+    poisoned = ast.parse("WatchmanAgent(config, temperature=0)")
+    assert _live_triage_agent_construction_kwargs(poisoned) == ["WatchmanAgent(..., temperature=...)"]
+
+
+def test_live_triage_agent_guard_detects_cache_kwarg() -> None:
+    poisoned = ast.parse("CipherAgent(config, cache=cache)")
+    assert _live_triage_agent_construction_kwargs(poisoned) == ["CipherAgent(..., cache=...)"]
+
+
+def test_live_triage_agent_guard_detects_budget_kwarg() -> None:
+    poisoned = ast.parse("WatchmanAgent(config, budget=budget)")
+    assert _live_triage_agent_construction_kwargs(poisoned) == ["WatchmanAgent(..., budget=...)"]

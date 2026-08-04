@@ -4,6 +4,7 @@ from pytest_mock import MockerFixture
 
 from sentinel.config import Config
 from sentinel.triage.evidence import EvidenceItem
+from sentinel.triage.script_guard import ApiCallBudgetExceededError
 from sentinel.triage.scoring import compute_raw_score
 from sentinel.verdict import SentinelAgent
 from sentinel.watchman import WatchmanAgent
@@ -274,3 +275,80 @@ def test_watchman_satisfies_sentinel_agent_protocol(
     mocker.patch("sentinel.watchman.anthropic.Anthropic")
     agent: SentinelAgent = WatchmanAgent(config=fake_config)
     assert callable(getattr(agent, "analyze", None))
+
+
+# --- Story 4.2: temperature pinning + budget enforcement (real-corpus scripts only) ---
+
+
+def test_watchman_passes_temperature_through_to_messages_create_when_set(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = '{"findings": [], "confidence": "Investigating"}'
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+
+    agent = WatchmanAgent(config=fake_config, temperature=0)
+    agent.analyze(sample_alert)
+
+    _, kwargs = mock_anthropic.return_value.messages.create.call_args
+    assert kwargs["temperature"] == 0
+
+
+def test_watchman_omits_temperature_kwarg_when_not_set(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """Default (live triage) behavior: no temperature pinned at all, not
+    even an explicit None -- confirms AC5's "live triage unaffected"
+    boundary at the actual SDK call-site level, not just by inspecting
+    WatchmanAgent's constructor default."""
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = '{"findings": [], "confidence": "Investigating"}'
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+
+    agent = WatchmanAgent(config=fake_config)  # no temperature -- matches worker.py's live call
+    agent.analyze(sample_alert)
+
+    _, kwargs = mock_anthropic.return_value.messages.create.call_args
+    assert "temperature" not in kwargs
+
+
+def test_watchman_budget_check_and_record_called_before_messages_create(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = '{"findings": [], "confidence": "Investigating"}'
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+    call_order: list[str] = []
+    budget = mocker.MagicMock()
+    budget.check_and_record.side_effect = lambda *a, **k: call_order.append("budget")
+    mock_anthropic.return_value.messages.create.side_effect = (
+        lambda *a, **k: (call_order.append("messages.create"), mock_response)[1]
+    )
+
+    agent = WatchmanAgent(config=fake_config, budget=budget)
+    agent.analyze(sample_alert)
+
+    budget.check_and_record.assert_called_once_with("watchman")
+    assert call_order == ["budget", "messages.create"]
+
+
+def test_watchman_budget_exceeded_propagates_out_of_analyze_uncaught(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """Regression guard for the exact swallowing bug this story's design
+    caught during drafting: analyze()'s own broad except Exception: (and,
+    if the budget check were placed differently, any other broad handler)
+    must NOT convert ApiCallBudgetExceededError into a normal coverage-gap
+    AgentResult -- it must propagate all the way out, uncaught, so the
+    calling script can abort loudly (AC3)."""
+    mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    budget = mocker.MagicMock()
+    budget.check_and_record.side_effect = ApiCallBudgetExceededError("ceiling reached")
+
+    agent = WatchmanAgent(config=fake_config, budget=budget)
+
+    with pytest.raises(ApiCallBudgetExceededError):
+        agent.analyze(sample_alert)

@@ -5,6 +5,12 @@ import httpx
 
 from sentinel.config import Config
 from sentinel.triage.evidence import EvidenceItem
+from sentinel.triage.script_guard import (
+    ApiCallBudget,
+    ApiCallBudgetExceededError,
+    CachedLookup,
+    LookupCache,
+)
 from sentinel.verdict import AgentResult, BlindSpot
 
 # PROVISIONAL PRIORS, not calibrated values (matches headers.py/watchman.py's
@@ -116,8 +122,21 @@ def _urlhaus_weight_and_direction(url_count: int) -> tuple[float, Literal["malic
 
 
 class CipherAgent:
-    def __init__(self, config: Config) -> None:
+    """`cache`/`budget` are Story 4.2 additions -- both default to
+    `None`/off. Only fit_real_calibration_model.py/run_evaluation_harness.py
+    ever pass them; worker.py's live-triage `CipherAgent(config)` call sites
+    are unmodified, so live triage never checks a cache or a call ceiling
+    (AC5)."""
+
+    def __init__(
+        self,
+        config: Config,
+        cache: LookupCache | None = None,
+        budget: ApiCallBudget | None = None,
+    ) -> None:
         self._config = config
+        self._cache = cache
+        self._budget = budget
         self._client = httpx.Client(timeout=config.timeout_seconds)
 
     def analyze(self, input_data: str) -> AgentResult:
@@ -162,6 +181,11 @@ class CipherAgent:
                 error="timeout",
                 evidence=_coverage_gap_evidence("cipher_analysis", reason),
             )
+        except ApiCallBudgetExceededError:
+            # Story 4.2: must propagate uncaught, never converted into a
+            # coverage-gap AgentResult -- see the identical guard on each of
+            # _analyze_ip/_analyze_domain/_lookup_urlhaus's own except blocks.
+            raise
         except Exception:
             reason = "Cipher analysis failed — threat intelligence lookup unavailable"
             return AgentResult(
@@ -182,6 +206,7 @@ class CipherAgent:
     def _lookup_urlhaus(
         self,
         indicator: str,
+        indicator_type: Literal["ip", "domain"],
         findings: list[str],
         blind_spots: list[BlindSpot],
         evidence: list[EvidenceItem],
@@ -195,8 +220,30 @@ class CipherAgent:
         itself auditable evidence for the weighted score, distinct from a true
         coverage gap (the except Exception path below, where the lookup never
         completed at all).
+
+        Story 4.2: `indicator_type` identifies the cache key alongside
+        `indicator`/`source="urlhaus"`. A cache hit reconstructs only the
+        `EvidenceItem` (added to `evidence`) -- NOT `findings`/`blind_spots`
+        membership, which this codebase's real-corpus-script consumers
+        (`gather_evidence_and_raw_score`) never read anyway; replicating
+        exact historical `findings` text on every cache hit would add real
+        complexity for zero actual benefit to this story's purpose.
         """
+        if self._cache is not None:
+            cached = self._cache.get(indicator_type, indicator, "urlhaus")
+            if cached is not None:
+                evidence.append(
+                    EvidenceItem(
+                        name="urlhaus_finding",
+                        finding=cached["finding"],
+                        weight=cached["weight"],
+                        direction=cached["direction"],
+                    )
+                )
+                return None
         try:
+            if self._budget is not None:
+                self._budget.check_and_record("urlhaus")
             uh_resp = self._client.post(
                 _URLHAUS_URL,
                 data={"host": indicator},
@@ -229,6 +276,11 @@ class CipherAgent:
                     findings.append(finding)
                     weight, direction = _urlhaus_weight_and_direction(url_count)
                     evidence.append(EvidenceItem(name="urlhaus_finding", finding=finding, weight=weight, direction=direction))
+                    if self._cache is not None:
+                        self._cache.put(
+                            indicator_type, indicator, "urlhaus",
+                            CachedLookup(weight=weight, direction=direction, finding=finding),
+                        )
                 else:
                     # "ok" with url_count == 0 is a degenerate API shape -- read
                     # identically to a genuine no_results miss below, not a
@@ -239,6 +291,14 @@ class CipherAgent:
                             weight=_UNINFORMATIVE_WEIGHT, direction="neutral",
                         )
                     )
+                    if self._cache is not None:
+                        self._cache.put(
+                            indicator_type, indicator, "urlhaus",
+                            CachedLookup(
+                                weight=_UNINFORMATIVE_WEIGHT, direction="neutral",
+                                finding=no_association_reason,
+                            ),
+                        )
             elif query_status == "no_results":
                 # silent no-data for findings/blind_spots (unchanged); absence is
                 # not exonerating, so still record a neutral, uninformative
@@ -249,6 +309,13 @@ class CipherAgent:
                         weight=_UNINFORMATIVE_WEIGHT, direction="neutral",
                     )
                 )
+                if self._cache is not None:
+                    self._cache.put(
+                        indicator_type, indicator, "urlhaus",
+                        CachedLookup(
+                            weight=_UNINFORMATIVE_WEIGHT, direction="neutral", finding=no_association_reason
+                        ),
+                    )
             else:
                 # Any other/unrecognized query_status (e.g. URLhaus's documented
                 # "invalid_host") means the query itself was rejected or
@@ -265,6 +332,8 @@ class CipherAgent:
             return None
         except httpx.TimeoutException:
             raise
+        except ApiCallBudgetExceededError:
+            raise  # Story 4.2: must not be swallowed by the generic handler below
         except Exception:
             reason = "URLhaus lookup failed — malicious URL data unavailable"
             blind_spots.append(
@@ -284,138 +353,172 @@ class CipherAgent:
         overall_error: str | None = None
 
         # VirusTotal lookup
-        try:
-            vt_resp = self._client.get(
-                _VT_IP_URL.format(ip=ip),
-                headers={"x-apikey": self._config.virustotal_api_key},
+        vt_cached = self._cache.get("ip", ip, "virustotal") if self._cache is not None else None
+        if vt_cached is not None:
+            evidence.append(
+                EvidenceItem(
+                    name="virustotal_finding", finding=vt_cached["finding"],
+                    weight=vt_cached["weight"], direction=vt_cached["direction"],
+                )
             )
-            if vt_resp.status_code == 429:
-                reason = "VirusTotal rate limit reached — reputation data unavailable"
-                blind_spots.append(
-                    BlindSpot(
-                        source="virustotal",
-                        reason=reason,
-                        next_step="Wait 60 seconds or upgrade to VirusTotal Premium",
+        else:
+            try:
+                if self._budget is not None:
+                    self._budget.check_and_record("virustotal")
+                vt_resp = self._client.get(
+                    _VT_IP_URL.format(ip=ip),
+                    headers={"x-apikey": self._config.virustotal_api_key},
+                )
+                if vt_resp.status_code == 429:
+                    reason = "VirusTotal rate limit reached — reputation data unavailable"
+                    blind_spots.append(
+                        BlindSpot(
+                            source="virustotal",
+                            reason=reason,
+                            next_step="Wait 60 seconds or upgrade to VirusTotal Premium",
+                        )
                     )
-                )
-                evidence.append(
-                    EvidenceItem(name="virustotal_finding", finding=reason, weight=_UNINFORMATIVE_WEIGHT, direction="neutral")
-                )
-                overall_error = "rate_limited"
-            elif vt_resp.status_code != 200:
-                # Any other non-200 (VT's documented 404 "indicator never
-                # scanned", 401/403 auth failure, 5xx) previously fell through
-                # to the .get(..., 0) defaults below, producing a false "0
-                # malicious engines" neutral EvidenceItem indistinguishable
-                # from a genuine clean scan. Must be a coverage gap instead.
-                reason = f"VirusTotal returned unexpected status {vt_resp.status_code} — reputation data unavailable"
+                    evidence.append(
+                        EvidenceItem(name="virustotal_finding", finding=reason, weight=_UNINFORMATIVE_WEIGHT, direction="neutral")
+                    )
+                    overall_error = "rate_limited"
+                elif vt_resp.status_code != 200:
+                    # Any other non-200 (VT's documented 404 "indicator never
+                    # scanned", 401/403 auth failure, 5xx) previously fell through
+                    # to the .get(..., 0) defaults below, producing a false "0
+                    # malicious engines" neutral EvidenceItem indistinguishable
+                    # from a genuine clean scan. Must be a coverage gap instead.
+                    reason = f"VirusTotal returned unexpected status {vt_resp.status_code} — reputation data unavailable"
+                    blind_spots.append(
+                        BlindSpot(
+                            source="virustotal",
+                            reason=reason,
+                            next_step="Check the VirusTotal API key and indicator format",
+                        )
+                    )
+                    evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
+                    if overall_error is None:
+                        overall_error = "analysis_failed"
+                else:
+                    vt_data = vt_resp.json()
+                    stats = (
+                        vt_data.get("data", {})
+                        .get("attributes", {})
+                        .get("last_analysis_stats", {})
+                    )
+                    # Defensive cast (matches _lookup_urlhaus's existing
+                    # int(..., 0) precedent) -- an explicit JSON null or
+                    # non-numeric value here would otherwise raise mid-tier-
+                    # comparison, AFTER `finding` is already appended below.
+                    malicious = int(stats.get("malicious") or 0)
+                    suspicious = int(stats.get("suspicious") or 0)
+                    finding = (
+                        f"VirusTotal: {ip} flagged by {malicious} engines as malicious, "
+                        f"{suspicious} as suspicious"
+                    )
+                    findings.append(finding)
+                    weight, direction = _vt_weight_and_direction(malicious, suspicious)
+                    evidence.append(EvidenceItem(name="virustotal_finding", finding=finding, weight=weight, direction=direction))
+                    if self._cache is not None:
+                        self._cache.put(
+                            "ip", ip, "virustotal", CachedLookup(weight=weight, direction=direction, finding=finding)
+                        )
+            except httpx.TimeoutException:
+                raise
+            except ApiCallBudgetExceededError:
+                raise  # Story 4.2: must not be swallowed by the generic handler below
+            except Exception:
+                reason = "VirusTotal lookup failed — reputation data unavailable"
                 blind_spots.append(
                     BlindSpot(
                         source="virustotal",
                         reason=reason,
-                        next_step="Check the VirusTotal API key and indicator format",
+                        next_step=None,
                     )
                 )
                 evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
                 if overall_error is None:
                     overall_error = "analysis_failed"
-            else:
-                vt_data = vt_resp.json()
-                stats = (
-                    vt_data.get("data", {})
-                    .get("attributes", {})
-                    .get("last_analysis_stats", {})
-                )
-                # Defensive cast (matches _lookup_urlhaus's existing
-                # int(..., 0) precedent) -- an explicit JSON null or
-                # non-numeric value here would otherwise raise mid-tier-
-                # comparison, AFTER `finding` is already appended below.
-                malicious = int(stats.get("malicious") or 0)
-                suspicious = int(stats.get("suspicious") or 0)
-                finding = (
-                    f"VirusTotal: {ip} flagged by {malicious} engines as malicious, "
-                    f"{suspicious} as suspicious"
-                )
-                findings.append(finding)
-                weight, direction = _vt_weight_and_direction(malicious, suspicious)
-                evidence.append(EvidenceItem(name="virustotal_finding", finding=finding, weight=weight, direction=direction))
-        except httpx.TimeoutException:
-            raise
-        except Exception:
-            reason = "VirusTotal lookup failed — reputation data unavailable"
-            blind_spots.append(
-                BlindSpot(
-                    source="virustotal",
-                    reason=reason,
-                    next_step=None,
-                )
-            )
-            evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
-            if overall_error is None:
-                overall_error = "analysis_failed"
 
         # AbuseIPDB lookup
-        try:
-            ab_resp = self._client.get(
-                _ABUSEIPDB_URL,
-                params={"ipAddress": ip, "maxAgeInDays": 90},
-                headers={
-                    "Key": self._config.abuseipdb_api_key,
-                    "Accept": "application/json",
-                },
+        ab_cached = self._cache.get("ip", ip, "abuseipdb") if self._cache is not None else None
+        if ab_cached is not None:
+            evidence.append(
+                EvidenceItem(
+                    name="abuseipdb_finding", finding=ab_cached["finding"],
+                    weight=ab_cached["weight"], direction=ab_cached["direction"],
+                )
             )
-            if ab_resp.status_code == 429:
-                reason = "AbuseIPDB rate limit reached — abuse report data unavailable"
-                blind_spots.append(
-                    BlindSpot(
-                        source="abuseipdb",
-                        reason=reason,
-                        next_step="Wait before retrying or upgrade your AbuseIPDB plan",
+        else:
+            try:
+                if self._budget is not None:
+                    self._budget.check_and_record("abuseipdb")
+                ab_resp = self._client.get(
+                    _ABUSEIPDB_URL,
+                    params={"ipAddress": ip, "maxAgeInDays": 90},
+                    headers={
+                        "Key": self._config.abuseipdb_api_key,
+                        "Accept": "application/json",
+                    },
+                )
+                if ab_resp.status_code == 429:
+                    reason = "AbuseIPDB rate limit reached — abuse report data unavailable"
+                    blind_spots.append(
+                        BlindSpot(
+                            source="abuseipdb",
+                            reason=reason,
+                            next_step="Wait before retrying or upgrade your AbuseIPDB plan",
+                        )
                     )
-                )
-                evidence.append(
-                    EvidenceItem(name="abuseipdb_finding", finding=reason, weight=_UNINFORMATIVE_WEIGHT, direction="neutral")
-                )
-                if overall_error is None:
-                    overall_error = "rate_limited"
-            elif ab_resp.status_code != 200:
-                reason = f"AbuseIPDB returned unexpected status {ab_resp.status_code} — abuse report data unavailable"
+                    evidence.append(
+                        EvidenceItem(name="abuseipdb_finding", finding=reason, weight=_UNINFORMATIVE_WEIGHT, direction="neutral")
+                    )
+                    if overall_error is None:
+                        overall_error = "rate_limited"
+                elif ab_resp.status_code != 200:
+                    reason = f"AbuseIPDB returned unexpected status {ab_resp.status_code} — abuse report data unavailable"
+                    blind_spots.append(
+                        BlindSpot(
+                            source="abuseipdb",
+                            reason=reason,
+                            next_step="Check the AbuseIPDB API key and indicator format",
+                        )
+                    )
+                    evidence.extend(_coverage_gap_evidence("abuseipdb_finding", reason))
+                    if overall_error is None:
+                        overall_error = "analysis_failed"
+                else:
+                    ab_data = ab_resp.json()
+                    # Defensive cast, matching _lookup_urlhaus's existing precedent.
+                    score = int(ab_data.get("data", {}).get("abuseConfidenceScore") or 0)
+                    reports = int(ab_data.get("data", {}).get("totalReports") or 0)
+                    finding = f"AbuseIPDB: {ip} abuse confidence {score}% from {reports} reports"
+                    findings.append(finding)
+                    weight, direction = _abuseipdb_weight_and_direction(score)
+                    evidence.append(EvidenceItem(name="abuseipdb_finding", finding=finding, weight=weight, direction=direction))
+                    if self._cache is not None:
+                        self._cache.put(
+                            "ip", ip, "abuseipdb", CachedLookup(weight=weight, direction=direction, finding=finding)
+                        )
+            except httpx.TimeoutException:
+                raise
+            except ApiCallBudgetExceededError:
+                raise  # Story 4.2: must not be swallowed by the generic handler below
+            except Exception:
+                reason = "AbuseIPDB lookup failed — abuse report data unavailable"
                 blind_spots.append(
                     BlindSpot(
                         source="abuseipdb",
                         reason=reason,
-                        next_step="Check the AbuseIPDB API key and indicator format",
+                        next_step=None,
                     )
                 )
                 evidence.extend(_coverage_gap_evidence("abuseipdb_finding", reason))
                 if overall_error is None:
                     overall_error = "analysis_failed"
-            else:
-                ab_data = ab_resp.json()
-                # Defensive cast, matching _lookup_urlhaus's existing precedent.
-                score = int(ab_data.get("data", {}).get("abuseConfidenceScore") or 0)
-                reports = int(ab_data.get("data", {}).get("totalReports") or 0)
-                finding = f"AbuseIPDB: {ip} abuse confidence {score}% from {reports} reports"
-                findings.append(finding)
-                weight, direction = _abuseipdb_weight_and_direction(score)
-                evidence.append(EvidenceItem(name="abuseipdb_finding", finding=finding, weight=weight, direction=direction))
-        except httpx.TimeoutException:
-            raise
-        except Exception:
-            reason = "AbuseIPDB lookup failed — abuse report data unavailable"
-            blind_spots.append(
-                BlindSpot(
-                    source="abuseipdb",
-                    reason=reason,
-                    next_step=None,
-                )
-            )
-            evidence.extend(_coverage_gap_evidence("abuseipdb_finding", reason))
-            if overall_error is None:
-                overall_error = "analysis_failed"
 
         # URLhaus lookup
-        uh_error = self._lookup_urlhaus(ip, findings, blind_spots, evidence)
+        uh_error = self._lookup_urlhaus(ip, "ip", findings, blind_spots, evidence)
         if uh_error is not None and overall_error is None:
             overall_error = uh_error
 
@@ -435,66 +538,83 @@ class CipherAgent:
         overall_error: str | None = None
 
         # VirusTotal domain lookup
-        try:
-            vt_resp = self._client.get(
-                _VT_DOMAIN_URL.format(domain=domain),
-                headers={"x-apikey": self._config.virustotal_api_key},
+        vt_cached = self._cache.get("domain", domain, "virustotal") if self._cache is not None else None
+        if vt_cached is not None:
+            evidence.append(
+                EvidenceItem(
+                    name="virustotal_finding", finding=vt_cached["finding"],
+                    weight=vt_cached["weight"], direction=vt_cached["direction"],
+                )
             )
-            if vt_resp.status_code == 429:
-                reason = "VirusTotal rate limit reached — reputation data unavailable"
-                blind_spots.append(
-                    BlindSpot(
-                        source="virustotal",
-                        reason=reason,
-                        next_step="Wait 60 seconds or upgrade to VirusTotal Premium",
+        else:
+            try:
+                if self._budget is not None:
+                    self._budget.check_and_record("virustotal")
+                vt_resp = self._client.get(
+                    _VT_DOMAIN_URL.format(domain=domain),
+                    headers={"x-apikey": self._config.virustotal_api_key},
+                )
+                if vt_resp.status_code == 429:
+                    reason = "VirusTotal rate limit reached — reputation data unavailable"
+                    blind_spots.append(
+                        BlindSpot(
+                            source="virustotal",
+                            reason=reason,
+                            next_step="Wait 60 seconds or upgrade to VirusTotal Premium",
+                        )
                     )
-                )
-                evidence.append(
-                    EvidenceItem(name="virustotal_finding", finding=reason, weight=_UNINFORMATIVE_WEIGHT, direction="neutral")
-                )
-                overall_error = "rate_limited"
-            elif vt_resp.status_code != 200:
-                reason = f"VirusTotal returned unexpected status {vt_resp.status_code} — reputation data unavailable"
+                    evidence.append(
+                        EvidenceItem(name="virustotal_finding", finding=reason, weight=_UNINFORMATIVE_WEIGHT, direction="neutral")
+                    )
+                    overall_error = "rate_limited"
+                elif vt_resp.status_code != 200:
+                    reason = f"VirusTotal returned unexpected status {vt_resp.status_code} — reputation data unavailable"
+                    blind_spots.append(
+                        BlindSpot(
+                            source="virustotal",
+                            reason=reason,
+                            next_step="Check the VirusTotal API key and indicator format",
+                        )
+                    )
+                    evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
+                    if overall_error is None:
+                        overall_error = "analysis_failed"
+                else:
+                    vt_data = vt_resp.json()
+                    stats = (
+                        vt_data.get("data", {})
+                        .get("attributes", {})
+                        .get("last_analysis_stats", {})
+                    )
+                    malicious = int(stats.get("malicious") or 0)
+                    suspicious = int(stats.get("suspicious") or 0)
+                    finding = (
+                        f"VirusTotal: {domain} flagged by {malicious} engines as malicious, "
+                        f"{suspicious} as suspicious"
+                    )
+                    findings.append(finding)
+                    weight, direction = _vt_weight_and_direction(malicious, suspicious)
+                    evidence.append(EvidenceItem(name="virustotal_finding", finding=finding, weight=weight, direction=direction))
+                    if self._cache is not None:
+                        self._cache.put(
+                            "domain", domain, "virustotal", CachedLookup(weight=weight, direction=direction, finding=finding)
+                        )
+            except httpx.TimeoutException:
+                raise
+            except ApiCallBudgetExceededError:
+                raise  # Story 4.2: must not be swallowed by the generic handler below
+            except Exception:
+                reason = "VirusTotal lookup failed — reputation data unavailable"
                 blind_spots.append(
                     BlindSpot(
                         source="virustotal",
                         reason=reason,
-                        next_step="Check the VirusTotal API key and indicator format",
+                        next_step=None,
                     )
                 )
                 evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
                 if overall_error is None:
                     overall_error = "analysis_failed"
-            else:
-                vt_data = vt_resp.json()
-                stats = (
-                    vt_data.get("data", {})
-                    .get("attributes", {})
-                    .get("last_analysis_stats", {})
-                )
-                malicious = int(stats.get("malicious") or 0)
-                suspicious = int(stats.get("suspicious") or 0)
-                finding = (
-                    f"VirusTotal: {domain} flagged by {malicious} engines as malicious, "
-                    f"{suspicious} as suspicious"
-                )
-                findings.append(finding)
-                weight, direction = _vt_weight_and_direction(malicious, suspicious)
-                evidence.append(EvidenceItem(name="virustotal_finding", finding=finding, weight=weight, direction=direction))
-        except httpx.TimeoutException:
-            raise
-        except Exception:
-            reason = "VirusTotal lookup failed — reputation data unavailable"
-            blind_spots.append(
-                BlindSpot(
-                    source="virustotal",
-                    reason=reason,
-                    next_step=None,
-                )
-            )
-            evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
-            if overall_error is None:
-                overall_error = "analysis_failed"
 
         # AbuseIPDB is IP-only — domain lookups are a blind spot
         abuseipdb_gap_reason = (
@@ -510,7 +630,7 @@ class CipherAgent:
         evidence.extend(_coverage_gap_evidence("abuseipdb_finding", abuseipdb_gap_reason))
 
         # URLhaus lookup (supports both IPs and domains)
-        uh_error = self._lookup_urlhaus(domain, findings, blind_spots, evidence)
+        uh_error = self._lookup_urlhaus(domain, "domain", findings, blind_spots, evidence)
         if uh_error is not None and overall_error is None:
             overall_error = uh_error
 
