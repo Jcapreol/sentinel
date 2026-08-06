@@ -703,6 +703,49 @@ def test_main_second_concurrent_invocation_fails_before_load_corpus_or_load_cali
     cipher.analyze.assert_not_called()
 
 
+def test_main_prints_cost_warning_when_sample_size_exceeds_default(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, capsys, tmp_path
+) -> None:
+    """valid_corpus's held_out pools are only 35 files/class, so the default
+    (200) always fully covers them regardless of --sample-size-per-class --
+    _DEFAULT_SAMPLE_SIZE_PER_CLASS is patched down here purely to prove
+    main() actually wires the warning through with the real args, matching
+    print_sample_size_cost_warning's own already-covered capping logic
+    (see test_script_guard.py) rather than re-testing that logic here."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
+    mocker.patch("run_evaluation_harness._DEFAULT_SAMPLE_SIZE_PER_CLASS", 5)
+    mocker.patch(
+        "sys.argv",
+        ["run_evaluation_harness.py", "--sample-size-per-class", "30"],
+    )
+
+    with pytest.raises(SystemExit):
+        script.main()
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "30" in captured.err
+
+
+def test_main_silent_when_sample_size_is_default(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, capsys, tmp_path
+) -> None:
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
+    mocker.patch(
+        "sys.argv",
+        ["run_evaluation_harness.py", "--sample-size-per-class", "3"],
+    )
+
+    with pytest.raises(SystemExit):
+        script.main()
+
+    assert "WARNING" not in capsys.readouterr().err
+
+
 def test_main_budget_exceeded_exits_three_with_no_report_printed(  # type: ignore[no-untyped-def]
     valid_corpus, mocker, capsys, tmp_path
 ) -> None:
