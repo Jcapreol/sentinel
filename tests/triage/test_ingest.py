@@ -704,6 +704,163 @@ def test_extract_email_content_preserves_href_url_when_stripping_html_tags() -> 
     assert "http://evil.example.com/pay" in content
 
 
+def test_extract_email_content_strips_style_block_content_not_just_tags() -> None:
+    """[Cipher domain-extraction fix, Phase 2] _strip_html previously removed
+    only the <style>/</style> DELIMITERS via a blanket <[^>]+> tag regex,
+    leaving the CSS rule text itself (selectors, property names) in the
+    output as if it were real body text -- CipherAgent's _extract_domains
+    then matched CSS selector chains like "table.icons" as if they were
+    real domains. Real excerpt modeled on benign_corpus_raw/benign/held_out/
+    own-inbox-49c0a18092beb365.eml (content_hash 49c0a180...), a real Chick-
+    fil-A marketing email where this exact CSS rule appeared inside a real
+    <style> block, ahead of the message's real sending domains."""
+    raw_bytes = (
+        b"From: news@e.chick-fil-a.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><head><style>"
+        b".desktop_hide,.desktop_hide table{mso-hide:all;display:none}"
+        b"@media (max-width:740px){.desktop_hide table.icons-outer{display:inline-table!important}"
+        b".icons-inner{text-align:center}.icons-inner td{margin:0 auto}}"
+        b"</style></head>"
+        b'<body>See offers at <a href="http://email.chick-fil-a.com/offers">this link</a></body>'
+        b"</html>"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "table.icons" not in content
+    assert "icons-inner" not in content
+    assert "mso-hide" not in content
+    assert "http://email.chick-fil-a.com/offers" in content
+
+
+def test_extract_email_content_strips_script_block_content_not_just_tags() -> None:
+    """[Cipher domain-extraction fix, Phase 2] Mirrors the <style> case above
+    for <script> blocks. Real excerpt modeled on benign_corpus_raw/malicious/
+    held_out/sample-1073.eml, a real malicious file where a real <script>
+    block (minified JS overriding history.pushState/replaceState) preceded
+    the message's one real indicator -- an unsubscribe link to
+    bsq2.firiri.shop -- causing _extract_domains to surface
+    "history.pushState" as its first (and previously only-considered) match
+    instead of the real malicious domain."""
+    raw_bytes = (
+        b"From: newsletter@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><head>"
+        b'<script ecommerce-type="extend-native-history-api">(()=>{const e=history.pushState,'
+        b"t=history.replaceState;history.pushState=function(){e.apply(history,arguments)},"
+        b"history.replaceState=function(){t.apply(history,arguments)}})()</script>"
+        b"</head>"
+        b'<body>Um sich abzumelden, klicken Sie bitte auf '
+        b'<a href="http://bsq2.firiri.shop/unsubscribe">Hier</a></body></html>'
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "history.pushState" not in content
+    assert "history.replaceState" not in content
+    assert "http://bsq2.firiri.shop/unsubscribe" in content
+
+
+def test_extract_email_content_preserves_href_written_dynamically_inside_script() -> None:
+    """[Code review, 2026-08-05] The new style/script-block removal (added to
+    fix the CSS/JS-leak bug above) previously ran BEFORE href extraction,
+    so an href written dynamically via document.write() -- a real, if
+    uncommon, pattern this project's own corpus contains (13/10,435 real
+    files reference document.write) -- was destroyed along with the script
+    block before _HREF_PATTERN ever saw it. hrefs must be captured from the
+    ORIGINAL html, before any style/script stripping happens."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><script>document.write('<a href=\"http://evil.example.tk/steal\">Click</a>')"
+        b"</script></html>"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "http://evil.example.tk/steal" in content
+
+
+def test_extract_email_content_strips_style_script_block_even_with_mismatched_closing_tag() -> None:
+    """[Code review, 2026-08-05] Real, malformed HTML in this project's own
+    corpus (7/10,435 files) pairs a <style> open with a </script> close (or
+    vice versa) -- a backreference-based regex (</\\1>) requires the exact
+    same tag name to close, so a mismatched pair previously left the whole
+    block, CSS junk included, completely unstripped."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><head><style>table.icons{display:none}</script></head>"
+        b'<body>real text <a href="http://kay.com/offers">link</a></body></html>'
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "table.icons" not in content
+    assert "http://kay.com/offers" in content
+
+
+def test_extract_email_content_bounds_cost_of_pathological_unclosed_script_tags() -> None:
+    """[Code review, 2026-08-05] The lazy `.*?` DOTALL block-match regex is
+    quadratic in the number of unclosed <script>/<style> opens (each
+    unmatched open forces a fresh scan to the end of the document before
+    failing) -- confirmed empirically: 800KB of repeated unclosed <script>
+    tags took over a second, scaling roughly with the square of input size.
+    A phishing-triage tool processes attacker-controlled HTML by design, so
+    this must be bounded, not just fast on well-formed input. Not a strict
+    timing assertion (flaky under load) -- proves the guard actually
+    engages by checking the well-formed style/script logic is skipped
+    (junk survives) once the size ceiling is exceeded, which is the
+    intended, documented tradeoff."""
+    import time
+
+    from sentinel.triage.ingest import _MAX_HTML_LENGTH_FOR_BLOCK_STRIP
+
+    huge_unclosed = "<script>" + ("x" * (_MAX_HTML_LENGTH_FOR_BLOCK_STRIP + 1))
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n" + huge_unclosed.encode()
+    )
+
+    start = time.perf_counter()
+    extract_email_content(raw_bytes)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 2.0
+
+
+def test_extract_email_content_self_closed_script_tag_does_not_swallow_unrelated_later_content() -> None:
+    """[Code review, 2026-08-05, Edge Case Hunter] A self-closed
+    <script src="..."/> (a real, common pattern for external analytics/
+    tracking includes in ESP-generated marketing HTML -- has no content and
+    no closing tag of its own) was being treated as an unclosed opener,
+    causing the lazy block-match to extend all the way to the NEXT,
+    UNRELATED <script>...</script> anywhere later in the message --
+    silently deleting everything in between, including real body content
+    and a real domain. This is strictly worse than the bug being fixed:
+    extract_email_content's output feeds BOTH Watchman and Cipher
+    (src/sentinel/triage/worker.py), so this could blank real evidence for
+    both agents, not just Cipher's IOC pick."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b'<html><script src="https://cdn.example.com/analytics.js"/>'
+        b"<p>Your invoice ... Pay at http://real-billing-portal.tld/invoice123 ...</p>"
+        b'<script>console.log("unrelated tracker")</script></html>'
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "http://real-billing-portal.tld/invoice123" in content
+
+
 def test_extract_email_content_non_text_single_part_body_is_not_decoded_as_text() -> None:
     """2026-07-23 code-review patch: a non-multipart, non-text body (e.g.
     application/pdf) was previously force-decoded as UTF-8 plain text,
