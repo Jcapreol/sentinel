@@ -75,7 +75,7 @@ def test_cipher_no_ioc_returns_structured_null(fake_config: Config) -> None:
 
 
 def test_cipher_rate_limit_returns_blind_spot(
-    mocker: MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -98,6 +98,11 @@ def test_cipher_rate_limit_returns_blind_spot(
     assert vt_item["weight"] == 0.10
     assert vt_item["direction"] == "neutral"
     assert ab_item["weight"] == 0.10
+    # [Story 4.1] A VT degradation must be visible in stderr -- "no errors in
+    # the log" was silently false comfort before this (see deferred-work.md).
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "VirusTotal" in captured.err
     assert ab_item["direction"] == "neutral"
 
 
@@ -338,7 +343,7 @@ def test_cipher_domain_extracted_from_url(mocker: MockerFixture, fake_config: Co
 
 
 def test_cipher_domain_rate_limit_returns_blind_spot(
-    mocker: MockerFixture, fake_config: Config
+    mocker: MockerFixture, fake_config: Config, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -360,10 +365,13 @@ def test_cipher_domain_rate_limit_returns_blind_spot(
     vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
     assert vt_item["weight"] == 0.10
     assert vt_item["direction"] == "neutral"
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "VirusTotal" in captured.err
 
 
 def test_cipher_domain_vt_failure_returns_blind_spot(
-    mocker: MockerFixture, fake_config: Config
+    mocker: MockerFixture, fake_config: Config, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
@@ -380,6 +388,9 @@ def test_cipher_domain_vt_failure_returns_blind_spot(
     assert vt_item["direction"] == "neutral"
     vt_blind_spot = next(bs for bs in result["blind_spots"] if bs["source"] == "virustotal")
     assert vt_item["finding"] == vt_blind_spot["reason"]
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "VirusTotal" in captured.err
 
 
 def test_cipher_ip_takes_precedence_over_domain(
@@ -581,7 +592,7 @@ def test_cipher_never_asserts_benign_direction(
 
 
 def test_cipher_vt_non_200_status_is_coverage_gap_not_clean_scan(
-    mocker: MockerFixture, fake_config: Config, sample_alert: str
+    mocker: MockerFixture, fake_config: Config, sample_alert: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A VirusTotal 404 ('never scanned') or 401/403 (auth failure) previously
     fell through to `.get(..., 0)` defaults, producing a false '0 malicious
@@ -610,6 +621,9 @@ def test_cipher_vt_non_200_status_is_coverage_gap_not_clean_scan(
     vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
     assert vt_item["weight"] == 0.0
     assert vt_item["direction"] == "neutral"
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "VirusTotal" in captured.err
 
 
 def test_cipher_abuseipdb_non_200_status_is_coverage_gap_not_clean_scan(
