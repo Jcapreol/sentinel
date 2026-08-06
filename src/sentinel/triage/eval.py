@@ -257,6 +257,28 @@ def _check_split_integrity(corpus: Corpus, reasons: list[str]) -> None:
                 "content within the same split, which would corrupt a calibration fit"
             )
 
+    # [Story 4.1] Within-class cross-split overlap: identical content present
+    # in a SINGLE class's own tuning AND held_out split. The global
+    # tuning-vs-held_out check above already catches this structurally (it
+    # unions both classes before comparing), but its message deliberately
+    # can't name which class is involved ("possibly across different
+    # classes") -- a different diagnostic gap from the same-split cross-class
+    # check above (which never compares a class against itself). Found via a
+    # real corpus incident: a hash-convention mismatch between an older and a
+    # newer harvest_own_inbox.py run left real messages assigned to different
+    # splits within the SAME class, only traceable via a manual diagnostic
+    # script. This check names the class immediately instead.
+    for class_name in _CLASSES:
+        class_tuning_hashes = {f["content_hash"] for f in corpus[f"{class_name}_tuning"]}  # type: ignore[literal-required]
+        class_held_out_hashes = {f["content_hash"] for f in corpus[f"{class_name}_held_out"]}  # type: ignore[literal-required]
+        within_class_overlap = class_tuning_hashes & class_held_out_hashes
+        if within_class_overlap:
+            reasons.append(
+                f"{len(within_class_overlap)} {class_name} file(s) have identical content in "
+                f"both {class_name}_tuning and {class_name}_held_out -- zero overlap required "
+                "within a single class's own tuning/held_out split"
+            )
+
 
 def _check_provenance(root: Path, reasons: list[str]) -> None:
     for class_name in _CLASSES:
