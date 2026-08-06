@@ -3,6 +3,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from sentinel.cipher import (
+    _UNINFORMATIVE_WEIGHT,
     CipherAgent,
     _extract_domains,
     _extract_public_ips,
@@ -114,25 +115,126 @@ def test_cipher_rate_limit_returns_blind_spot(
 def test_cipher_timeout_returns_blind_spot(
     mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:
+    """[Code review, 2026-08-05] Previously, a timeout on ANY sub-lookup
+    re-raised past _analyze_ip entirely, discarding whatever the OTHER
+    sub-lookups had already found and replacing the whole result with a
+    single aggregate coverage-gap item -- this test's own assertions used
+    to lock in that exact (buggy) shape. Now every sub-lookup degrades
+    independently, matching every other exception type's existing
+    handling, so a timeout on every .get() call still produces one
+    coverage-gap EvidenceItem per sub-signal (VT, AbuseIPDB, URLhaus),
+    not one aggregate "cipher_analysis" item -- see
+    test_cipher_timeout_on_one_sublookup_preserves_already_gathered_evidence
+    for the regression this was actually about: findings gathered BEFORE
+    a later timeout must survive."""
     mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
     mock_client = mock_httpx.return_value
     mock_client.get.side_effect = httpx.ReadTimeout("timed out")
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {"query_status": "no_results"}
 
     agent = CipherAgent(config=fake_config)
     result = agent.analyze(sample_alert)
 
     assert result["error"] == "timeout"
     assert result["findings"] == []
+    # [Code review, 2026-08-05] Exact counts, not just existence -- a bug
+    # producing a spurious extra blind_spot/evidence item (e.g. the
+    # believed-unreachable outer analyze() timeout handler firing
+    # unexpectedly, or a double-handled exception) must fail this test.
+    # 2 blind_spots (VT + AbuseIPDB timed out); URLhaus's own .post() call
+    # succeeded (no_results), which adds an evidence item but no blind_spot.
+    assert len(result["blind_spots"]) == 2
+    assert len(result["evidence"]) == 3
+    vt_blind_spot = next(bs for bs in result["blind_spots"] if bs["source"] == "virustotal")
+    ab_blind_spot = next(bs for bs in result["blind_spots"] if bs["source"] == "abuseipdb")
+    assert "timed out" in vt_blind_spot["reason"].lower()
+    assert "timed out" in ab_blind_spot["reason"].lower()
+    vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
+    ab_item = next(i for i in result["evidence"] if i["name"] == "abuseipdb_finding")
+    uh_item = next(i for i in result["evidence"] if i["name"] == "urlhaus_finding")
+    assert vt_item == {"name": "virustotal_finding", "finding": vt_blind_spot["reason"], "weight": 0.0, "direction": "neutral"}
+    assert ab_item == {"name": "abuseipdb_finding", "finding": ab_blind_spot["reason"], "weight": 0.0, "direction": "neutral"}
+    # URLhaus's own .post() call was mocked to succeed (no_results) -- only
+    # the two .get()-based lookups (VT/AbuseIPDB) were made to time out.
+    assert uh_item["direction"] == "neutral"
+    assert uh_item["weight"] == _UNINFORMATIVE_WEIGHT
+
+
+def test_cipher_timeout_on_one_sublookup_preserves_already_gathered_evidence(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """[Code review, 2026-08-05] The core regression: VT succeeds and finds
+    a real malicious signal (20 engines), THEN AbuseIPDB times out. Before
+    this fix, AbuseIPDB's timeout re-raised past _analyze_ip entirely,
+    discarding VT's already-gathered finding/evidence and replacing the
+    whole AgentResult with a single empty coverage-gap item -- a confirmed
+    malicious indicator would score as "nothing found". Now AbuseIPDB's
+    timeout degrades to its own coverage-gap item, same as every other
+    exception type, and VT's real evidence survives."""
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 20, "suspicious": 0}}}
+    }
+    mock_client.get.side_effect = [vt_response, httpx.ReadTimeout("timed out")]
+    mock_client.post.return_value.status_code = 200
+    mock_client.post.return_value.json.return_value = {"query_status": "no_results"}
+
+    agent = CipherAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["error"] == "timeout"
+    assert len(result["findings"]) == 1
+    assert "20 engines" in result["findings"][0]
     assert len(result["blind_spots"]) == 1
-    assert result["blind_spots"][0]["source"] == "cipher"
-    assert result["evidence"] == [
-        {
-            "name": "cipher_analysis",
-            "finding": result["blind_spots"][0]["reason"],
-            "weight": 0.0,
-            "direction": "neutral",
-        }
-    ]
+    assert len(result["evidence"]) == 3  # VT (real) + AbuseIPDB (gap) + URLhaus (no_results)
+    vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
+    assert vt_item["weight"] == 0.70
+    assert vt_item["direction"] == "malicious"
+    ab_blind_spot = next(bs for bs in result["blind_spots"] if bs["source"] == "abuseipdb")
+    assert "timed out" in ab_blind_spot["reason"].lower()
+    ab_item = next(i for i in result["evidence"] if i["name"] == "abuseipdb_finding")
+    assert ab_item == {"name": "abuseipdb_finding", "finding": ab_blind_spot["reason"], "weight": 0.0, "direction": "neutral"}
+
+
+def test_cipher_urlhaus_timeout_preserves_vt_and_abuseipdb_evidence(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """Mirrors the VT-then-AbuseIPDB-timeout test above for the third
+    sub-lookup site (_lookup_urlhaus's own timeout handling, shared by
+    both _analyze_ip and _analyze_domain) -- VT and AbuseIPDB both
+    succeed, URLhaus times out; their real findings must survive."""
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 5, "suspicious": 0}}}
+    }
+    ab_response = mocker.MagicMock()
+    ab_response.status_code = 200
+    ab_response.json.return_value = {"data": {"abuseConfidenceScore": 80, "totalReports": 3}}
+    mock_client.get.side_effect = [vt_response, ab_response]
+    mock_client.post.side_effect = httpx.ReadTimeout("timed out")
+
+    agent = CipherAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert result["error"] == "timeout"
+    assert len(result["findings"]) == 2
+    assert len(result["blind_spots"]) == 1
+    assert len(result["evidence"]) == 3
+    vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
+    ab_item = next(i for i in result["evidence"] if i["name"] == "abuseipdb_finding")
+    assert vt_item["direction"] == "malicious"
+    assert ab_item["direction"] == "malicious"
+    uh_blind_spot = next(bs for bs in result["blind_spots"] if bs["source"] == "urlhaus")
+    assert "timed out" in uh_blind_spot["reason"].lower()
+    uh_item = next(i for i in result["evidence"] if i["name"] == "urlhaus_finding")
+    assert uh_item == {"name": "urlhaus_finding", "finding": uh_blind_spot["reason"], "weight": 0.0, "direction": "neutral"}
 
 
 def test_cipher_generic_exception_returns_blind_spot(
@@ -373,6 +475,39 @@ def test_cipher_domain_rate_limit_returns_blind_spot(
     captured = capsys.readouterr()
     assert "WARNING" in captured.err
     assert "VirusTotal" in captured.err
+
+
+def test_cipher_domain_timeout_on_urlhaus_preserves_vt_evidence(
+    mocker: MockerFixture, fake_config: Config
+) -> None:
+    """[Code review, 2026-08-05] Domain-path mirror of the ip-path
+    preservation tests above -- confirms the same fix was applied to
+    _analyze_domain's own VT timeout site (a separate code location from
+    _analyze_ip's), not just the ip path."""
+    mock_httpx = mocker.patch("sentinel.cipher.httpx.Client")
+    mock_client = mock_httpx.return_value
+    vt_response = mocker.MagicMock()
+    vt_response.status_code = 200
+    vt_response.json.return_value = {
+        "data": {"attributes": {"last_analysis_stats": {"malicious": 6, "suspicious": 0}}}
+    }
+    mock_client.get.return_value = vt_response
+    mock_client.post.side_effect = httpx.ReadTimeout("timed out")
+
+    agent = CipherAgent(config=fake_config)
+    result = agent.analyze("DNS query to evil.example.net observed from 10.0.0.5")
+
+    assert result["error"] == "timeout"
+    assert len(result["findings"]) == 1
+    # 2 blind_spots: AbuseIPDB's unconditional "not applicable to domains"
+    # gap, plus URLhaus's timeout. 3 evidence items: VT (real) + AbuseIPDB
+    # (not-applicable gap) + URLhaus (timeout gap).
+    assert len(result["blind_spots"]) == 2
+    assert len(result["evidence"]) == 3
+    vt_item = next(i for i in result["evidence"] if i["name"] == "virustotal_finding")
+    assert vt_item["direction"] == "malicious"
+    uh_blind_spot = next(bs for bs in result["blind_spots"] if bs["source"] == "urlhaus")
+    assert "timed out" in uh_blind_spot["reason"].lower()
 
 
 def test_cipher_domain_vt_failure_returns_blind_spot(
