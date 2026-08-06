@@ -340,15 +340,17 @@ def _decode_part(part: Message) -> str:
         return payload.decode("utf-8", errors="replace")
 
 
-def _decode_subject(raw_subject: str) -> str:
-    """Decodes RFC 2047 MIME-encoded-word Subject headers (e.g.
-    '=?UTF-8?B?...?='). email.message_from_bytes's default Compat32 policy
-    returns these verbatim otherwise, hiding urgency/homoglyph phishing
-    language deliberately placed in the subject line."""
+def _decode_header_pieces(header_input: object) -> str | None:
+    """Runs email.header.decode_header on `header_input` (a str OR an
+    email.header.Header object -- decode_header accepts both, and treats
+    them differently, see _decode_subject's docstring) and joins the
+    resulting pieces into a single str. Returns None if decode_header
+    itself raises (e.g. HeaderParseError on malformed base64 in an
+    encoded-word) rather than letting the exception propagate."""
     try:
-        pieces = decode_header(raw_subject)
+        pieces = decode_header(header_input)  # type: ignore[arg-type]
     except Exception:
-        return raw_subject
+        return None
     decoded: list[str] = []
     for text, charset in pieces:
         if isinstance(text, bytes):
@@ -359,6 +361,57 @@ def _decode_subject(raw_subject: str) -> str:
         else:
             decoded.append(text)
     return "".join(decoded)
+
+
+def _decode_subject(raw_subject: str) -> str:
+    """Decodes RFC 2047 MIME-encoded-word Subject headers (e.g.
+    '=?UTF-8?B?...?='). email.message_from_bytes's default Compat32 policy
+    returns these verbatim otherwise, hiding urgency/homoglyph phishing
+    language deliberately placed in the subject line.
+
+    [Code review, 2026-08-05] Two-pass decode -- despite this function's own
+    str-typed signature, Message.get("Subject") can actually return an
+    email.header.Header object at runtime for certain real, oddly-folded
+    encoded headers (confirmed against real corpus files), and
+    decode_header() treats a Header object differently from a plain str:
+
+    - For a raw, non-RFC-2047 8-bit header (real UTF-8 bytes sitting
+      directly in the header, e.g. a homoglyph-evasion Subject with a raw
+      Cyrillic byte) -- decode_header on the Header OBJECT correctly
+      recovers the exact original bytes via its internal chunk
+      representation (losslessly, via surrogateescape) and decodes them
+      correctly. Calling str() on the Header FIRST destroys this: Header's
+      own __str__() decodes those bytes with errors="replace" internally,
+      permanently replacing them with U+FFFD BEFORE decode_header ever
+      gets a chance to see the real bytes. An earlier version of this fix
+      did exactly that (str() the input unconditionally) and was a NET
+      REGRESSION confirmed against the real corpus: it corrupted 1,903
+      real Subject lines (including homoglyph phishing text) to fix only
+      11.
+    - For a genuinely un-recognized encoded-word (the literal
+      "=?UTF-8?B?...?=" marker stored as opaque, un-parsed text inside the
+      Header's own internal chunk -- some real, oddly-folded/padded headers
+      trip up the initial header-folding parser this way) -- decode_header
+      on the Header object does NOT re-interpret that embedded marker; the
+      literal text survives undecoded. A SECOND decode_header pass, now on
+      the resulting plain str, does recognize and decode it correctly (str
+      inputs are parsed via a different, regex-based code path).
+
+    So: pass 1 runs on the ORIGINAL input (str or Header, never str()-
+    coerced first, to avoid destroying real bytes). Only if pass 1's result
+    still contains an undecoded "=?...?=" marker does pass 2 re-run
+    decode_header on that (now plain-str) result -- safe by construction,
+    since pass 2 only ever sees text pass 1 already decoded from real
+    bytes. If pass 2 also fails (e.g. malformed base64 inside the
+    marker), pass 1's own result is kept rather than losing it."""
+    first_pass = _decode_header_pieces(raw_subject)
+    if first_pass is None:
+        return str(raw_subject)
+    if "=?" in first_pass:
+        second_pass = _decode_header_pieces(first_pass)
+        if second_pass is not None:
+            return second_pass
+    return first_pass
 
 
 def _strip_html(html: str) -> str:
