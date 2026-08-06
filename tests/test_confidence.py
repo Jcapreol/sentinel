@@ -210,3 +210,58 @@ def test_abuse_below_threshold_treated_as_clean() -> None:
         _watchman("Probable"),
         _cipher([_ABUSE_BELOW_THRESHOLD]),
     ) == ConfidenceTier.BENIGN
+
+
+# ---------------------------------------------------------------------------
+# Partial errors — a real finding gathered before another sub-lookup failed
+# must not be discarded, but a clean-looking partial result must not be
+# upgraded to a full exoneration either (2026-08-06, confidence.py fix).
+# ---------------------------------------------------------------------------
+
+def test_malicious_cipher_finding_surfaces_despite_partial_error() -> None:
+    # VT already found a real malicious signal before AbuseIPDB timed out.
+    # Previously: `error` being set alone forced "no_data", discarding the
+    # real VT finding entirely. A confirmed malicious IOC must never score
+    # as "nothing found" just because a LATER, independent lookup failed.
+    assert calculate_tier(
+        _watchman(None, error="timeout"),
+        _cipher([_VT_MALICIOUS], error="timeout"),
+    ) == ConfidenceTier.PROBABLE
+
+
+def test_malicious_cipher_finding_with_error_still_reaches_confirmed_with_corroboration() -> None:
+    # Same partial-error malicious finding, but now Watchman independently
+    # corroborates — must still reach CONFIRMED, same as a fully-completed
+    # (error-free) malicious finding would (test_malicious_ioc_watchman_
+    # confirmed_returns_confirmed above). A degraded-but-real signal must
+    # not be capped at a lower tier just because part of the check errored.
+    assert calculate_tier(
+        _watchman("Confirmed"),
+        _cipher([_VT_MALICIOUS], error="timeout"),
+    ) == ConfidenceTier.CONFIRMED
+
+
+def test_clean_looking_cipher_finding_with_error_is_not_presented_as_full_exoneration() -> None:
+    # VT found 0 malicious engines, but AbuseIPDB (a different, independent
+    # check) never completed. This must NOT be treated the same as a fully-
+    # completed clean scan (BENIGN) -- an incomplete check is not proof of
+    # safety, the same "absence is not exonerating" principle already
+    # documented elsewhere in this codebase (cipher.py/headers.py). Must
+    # land on INVESTIGATING (no_data + Watchman low/medium), not BENIGN.
+    assert calculate_tier(
+        _watchman("Investigating"),
+        _cipher([_VT_CLEAN], error="timeout"),
+    ) == ConfidenceTier.INVESTIGATING
+
+
+def test_abuseipdb_malicious_finding_surfaces_despite_partial_error() -> None:
+    # [Code review, 2026-08-06] Mirrors test_malicious_cipher_finding_
+    # surfaces_despite_partial_error above, but for the AbuseIPDB-score
+    # regex path specifically rather than the VT-engines path -- the shared
+    # `for finding in result["findings"]` loop checks both regexes before
+    # falling through, so both must independently survive an error alongside
+    # them, not just the VT one.
+    assert calculate_tier(
+        _watchman(None, error="timeout"),
+        _cipher([_ABUSE_MALICIOUS], error="timeout"),
+    ) == ConfidenceTier.PROBABLE

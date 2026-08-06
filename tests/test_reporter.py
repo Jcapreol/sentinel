@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -8,9 +9,10 @@ import pytest
 from pytest_mock import MockerFixture
 
 from conftest import make_agent_result
+from sentinel.confidence import TIER_MAP, calculate_tier
 from sentinel.main import main
 from sentinel.reporter import generate_report, write_report_markdown
-from sentinel.verdict import VerdictSchema
+from sentinel.verdict import VerdictSchema, assemble_verdict
 
 if TYPE_CHECKING:
     from sentinel.config import Config
@@ -91,6 +93,39 @@ def test_report_contains_all_six_sections() -> None:
     assert len(report["evidence_chain"]) == 2
     assert isinstance(report["recommended_next_steps"], list)
     assert len(report["recommended_next_steps"]) > 0
+
+
+def test_evidence_chain_cipher_status_does_not_contradict_escalated_verdict() -> None:
+    """[Code review, 2026-08-06] Before this fix: a cipher result with a
+    real malicious finding surviving a partial error (e.g. VT succeeded,
+    AbuseIPDB timed out) would drive the verdict tier to PROBABLE/CONFIRMED
+    (via confidence.py's own asymmetric fix) while evidence_chain's cipher
+    status still literally said "error" right next to that escalated
+    verdict -- a user reading the incident report could reasonably wonder
+    why an "error" produced a confident malicious verdict. Status must now
+    read "partial", consistent with the escalated tier it sits beside --
+    this is the full real pipeline (calculate_tier -> assemble_verdict ->
+    generate_report), not an isolated unit check, to prove the two never
+    disagree end to end."""
+    watchman_result = make_agent_result(source="watchman")
+    cipher_result = make_agent_result(
+        source="cipher",
+        findings=["VirusTotal: 1.2.3.4 flagged by 20 engines as malicious, 0 as suspicious"],
+        error="timeout",
+    )
+    tier_enum = calculate_tier(watchman_result, cipher_result)
+    tier = TIER_MAP[tier_enum]
+    verdict = assemble_verdict(watchman_result, cipher_result, tier, True, time.time())
+
+    report = generate_report("suspicious IP 1.2.3.4", watchman_result, cipher_result, verdict)
+
+    # watchman_result carries make_agent_result's default raw_confidence
+    # ("Probable" -> medium severity), so cipher malicious + watchman medium
+    # -> Confirmed (calculate_tier's own documented mapping) -- an escalated,
+    # not merely "some data", tier.
+    assert verdict["verdict"] == "Confirmed"
+    cipher_entry = next(e for e in report["evidence_chain"] if e["source"] == "cipher")
+    assert cipher_entry["status"] == "partial"
 
 
 def test_mitre_tags_extracted_from_watchman_output() -> None:
