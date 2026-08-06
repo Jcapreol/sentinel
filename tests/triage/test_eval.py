@@ -450,6 +450,37 @@ def test_same_split_cross_class_overlap_is_rejected(tmp_path: Path) -> None:
     assert any("benign" in r.lower() and "malicious" in r.lower() for r in result["reasons"])
 
 
+def test_within_class_cross_split_overlap_is_rejected_and_names_the_class(tmp_path: Path) -> None:
+    """[Review] A file mistakenly present in a SINGLE class's own tuning AND
+    held_out split (e.g. benign/tuning and benign/held_out) is already
+    caught by the pre-existing global tuning-vs-held_out overlap check
+    (test_overlapping_content_between_splits_is_rejected), but that check's
+    message deliberately can't say WHICH class is involved ("possibly across
+    different classes"). This is a different, more specific failure mode
+    from the same-split cross-class check above (which compares tuning-vs-
+    tuning across classes, never a single class's own tuning-vs-held_out) --
+    a dedicated check that names the class directly closes the diagnostic
+    gap. Real risk (Story 4.1): a hash-convention mismatch between an older
+    and a newer harvest_own_inbox.py run left 57 real messages assigned to
+    different splits within the SAME class, only found via a manual
+    diagnostic script -- this check now names the class immediately instead
+    of requiring that investigation every time."""
+    _write_valid_corpus(tmp_path)
+
+    benign_tuning_first = sorted((tmp_path / "benign" / "tuning").glob("*.eml"))[0]
+    benign_held_out_first = sorted((tmp_path / "benign" / "held_out").glob("*.eml"))[0]
+    benign_held_out_first.write_bytes(benign_tuning_first.read_bytes())
+
+    corpus = load_corpus(str(tmp_path))
+    result = validate_corpus(corpus)
+
+    assert result["is_valid"] is False
+    assert any(
+        "benign" in r.lower() and "tuning" in r.lower() and "held_out" in r.lower()
+        for r in result["reasons"]
+    )
+
+
 def test_load_corpus_never_raises_on_directory_listing_permission_error(tmp_path: Path, mocker) -> None:  # type: ignore[no-untyped-def]
     _write_eml(tmp_path / "benign" / "tuning" / "a.eml", "subj", "body")
     mocker.patch("pathlib.Path.iterdir", side_effect=PermissionError("simulated"))
