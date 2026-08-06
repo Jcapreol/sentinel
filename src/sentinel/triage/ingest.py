@@ -283,6 +283,50 @@ def extract_sender_and_content_hash(raw_bytes: bytes) -> tuple[str | None, str]:
 
 _TAG_PATTERN = re.compile(r"<[^>]+>")
 _HREF_PATTERN = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+# [Cipher domain-extraction fix, Phase 2] _TAG_PATTERN alone only removes the
+# <style>/<script> DELIMITERS, leaving their CSS/JS text content behind as if
+# it were real body text -- CipherAgent's domain regex then matches CSS
+# selector chains (table.icons) and JS identifiers (history.pushState) as if
+# they were real domains, ahead of any real indicator later in the message.
+# Removed as whole blocks, before _TAG_PATTERN ever runs, so no CSS/JS text
+# reaches the output at all. re.DOTALL so a block spanning multiple lines
+# (the common case) still matches as one block instead of stopping at the
+# first newline. [Code review, 2026-08-05] Closing tag name is deliberately
+# NOT required to match the opening one (</(?:style|script)>, not a </\1>
+# backreference) -- real, malformed HTML in this project's own corpus
+# (7/10,435 files) pairs a <style> open with a </script> close or vice
+# versa; a backreference left that whole block, CSS/JS junk included,
+# completely unstripped. Matching either closer for either opener strips
+# strictly more, never less -- the right tradeoff for a security-relevant
+# extraction path. The opening-tag group `(?:[^>]*[^/>])?` deliberately
+# excludes SELF-CLOSED tags (`<script src="...analytics.js"/>`, a common
+# real pattern for external script/tracking includes) from matching as an
+# opener at all -- requiring the character just before the final `>` not be
+# `/`. Without this, a self-closed tag (no content, no closing tag of its
+# own) was treated as an unclosed opener, and the lazy `.*?` extended the
+# match all the way to the NEXT, UNRELATED `</script>`/`</style>` anywhere
+# later in the message, silently deleting everything in between -- a
+# strictly worse failure than the bug this fix targets, since it can blank
+# real content (including real domains) for BOTH Watchman and Cipher, not
+# just skew Cipher's IOC pick.
+_STYLE_SCRIPT_BLOCK_PATTERN = re.compile(
+    r"<(?:style|script)\b(?:[^>]*[^/>])?>.*?</(?:style|script)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# [Code review, 2026-08-05] _STYLE_SCRIPT_BLOCK_PATTERN's lazy .*? DOTALL
+# match is quadratic in the number of UNCLOSED <style>/<script> opens --
+# confirmed empirically, ~800KB of repeated unclosed <script> tags took
+# over a second and scaled roughly with the square of input size. This
+# project's real corpus's largest actual email is ~48KB; this ceiling is
+# generously above any real message while still bounding the cost of a
+# deliberately pathological one -- a phishing-triage tool processes
+# attacker-controlled HTML by design, so this must be bounded, not just
+# fast on well-formed input. Oversized input skips block-stripping (falls
+# back to the pre-existing tag-only behavior for that one message) rather
+# than raising or truncating -- a message is still triaged, just without
+# this specific hardening, which is a better failure mode than refusing to
+# process it at all.
+_MAX_HTML_LENGTH_FOR_BLOCK_STRIP = 1_000_000
 
 
 def _decode_part(part: Message) -> str:
@@ -323,7 +367,18 @@ def _strip_html(html: str) -> str:
     an <a href="..."> URL along with the tag itself -- for an HTML-only
     phishing email using generic anchor text ("click here"), that silently
     destroys the one thing CipherAgent's IOC extraction depends on."""
+    # [Code review, 2026-08-05] hrefs are captured from the ORIGINAL html,
+    # before any style/script stripping -- a real href can be written
+    # dynamically inside a <script> block (document.write(...), a real
+    # pattern this project's own corpus contains, 13/10,435 files). Running
+    # block-stripping first destroyed that href before _HREF_PATTERN ever
+    # saw it; _HREF_PATTERN is a blunt text scan with no awareness of
+    # "real HTML tag" vs. "JS string that looks like one" either way, so
+    # this restores the exact pre-existing href-preservation guarantee
+    # while still letting block-stripping clean the body text.
     hrefs = _HREF_PATTERN.findall(html)
+    if len(html) <= _MAX_HTML_LENGTH_FOR_BLOCK_STRIP:
+        html = _STYLE_SCRIPT_BLOCK_PATTERN.sub(" ", html)
     stripped = _TAG_PATTERN.sub(" ", html)
     if hrefs:
         stripped += "\n" + "\n".join(hrefs)
