@@ -96,6 +96,32 @@ def test_watchman_unrecognized_confidence_yields_neutral_uninformative_evidence(
     assert result["evidence"][0]["finding"] == "Unusual login time"
 
 
+def test_watchman_confidence_tier_lookup_is_case_insensitive(
+    mocker: MockerFixture, fake_config: Config, sample_alert: str
+) -> None:
+    """[Code review, 2026-08-05] The prompt instructs Claude to always emit
+    exactly "Confirmed"/"Probable"/"Investigating", but nothing enforces
+    that at the API boundary -- plausible LLM formatting drift (e.g.
+    lowercase "confirmed") previously fell through to the unrecognized-
+    confidence fallback (weight=0.10/neutral) instead of the intended
+    tier (weight=0.7/malicious for "Confirmed"), silently and massively
+    underweighting a genuinely high-confidence malicious finding with no
+    error surfaced anywhere."""
+    mock_anthropic = mocker.patch("sentinel.watchman.anthropic.Anthropic")
+    mock_response = mocker.MagicMock()
+    mock_response.content[0].text = (
+        '{"findings": ["Credential exfiltration observed"], "confidence": "confirmed"}'
+    )
+    mock_anthropic.return_value.messages.create.return_value = mock_response
+
+    agent = WatchmanAgent(config=fake_config)
+    result = agent.analyze(sample_alert)
+
+    assert len(result["evidence"]) == 1
+    assert result["evidence"][0]["direction"] == "malicious"
+    assert result["evidence"][0]["weight"] == 0.7  # _CONFIDENCE_WEIGHT["Confirmed"], 1 finding
+
+
 def test_watchman_unhashable_confidence_does_not_crash(
     mocker: MockerFixture, fake_config: Config, sample_alert: str
 ) -> None:

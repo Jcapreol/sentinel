@@ -22,9 +22,9 @@ _MODEL = "claude-haiku-4-5-20251001"
 # "benign". This is a real, permanent asymmetry versus headers.py
 # (which can assert benign via an SPF/DKIM/DMARC pass), not a gap.
 _CONFIDENCE_WEIGHT: dict[str, float] = {
-    "Confirmed": 0.7,
-    "Probable": 0.5,
-    "Investigating": 0.3,
+    "confirmed": 0.7,
+    "probable": 0.5,
+    "investigating": 0.3,
 }
 
 # scoring.compute_raw_score does NOT exclude neutral-direction items from its
@@ -92,7 +92,16 @@ def _build_evidence(findings: list[str], confidence: str | None) -> list[Evidenc
         return _coverage_gap_evidence(
             "Watchman completed analysis; no behavioral indicators of compromise found"
         )
-    weight = _CONFIDENCE_WEIGHT.get(confidence) if isinstance(confidence, str) else None
+    # [Code review, 2026-08-05] .strip().lower() -- the prompt instructs
+    # Claude to always emit exactly "Confirmed"/"Probable"/"Investigating",
+    # but nothing enforces that at the API boundary; a bare, case-sensitive
+    # dict lookup previously fell through to the unrecognized-confidence
+    # fallback below for plausible LLM formatting drift (e.g. lowercase
+    # "confirmed"), silently underweighting a genuinely high-confidence
+    # finding with no error surfaced anywhere.
+    weight = (
+        _CONFIDENCE_WEIGHT.get(confidence.strip().lower()) if isinstance(confidence, str) else None
+    )
     # 2026-07-23, Story 2.2: divide by len(findings) -- deferred from Story 2.1's
     # code review (see deferred-work.md's worked example). N findings from ONE
     # LLM inference are not N independent corroborating observations; without
