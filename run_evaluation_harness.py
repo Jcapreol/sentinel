@@ -112,6 +112,7 @@ from sentinel.triage.script_guard import (
     LockAlreadyHeldError,
     LookupCache,
     acquire_run_lock,
+    print_sample_size_cost_warning,
 )
 from sentinel.triage.scoring import InconclusiveScoreError, apply_calibration, determine_verdict
 from sentinel.triage.worker import check_structural_deferral, gather_evidence_and_raw_score
@@ -469,6 +470,14 @@ def main() -> None:
             config = load_config()
             corpus_path = args.corpus_path or _default_corpus_path(config)
             corpus = load_corpus(corpus_path)
+            print_sample_size_cost_warning(
+                args.sample_size_per_class,
+                _DEFAULT_SAMPLE_SIZE_PER_CLASS,
+                {
+                    "benign_held_out": len(corpus["benign_held_out"]),
+                    "malicious_held_out": len(corpus["malicious_held_out"]),
+                },
+            )
             calibration_model = load_calibration_model(_CALIBRATION_MODEL_PATH)
             cache = LookupCache(_STATE_DB_PATH, ttl_seconds=args.cache_ttl_seconds)
             budget = ApiCallBudget(

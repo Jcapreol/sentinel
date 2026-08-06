@@ -430,6 +430,69 @@ def test_main_resolves_output_path_before_acquiring_the_lock(
     assert output_path.exists()
 
 
+def test_main_prints_cost_warning_when_sample_size_exceeds_default(
+    valid_corpus, tmp_path: Path, mocker, capsys  # type: ignore[no-untyped-def]
+) -> None:
+    """valid_corpus's tuning pools are only 35 files/class, so the default
+    (200) always fully covers them regardless of --sample-size-per-class --
+    _DEFAULT_SAMPLE_SIZE_PER_CLASS is patched down here purely to prove
+    main() actually wires the warning through with the real args, matching
+    print_sample_size_cost_warning's own already-covered capping logic
+    (see test_script_guard.py) rather than re-testing that logic here."""
+    output_path = tmp_path / "calibration_model_v1.json"
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    mocker.patch("fit_real_calibration_model.WatchmanAgent", return_value=watchman)
+    mocker.patch("fit_real_calibration_model.CipherAgent", return_value=cipher)
+    mocker.patch("fit_real_calibration_model.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch("fit_real_calibration_model._DEFAULT_SAMPLE_SIZE_PER_CLASS", 5)
+    mocker.patch(
+        "sys.argv",
+        [
+            "fit_real_calibration_model.py",
+            "--sample-size-per-class",
+            "30",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    script.main()
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "30" in captured.err
+
+
+def test_main_silent_when_sample_size_is_default(
+    valid_corpus, tmp_path: Path, mocker, capsys  # type: ignore[no-untyped-def]
+) -> None:
+    output_path = tmp_path / "calibration_model_v1.json"
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    mocker.patch("fit_real_calibration_model.WatchmanAgent", return_value=watchman)
+    mocker.patch("fit_real_calibration_model.CipherAgent", return_value=cipher)
+    mocker.patch("fit_real_calibration_model.load_corpus", return_value=valid_corpus)
+    mocker.patch(
+        "fit_real_calibration_model.load_config",
+        return_value=mocker.Mock(eval_corpus_path=None),
+    )
+    mocker.patch("fit_real_calibration_model._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch(
+        "sys.argv",
+        ["fit_real_calibration_model.py", "--sample-size-per-class", "3", "--output", str(output_path)],
+    )
+
+    script.main()
+
+    assert "WARNING" not in capsys.readouterr().err
+
+
 def test_main_budget_exceeded_exits_one_with_no_output_written(  # type: ignore[no-untyped-def]
     valid_corpus, tmp_path: Path, mocker
 ) -> None:

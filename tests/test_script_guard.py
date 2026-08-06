@@ -19,6 +19,7 @@ from sentinel.triage.script_guard import (
     LockAlreadyHeldError,
     LookupCache,
     acquire_run_lock,
+    print_sample_size_cost_warning,
 )
 
 # --- acquire_run_lock -------------------------------------------------------
@@ -336,3 +337,52 @@ def test_api_call_budget_check_and_record_is_atomic_under_concurrent_threads(
     # every single run -- a race would show up as ["ok", "ok"] (both slipped
     # through) at least occasionally.
     assert sorted(results) == ["ok", "rejected"]
+
+
+# --- print_sample_size_cost_warning -------------------------------------------
+
+
+def test_cost_warning_silent_when_sample_size_is_none(capsys) -> None:  # type: ignore[no-untyped-def]
+    print_sample_size_cost_warning(None, 200, {"benign_tuning": 813, "malicious_tuning": 6916})
+
+    assert capsys.readouterr().err == ""
+
+
+def test_cost_warning_silent_when_sample_size_at_or_under_default(capsys) -> None:  # type: ignore[no-untyped-def]
+    print_sample_size_cost_warning(200, 200, {"benign_tuning": 813, "malicious_tuning": 6916})
+    print_sample_size_cost_warning(150, 200, {"benign_tuning": 813, "malicious_tuning": 6916})
+
+    assert capsys.readouterr().err == ""
+
+
+def test_cost_warning_silent_when_pools_too_small_for_the_cap_to_matter(capsys) -> None:  # type: ignore[no-untyped-def]
+    """A requested N above the default must not by itself trigger a warning
+    if every pool is smaller than the default anyway -- the actual call
+    volume (after capping each pool at its own size) is what matters, not
+    the raw requested N."""
+    print_sample_size_cost_warning(1000, 200, {"benign_tuning": 50, "malicious_tuning": 50})
+
+    assert capsys.readouterr().err == ""
+
+
+def test_cost_warning_fires_with_capped_counts_and_ratio(capsys) -> None:  # type: ignore[no-untyped-def]
+    """The pool sizes passed in are RAW, uncapped -- the function itself
+    caps each at min(sample_size_per_class, pool_size), matching
+    sample_corpus_files's own behavior, so a pool smaller than N is not
+    misreported as if N files from it will really be processed."""
+    print_sample_size_cost_warning(
+        850, 200, {"benign_tuning": 813, "malicious_tuning": 6916}
+    )
+
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert "850" in captured.err
+    assert "200" in captured.err
+    # benign_tuning capped at its own pool size (813 < 850); malicious_tuning
+    # capped at the requested 850 (850 < 6916).
+    assert "benign_tuning=813" in captured.err
+    assert "malicious_tuning=850" in captured.err
+    # actual_total = 813 + 850 = 1663; default_total = 200 * 2 = 400; ratio ~4.2x
+    assert "1663" in captured.err
+    assert "4.2" in captured.err
+    assert captured.out == ""

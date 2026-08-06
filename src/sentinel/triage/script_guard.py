@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import multiprocessing
 import sqlite3
+import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -49,6 +50,45 @@ from typing import Literal, TypedDict
 # and run_evaluation_harness.py (code review 2026-08-03).
 DEFAULT_CACHE_TTL_SECONDS = 86400.0  # 24h -- reputation data doesn't change minute to minute
 DEFAULT_API_CEILING_WINDOW_HOURS = 1.0
+
+
+def print_sample_size_cost_warning(
+    sample_size_per_class: int | None,
+    default_sample_size_per_class: int,
+    pool_sizes: dict[str, int],
+) -> None:
+    """Story 4.1: prints an unmissable stderr warning when a real-corpus
+    script's --sample-size-per-class will make substantially more real
+    Watchman/Cipher API calls than the default would -- same precedent as
+    run_evaluation_harness.py's own _IDENTITY_PLACEHOLDER_WARNING (Story
+    3.4): a prominent, printed-once warning, not a blocking/interactive
+    confirmation prompt (no script in this codebase blocks on stdin).
+
+    `pool_sizes` maps each class-bucket name (e.g. "benign_tuning",
+    "malicious_tuning") to its RAW file count -- this function does its own
+    min(sample_size_per_class, pool_size) capping per bucket, matching
+    sample_corpus_files's own "return everything if sample_size >= len(files)"
+    behavior, so a pool smaller than the requested N is never misreported as
+    though N files from it will really be processed.
+    """
+    if sample_size_per_class is None or sample_size_per_class <= default_sample_size_per_class:
+        return
+    actual_counts = {
+        name: min(sample_size_per_class, pool_size) for name, pool_size in pool_sizes.items()
+    }
+    actual_total = sum(actual_counts.values())
+    default_total = default_sample_size_per_class * len(pool_sizes)
+    if actual_total <= default_total:
+        return
+    ratio = actual_total / default_total
+    breakdown = ", ".join(f"{name}={count}" for name, count in actual_counts.items())
+    print(
+        f"WARNING: --sample-size-per-class {sample_size_per_class} exceeds the default "
+        f"({default_sample_size_per_class}) -- this run will make real Watchman/Cipher "
+        f"API calls for {actual_total} files total ({breakdown}), ~{ratio:.1f}x the "
+        f"default run's {default_total}. Confirm this was intentional.",
+        file=sys.stderr,
+    )
 
 
 class LockAlreadyHeldError(Exception):
