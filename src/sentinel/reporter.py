@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from sentinel.cipher import extract_ioc
-from sentinel.verdict import AgentResult, VerdictSchema
+from sentinel.verdict import AgentResult, VerdictSchema, cipher_agent_status
 
 
 class IncidentReport(TypedDict):
@@ -103,6 +103,12 @@ def generate_report(
         indicator_details["value"] = "no extractable IOC"
 
     # Evidence Chain
+    # [2026-08-06] Cipher's status goes through cipher_agent_status (verdict.py) --
+    # the same function assemble_verdict uses for methodology -- so a real
+    # malicious finding surviving a partial error reads "partial" here too,
+    # never a plain "error" that would contradict the escalated confidence
+    # tier the same finding also now drives. Watchman's status stays a plain
+    # binary (its own severity parsing has no "partial" case to distinguish).
     evidence_chain: list[dict[str, Any]] = [
         {
             "source": "watchman",
@@ -114,7 +120,7 @@ def generate_report(
             "source": "cipher",
             "type": "threat_intelligence",
             "findings": cipher_result["findings"],
-            "status": "error" if cipher_result["error"] else "success",
+            "status": cipher_agent_status(cipher_result),
         },
     ]
 

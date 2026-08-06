@@ -1,9 +1,8 @@
-import re
 from enum import Enum
 from typing import Literal
 
 from sentinel.source_registry import SOURCE_CATEGORIES
-from sentinel.verdict import AgentResult
+from sentinel.verdict import AgentResult, cipher_findings_show_malicious
 
 
 class ConfidenceTier(Enum):
@@ -20,10 +19,6 @@ TIER_MAP: dict[ConfidenceTier, tuple[int, str]] = {
     ConfidenceTier.CONFIRMED: (3, "Confirmed"),
 }
 
-_VT_MALICIOUS_RE = re.compile(r"VirusTotal:.*flagged by (\d+) engines as malicious")
-_ABUSE_SCORE_RE = re.compile(r"AbuseIPDB:.*abuse confidence (\d+)%")
-_ABUSE_MALICIOUS_THRESHOLD = 25
-
 
 def count_independent_sources(results: list[AgentResult]) -> int:
     categories: set[str] = set()
@@ -37,21 +32,60 @@ def count_independent_sources(results: list[AgentResult]) -> int:
 
 def _parse_cipher_severity(result: AgentResult) -> Literal["malicious", "clean", "no_data"]:
     """
-    "malicious" — at least one finding shows VT engines > 0 or AbuseIPDB >= threshold.
-    "clean"     — findings present but all scores are zero (Cipher checked and found nothing).
-    "no_data"   — error, or no findings at all (no IOC in alert, rate-limited, etc.).
+    "malicious" — cipher_findings_show_malicious(result["findings"]) is True
+                  (verdict.py -- the VT-engines-flagged or AbuseIPDB-score-over-
+                  threshold pattern). [2026-08-06] Now surfaced even when `error`
+                  is ALSO set (e.g. a later sub-lookup timed out after an earlier
+                  one already found something real) -- this IS the actual behavior
+                  change in this revision: previously ANY `error` short-circuited
+                  to "no_data" before findings were ever inspected, discarding a
+                  real threat signal just because part of the overall check didn't
+                  complete. Mirrors the reasoning behind cipher.py's own timeout
+                  fix (don't throw away evidence already gathered) and the VT-
+                  visibility fix (surface degradation, don't hide it). Safe by
+                  construction: cipher.py only ever appends a finding string after
+                  a full, successfully-parsed lookup response (defensive int casts
+                  happen before `findings.append`, every append site) -- a finding
+                  present here was never partial/garbled, and `error`, when also
+                  set, always originates from a DIFFERENT sub-lookup than the one
+                  that produced this finding (append and the error paths are
+                  mutually exclusive within one sub-lookup's own try/except).
+                  Known gap, pre-existing and NOT addressed here: a URLhaus-only
+                  finding never matches cipher_findings_show_malicious's patterns,
+                  so a real URLhaus hit would still fall through to "clean"/
+                  "no_data" if it's the only finding present -- narrower than this
+                  docstring's "malicious" case implies, worth its own look if it
+                  matters in practice.
+    "clean"     — cipher_findings_show_malicious is False, AND no error.
+                  [2026-08-06 clarification, not a behavior change] A finding that
+                  matches neither pattern (unparseable, or a source this function
+                  doesn't recognize, e.g. URLhaus) is indistinguishable here from a
+                  genuine zero-score finding -- both fall through to this branch.
+                  A zero-malicious/unrecognized finding alongside a set `error` was
+                  ALREADY "no_data", not "clean", before this revision (the old
+                  code's unconditional `error is not None` check already caught
+                  this case) -- that half of the current behavior is unchanged,
+                  restated here only for a single clear picture of all three cases.
+    "no_data"   — no findings at all, OR no malicious match alongside an error
+                  (rate-limited, timed out, etc. on part of the check) -- an
+                  incomplete check must never be presented as a complete,
+                  exonerating clean scan.
     Only "clean" is exonerating evidence; "no_data" is inconclusive.
+
+    Consistency note (2026-08-06): the "malicious"/no-error->"clean" split here
+    and verdict.py's own cipher_agent_status ("partial" vs "error" display
+    label) are two DIFFERENT three-way classifications built on the SAME
+    underlying cipher_findings_show_malicious primitive -- deliberately kept as
+    two functions (severity feeds the confidence tier; status is a display
+    label for methodology/evidence_chain) rather than one, since they answer
+    different questions, but neither re-implements the malicious-pattern match
+    independently.
     """
-    if result["error"] is not None or not result["findings"]:
+    if not result["findings"]:
         return "no_data"
-    for finding in result["findings"]:
-        m = _VT_MALICIOUS_RE.search(finding)
-        if m and int(m.group(1)) > 0:
-            return "malicious"
-        m = _ABUSE_SCORE_RE.search(finding)
-        if m and int(m.group(1)) >= _ABUSE_MALICIOUS_THRESHOLD:
-            return "malicious"
-    return "clean"
+    if cipher_findings_show_malicious(result["findings"]):
+        return "malicious"
+    return "no_data" if result["error"] is not None else "clean"
 
 
 def _parse_watchman_severity(result: AgentResult) -> Literal["high", "medium", "low", "no_data"]:

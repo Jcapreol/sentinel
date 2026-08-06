@@ -171,6 +171,46 @@ def test_print_verdict_goes_to_stdout(capsys: pytest.CaptureFixture[str]) -> Non
     assert parsed["confidence_tier"] == 2
 
 
+def test_assemble_verdict_cipher_status_is_partial_when_malicious_finding_survives_error() -> None:
+    # [Code review, 2026-08-06] Consistent with confidence.py's own fix:
+    # a real malicious finding surviving a partial error must not read as a
+    # plain "error" in methodology -- that would contradict the escalated
+    # confidence tier the finding also now drives. AgentResult.error itself
+    # is untouched by this -- only the derived display status changes.
+    watchman = make_agent_result(source="watchman")
+    cipher = make_agent_result(
+        source="cipher",
+        findings=["VirusTotal: 1.2.3.4 flagged by 20 engines as malicious, 0 as suspicious"],
+        error="timeout",
+    )
+    verdict = assemble_verdict(watchman, cipher, (2, "Probable"), True, time.time())
+    cipher_entry = next(m for m in verdict["methodology"] if m["agent"] == "cipher")
+    assert cipher_entry["status"] == "partial"
+    assert cipher_entry["error"] == "timeout"
+
+
+def test_assemble_verdict_cipher_status_is_error_when_error_and_no_malicious_finding() -> None:
+    watchman = make_agent_result(source="watchman")
+    cipher = make_agent_result(source="cipher", error="timeout")  # no findings at all
+    verdict = assemble_verdict(watchman, cipher, (1, "Investigating"), False, time.time())
+    cipher_entry = next(m for m in verdict["methodology"] if m["agent"] == "cipher")
+    assert cipher_entry["status"] == "error"
+
+
+def test_assemble_verdict_watchman_status_stays_binary_even_with_findings_and_error() -> None:
+    # Watchman's own severity parsing (_parse_watchman_severity) treats ANY
+    # error as no_data regardless of findings -- unchanged by this fix, which
+    # is scoped to Cipher only (confidence.py's asymmetric handling doesn't
+    # apply to Watchman). Watchman's status must stay simple binary.
+    watchman = make_agent_result(
+        source="watchman", findings=["some behavioral finding"], error="timeout"
+    )
+    cipher = make_agent_result(source="cipher")
+    verdict = assemble_verdict(watchman, cipher, (1, "Investigating"), False, time.time())
+    watchman_entry = next(m for m in verdict["methodology"] if m["agent"] == "watchman")
+    assert watchman_entry["status"] == "error"
+
+
 def test_assemble_verdict_all_fields_present_when_both_agents_fail() -> None:
     bs_w = BlindSpot(source="watchman", reason="timed out", next_step=None)
     bs_c = BlindSpot(source="cipher", reason="timed out", next_step=None)
