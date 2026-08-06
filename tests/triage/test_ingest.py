@@ -926,6 +926,122 @@ def test_extract_email_content_decodes_rfc2047_encoded_subject() -> None:
     assert "=?UTF-8?B?" not in content
 
 
+def test_extract_email_content_decodes_subject_even_when_parser_returns_header_object() -> None:
+    """[Code review, 2026-08-05] The 2026-07-23 patch above tested
+    decode_header against a plain str Subject, but email.message.Message's
+    get("Subject") can ALSO return an email.header.Header object instead
+    of str for certain real, oddly-folded encoded headers -- decode_header
+    does not raise on that input, it silently mis-decodes as charset=
+    "unknown-8bit" instead, leaving the literal "=?UTF-8?B?...?=" marker
+    undecoded.
+
+    This is a verbatim reproduction of the exact bytes from
+    benign_corpus_raw/malicious/tuning/sample-5380.eml's real Subject
+    header (a real "🌞 Starte jetzt in den Sommer 2025..." phishing
+    subject) -- confirmed by bisection that this specific real padding
+    content (not just its length; a same-length synthetic line of spaces
+    or commas does NOT reproduce it) is what makes Python's email parser
+    return a Header object here rather than str, so the real bytes are
+    used verbatim rather than a hand-built approximation that might not
+    actually trigger the bug."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: =?UTF-8?B?8J+MniBTdGFydGUgamV0enQgaW4gZGVuIFNvbW1lciAyMDI1OiDigqwyMDAwIEJvbnVzICsgMTQ1IEZyZWlzcGllbGUgYmVpIGlXaW4gRm9ydHVuZSBDYXNpbm8g4oCTIGtlaW5lIEVpbnphaGx1bmcgbsO2dGlnIQ==?=\r\n"
+        b"                                                                                                                                                                                                                                                      "
+        b",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,"
+        b"                                                                                                               "
+        + b"\xc2\xb2" * 89 + b"wnznasdelw" + b"\xc2\xb2" * 39 + b"oatbbwaf" + b"\xc2\xb2" * 9
+        + b"\r\n\r\nbody text"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Starte jetzt in den Sommer 2025" in content
+    assert "=?UTF-8?B?" not in content.split("\n\n", 1)[0]
+
+
+def test_extract_email_content_preserves_raw_utf8_homoglyph_subject_not_corrupted_by_decode() -> None:
+    """[Code review, 2026-08-05, Edge Case Hunter] CRITICAL regression test.
+    An earlier version of this fix (str(raw_subject) unconditionally before
+    decode_header) was a NET REGRESSION, confirmed against the real corpus:
+    it "fixed" 11 files but CORRUPTED 1,903 others (18% of the corpus) --
+    real Subject text replaced with U+FFFD garbage, including homoglyph
+    phishing text specifically, directly undermining this function's own
+    stated purpose.
+
+    This is a verbatim reproduction of the real raw bytes from
+    benign_corpus_raw/malicious/held_out/sample-1053.eml: a homoglyph-
+    evasion phishing subject with a raw (non-RFC-2047-encoded) UTF-8
+    Cyrillic 'о' (0xD0 0xBE) sitting directly in the header bytes --
+    "Imp[Cyrillic-о]rtant Inf[Cyrillic-о]rmation Fr[Cyrillic-о]m AT&T!".
+    Python's email parser stores this as a Header object with an
+    "unknown-8bit" chunk holding the ORIGINAL bytes (recoverable losslessly
+    via surrogateescape). Passing that Header object directly into
+    decode_header() correctly recovers and decodes the real bytes; calling
+    str() on it FIRST invokes Header.__str__(), which decodes those same
+    bytes with errors="replace" internally -- permanently destroying them
+    with U+FFFD before decode_header ever gets a chance to see the real
+    bytes. The fix must never do that."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: Imp\xd0\xbertant Inf\xd0\xbermation Fr\xd0\xbem AT&T!\r\n"
+        b"\r\nbody text"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "Impоrtant Infоrmation Frоm AT&T!" in content
+    assert "�" not in content.split("\n\n", 1)[0]
+
+
+def test_decode_subject_handles_a_realistic_header_object_with_leading_plain_text() -> None:
+    """[Code review, 2026-08-05] Real corpus example (sample-4911.eml) of a
+    PARTIAL decode failure -- a Subject with real plain-text content
+    followed by a trailing encoded-word ("phishing@pot, Get an ESaver -
+    <encoded 'Enter to Win with Elon Musk!'>"). Constructs an actual
+    email.header.Header directly (the real, minimal trigger for this bug
+    class -- decode_header() behaves differently for a Header instance
+    than for a str, regardless of how that Header was produced) rather
+    than relying on the fragile exact-byte-padding trigger reproduced in
+    the test above, while still using the real corpus text verbatim."""
+    from email.header import Header
+
+    from sentinel.triage.ingest import _decode_subject
+
+    real_subject_text = (
+        "phishing@pot, Get an ESaver – "
+        "=?UTF-8?B?RW50ZXIgdG8gV2luIHdpdGggRWxvbiBNdXNrIQ==?="
+    )
+    header_obj = Header(real_subject_text)
+    assert not isinstance(header_obj, str)  # sanity: reproduces the real type mismatch
+
+    decoded = _decode_subject(header_obj)  # type: ignore[arg-type]
+
+    assert "Enter to Win with Elon Musk!" in decoded
+    assert "=?UTF-8?B?" not in decoded
+
+
+def test_decode_subject_exception_fallback_still_returns_str_not_header_object() -> None:
+    """[Code review, 2026-08-05] decode_header() itself CAN raise (confirmed:
+    HeaderParseError on malformed base64 in an encoded-word, a realistic
+    real-world case -- corrupted/truncated headers, whether accidental or
+    a deliberate evasion attempt). The exception fallback `return
+    raw_subject` previously returned the ORIGINAL object unmodified -- if
+    raw_subject was a Header (this function's whole reason for existing),
+    it could still hand back a non-str Header on this path, undermining
+    the fix's own guarantee that this function always returns str."""
+    from email.header import Header
+
+    from sentinel.triage.ingest import _decode_subject
+
+    header_obj = Header("=?UTF-8?B?not-valid-base64!!!?=")
+    assert not isinstance(header_obj, str)
+
+    decoded = _decode_subject(header_obj)  # type: ignore[arg-type]
+
+    assert isinstance(decoded, str)
+
+
 def test_extract_email_content_body_failure_does_not_discard_subject(mocker) -> None:  # type: ignore[no-untyped-def]
     """2026-07-23 code-review patch: the function-wide try/except was
     all-or-nothing -- a failure extracting the body discarded an
