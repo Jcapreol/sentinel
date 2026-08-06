@@ -12,6 +12,7 @@ testing convention.
 """
 
 import ast
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -25,7 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 import run_evaluation_harness as script  # noqa: E402
 
-from sentinel.triage.eval import CalibrationModel, Corpus, load_corpus  # noqa: E402
+from sentinel.triage.eval import CalibrationModel, Corpus, compute_ece, load_corpus  # noqa: E402
 from sentinel.triage.script_guard import (  # noqa: E402
     ApiCallBudgetExceededError,
     acquire_run_lock,
@@ -159,10 +160,30 @@ def test_collect_pairs_assigns_correct_labels_to_each_class(valid_corpus) -> Non
     sampled_benign = valid_corpus["benign_held_out"][:2]
     sampled_malicious = valid_corpus["malicious_held_out"][:3]
 
-    pairs = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
-    labels = [label for _confidence, label in pairs]
+    labels = [sf["label"] for sf in scored]
     assert labels == [0.0, 0.0, 1.0, 1.0, 1.0]
+
+
+def test_collect_pairs_records_correct_file_identity(valid_corpus) -> None:  # type: ignore[no-untyped-def]
+    """[Story 4.1 follow-up, 2026-08-05] Each ScoredFile must carry the SAME
+    content_hash and path as the CorpusFile it was scored from -- the whole
+    point of this fix is making a real run's aggregate result traceable
+    back to a specific file after the process exits, which was previously
+    impossible (see deferred-work.md)."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    sampled_benign = valid_corpus["benign_held_out"][:2]
+    sampled_malicious = valid_corpus["malicious_held_out"][:2]
+
+    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+
+    assert len(scored) == 4
+    expected_by_hash = {f["content_hash"]: f for f in sampled_benign + sampled_malicious}
+    for sf in scored:
+        assert sf["content_hash"] in expected_by_hash
+        assert sf["path"] == expected_by_hash[sf["content_hash"]]["path"]
 
 
 def test_run_rejects_invalid_corpus(tmp_path: Path) -> None:
@@ -251,9 +272,9 @@ def test_collect_pairs_skips_unreadable_file_without_aborting(  # type: ignore[n
 
     mocker.patch("pathlib.Path.read_bytes", flaky_read_bytes)
 
-    pairs = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
-    assert len(pairs) == 3
+    assert len(scored) == 3
 
 
 def test_collect_pairs_warns_when_one_class_contributes_zero_pairs(  # type: ignore[no-untyped-def]
@@ -283,10 +304,10 @@ def test_collect_pairs_warns_when_one_class_contributes_zero_pairs(  # type: ign
 
     mocker.patch("run_evaluation_harness.gather_evidence_and_raw_score", side_effect=selective_gather)
 
-    pairs = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
-    assert len(pairs) == 3  # only benign succeeded
-    assert all(label == 0.0 for _confidence, label in pairs)
+    assert len(scored) == 3  # only benign succeeded
+    assert all(sf["label"] == 0.0 for sf in scored)
     captured = capsys.readouterr()
     assert "WARNING" in captured.err
     assert "malicious" in captured.err.lower()
@@ -305,9 +326,9 @@ def test_collect_pairs_skips_file_when_content_extraction_raises(  # type: ignor
         side_effect=RuntimeError("simulated extraction failure"),
     )
 
-    pairs = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
-    assert pairs == []
+    assert scored == []
 
 
 def test_collect_pairs_skips_file_when_apply_calibration_raises(  # type: ignore[no-untyped-def]
@@ -337,9 +358,9 @@ def test_collect_pairs_skips_file_when_apply_calibration_raises(  # type: ignore
         side_effect=RuntimeError("simulated: unrecognized calibration method"),
     )
 
-    pairs = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
-    assert pairs == []
+    assert scored == []
 
 
 def test_collect_pairs_defers_structurally_for_all_neutral_evidence_even_if_calibration_saturates(  # type: ignore[no-untyped-def]
@@ -373,18 +394,21 @@ def test_collect_pairs_defers_structurally_for_all_neutral_evidence_even_if_cali
         "run_evaluation_harness.apply_calibration", return_value=1.0
     )
 
-    pairs = script.collect_pairs(
+    scored = script.collect_pairs(
         sampled_benign, sampled_malicious, watchman, cipher, deferral_band=0.05
     )
 
-    assert len(pairs) == 4
-    assert all(confidence == 0.5 for confidence, _label in pairs)
+    assert len(scored) == 4
+    assert all(sf["calibrated_confidence"] == 0.5 for sf in scored)
     apply_calibration_spy.assert_not_called()
     # The deferral rate this harness reports must move off 0.0000 for a
     # sample like this -- the exact number CI caught as suspiciously
     # unchanged before this fix.
     assert (
-        script.compute_deferral_rate([c for c, _label in pairs], deferral_band=0.05) == 1.0
+        script.compute_deferral_rate(
+            [sf["calibrated_confidence"] for sf in scored], deferral_band=0.05
+        )
+        == 1.0
     )
 
 
@@ -456,6 +480,102 @@ def test_run_never_reports_gate_met_when_every_ece_bin_is_inconclusive(  # type:
     assert report["gate_met"] is False  # but the gate must NOT be MET from this
 
 
+def test_write_per_file_results_writes_expected_json(tmp_path: Path) -> None:
+    """[Story 4.1 follow-up, 2026-08-05] Direct, free, local test of the
+    writer itself -- per this task's own scope, a small local fixture with
+    fake confidence/label pairs is sufficient, no real pipeline needed."""
+    scored = [
+        script.ScoredFile(content_hash="abc123", path="/some/path/a.eml", calibrated_confidence=0.5, label=1.0),
+        script.ScoredFile(content_hash="def456", path="/some/path/b.eml", calibrated_confidence=0.95, label=1.0),
+        script.ScoredFile(content_hash="ghi789", path="/some/path/c.eml", calibrated_confidence=0.05, label=0.0),
+    ]
+    output_path = tmp_path / "results.json"
+
+    script.write_per_file_results(scored, str(output_path))
+
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert len(written) == 3
+    by_hash = {r["content_hash"]: r for r in written}
+    assert by_hash["abc123"]["path"] == "/some/path/a.eml"
+    assert by_hash["abc123"]["calibrated_confidence"] == 0.5
+    assert by_hash["abc123"]["label"] == 1.0
+    assert by_hash["abc123"]["ece_bin"] == [0.5, 0.6]
+    assert by_hash["def456"]["ece_bin"] == [0.9, 1.0]
+    assert by_hash["ghi789"]["ece_bin"] == [0.0, 0.1]
+
+
+def test_bin_range_for_confidence_matches_compute_ece_real_bin_boundaries() -> None:
+    """[Review][Patch] _bin_range_for_confidence deliberately re-implements
+    (rather than calls into) compute_ece's own bin-boundary logic -- code
+    review found nothing cross-validated the two stay in agreement. One
+    sample per bin, so each bin's real avg_confidence IS that sample's raw
+    confidence, letting this assert directly against compute_ece's actual
+    ECEResult["bins"] rather than a second hand-derived expectation."""
+    # Each confidence lands in a distinct bin (unlike e.g. 0.95 and 1.0, which
+    # both fall in the last bin's inclusive-upper-edge case and would merge
+    # into one two-sample bin, breaking the 1-sample-per-bin assumption below).
+    predictions = [(0.05, 0.0), (0.25, 0.0), (0.55, 1.0), (0.85, 1.0)]
+
+    ece_result = compute_ece(predictions)
+
+    assert len(ece_result["bins"]) == len(predictions)
+    for b in ece_result["bins"]:
+        assert script._bin_range_for_confidence(b["avg_confidence"]) == b["bin_range"]
+
+
+def test_run_writes_results_json_with_correct_per_file_count_when_results_path_given(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, tmp_path
+) -> None:
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
+    confidences = iter([0.05] * 3 + [0.95] * 3)
+    mocker.patch(
+        "run_evaluation_harness.apply_calibration", side_effect=lambda raw_score: next(confidences)
+    )
+    results_path = tmp_path / "results.json"
+
+    report = script.run(
+        valid_corpus,
+        _REAL_ISOTONIC_MODEL,
+        sample_size_per_class=3,
+        deferral_band=0.05,
+        watchman=watchman,
+        cipher=cipher,
+        results_path=str(results_path),
+    )
+
+    assert results_path.exists()
+    written = json.loads(results_path.read_text(encoding="utf-8"))
+    assert len(written) == report["sample_count"] == 6
+
+
+def test_run_does_not_write_results_json_when_results_path_not_given(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, tmp_path
+) -> None:
+    """Default behavior (no results_path argument) must stay exactly as
+    before this fix -- no new file appears unless explicitly requested."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
+    confidences = iter([0.05] * 3 + [0.95] * 3)
+    mocker.patch(
+        "run_evaluation_harness.apply_calibration", side_effect=lambda raw_score: next(confidences)
+    )
+    results_path = tmp_path / "results.json"
+
+    script.run(
+        valid_corpus,
+        _REAL_ISOTONIC_MODEL,
+        sample_size_per_class=3,
+        deferral_band=0.05,
+        watchman=watchman,
+        cipher=cipher,
+    )
+
+    assert not results_path.exists()
+
+
 def test_run_reports_gate_not_met_for_anti_correlated_data(  # type: ignore[no-untyped-def]
     valid_corpus, mocker
 ) -> None:
@@ -510,6 +630,9 @@ def _mock_main_dependencies(
         "run_evaluation_harness._CALIBRATION_MODEL_PATH", str(tmp_path / "calibration_model_v1.json")
     )
     mocker.patch("run_evaluation_harness._STATE_DB_PATH", str(tmp_path / "state.db"))
+    # [Story 4.1 follow-up] Without this, main() would write a real
+    # results.json to the repo root on every test run.
+    mocker.patch("run_evaluation_harness._RESULTS_PATH", str(tmp_path / "results.json"))
 
 
 def test_warns_and_exits_2_when_calibration_model_is_identity(  # type: ignore[no-untyped-def]
@@ -577,6 +700,41 @@ def test_main_exits_0_when_gate_is_met(  # type: ignore[no-untyped-def]
     assert exc.value.code == 0
     captured = capsys.readouterr()
     assert "Release gate: MET" in captured.out
+
+
+def test_main_writes_results_json_without_changing_console_report(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker, capsys, tmp_path
+) -> None:
+    """[Story 4.1 follow-up, 2026-08-05] Non-regression test: writing
+    results.json must be purely additive. Mirrors
+    test_main_exits_0_when_gate_is_met's exact setup and keeps its exact
+    console/exit-code assertions unchanged, proving the new file output
+    doesn't alter compute_ece/compute_auc_roc/compute_deferral_rate's
+    behavior or how _print_report prints it -- then separately checks the
+    new, additive results.json content."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    _mock_main_dependencies(mocker, valid_corpus, _REAL_ISOTONIC_MODEL, watchman, cipher, tmp_path)
+    mocker.patch("run_evaluation_harness.check_structural_deferral", return_value=False)
+    confidences = iter([0.05] * 5 + [0.95] * 5)
+    mocker.patch(
+        "run_evaluation_harness.apply_calibration", side_effect=lambda raw_score: next(confidences)
+    )
+    mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "5"])
+    results_path = tmp_path / "results.json"
+
+    with pytest.raises(SystemExit) as exc:
+        script.main()
+
+    # Identical to test_main_exits_0_when_gate_is_met -- unchanged.
+    assert exc.value.code == 0
+    captured = capsys.readouterr()
+    assert "Release gate: MET" in captured.out
+
+    # New, additive behavior.
+    assert results_path.exists()
+    written = json.loads(results_path.read_text(encoding="utf-8"))
+    assert len(written) == 10
 
 
 def test_main_exits_1_when_gate_is_not_met(  # type: ignore[no-untyped-def]
@@ -651,6 +809,7 @@ def test_main_passes_temperature_cache_budget_to_agents(  # type: ignore[no-unty
         "run_evaluation_harness._CALIBRATION_MODEL_PATH", str(tmp_path / "calibration_model_v1.json")
     )
     mocker.patch("run_evaluation_harness._STATE_DB_PATH", str(tmp_path / "state.db"))
+    mocker.patch("run_evaluation_harness._RESULTS_PATH", str(tmp_path / "results.json"))
     mocker.patch("sys.argv", ["run_evaluation_harness.py", "--sample-size-per-class", "3"])
 
     with pytest.raises(SystemExit):
