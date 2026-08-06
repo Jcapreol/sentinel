@@ -861,6 +861,38 @@ def test_extract_email_content_self_closed_script_tag_does_not_swallow_unrelated
     assert "http://real-billing-portal.tld/invoice123" in content
 
 
+def test_extract_email_content_whitespace_only_text_plain_does_not_mask_real_html_body() -> None:
+    """[Code review, 2026-08-05] _extract_body's `if text_plain: return
+    text_plain` used bare truthiness -- a decorative plaintext fallback of
+    pure CRLF/nbsp (non-empty, so truthy) won over a real HTML body with
+    actual content. Real reproduction of benign_corpus_raw/malicious/
+    tuning/sample-1492.eml (Subject: "VIRUS_DETECED!!!#0XHDD887"): its real
+    text/plain part is exactly 14 bytes of '\\r\\n\\r\\n\\r\\n\\r\\n\\xa0\\xa0\\r\\n',
+    while its real text/html part is 1305 bytes containing two real
+    dereferrer-wrapped redirect links -- a classic image-only phishing
+    pattern. Before this fix, extract_email_content returned just the
+    Subject line (50 bytes total): Watchman got nothing behavioral to
+    analyze and Cipher got no body text to extract an IOC from."""
+    raw_bytes = (
+        b"From: alice@example.com\r\n"
+        b"Subject: test\r\n"
+        b'Content-Type: multipart/alternative; boundary="BOUNDARY"\r\n\r\n'
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"\r\n\r\n\r\n\r\n\xc2\xa0\xc2\xa0\r\n"
+        b"--BOUNDARY\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n\r\n"
+        b'<html><body><a href="https://deref-web.de/mail/client/akYai3oF398/dereferrer/'
+        b'?redirectUrl=https%3A%2F%2Ft.ly%2Faiwugiuaew-gakahgbhf97"><img src="x.png"></a>'
+        b"</body></html>\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+    content = extract_email_content(raw_bytes)
+
+    assert "deref-web.de" in content
+
+
 def test_extract_email_content_non_text_single_part_body_is_not_decoded_as_text() -> None:
     """2026-07-23 code-review patch: a non-multipart, non-text body (e.g.
     application/pdf) was previously force-decoded as UTF-8 plain text,
