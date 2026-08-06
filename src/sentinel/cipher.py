@@ -259,6 +259,17 @@ class CipherAgent:
             )
 
         except httpx.TimeoutException:
+            # [Code review, 2026-08-05] Defensive fallback only -- as of this
+            # fix, every httpx call site inside _analyze_ip/_analyze_domain/
+            # _lookup_urlhaus catches its own TimeoutException locally and
+            # degrades to a per-signal coverage-gap EvidenceItem instead of
+            # letting it propagate here, specifically so a timeout on ONE
+            # sub-lookup no longer discards evidence already gathered by the
+            # others (previously, this handler's own "wipe everything, return
+            # one aggregate coverage-gap item" behavior was the bug). This
+            # branch should now be unreachable in practice; kept as a safety
+            # net in case a future httpx call is ever added outside those
+            # three guarded sites.
             reason = "Cipher timed out — threat intelligence lookup unavailable"
             return AgentResult(
                 source_name="cipher",
@@ -424,7 +435,23 @@ class CipherAgent:
                 return "analysis_failed"
             return None
         except httpx.TimeoutException:
-            raise
+            # [Code review, 2026-08-05] Previously re-raised, propagating past
+            # _analyze_ip/_analyze_domain entirely and discarding whatever
+            # VT/AbuseIPDB had ALREADY found -- a confirmed malicious IOC
+            # could score as "nothing found" if URLhaus timed out after the
+            # others succeeded. Degrades locally instead, same as every
+            # other exception type below, so already-gathered evidence
+            # survives.
+            reason = "URLhaus lookup timed out — malicious URL data unavailable"
+            blind_spots.append(
+                BlindSpot(
+                    source="urlhaus",
+                    reason=reason,
+                    next_step=None,
+                )
+            )
+            evidence.extend(_coverage_gap_evidence("urlhaus_finding", reason))
+            return "timeout"
         except ApiCallBudgetExceededError:
             raise  # Story 4.2: must not be swallowed by the generic handler below
         except Exception:
@@ -519,7 +546,26 @@ class CipherAgent:
                             "ip", ip, "virustotal", CachedLookup(weight=weight, direction=direction, finding=finding)
                         )
             except httpx.TimeoutException:
-                raise
+                # [Code review, 2026-08-05] Previously re-raised, propagating
+                # past _analyze_ip entirely and discarding this call's own
+                # locally-accumulated findings/evidence AND anything the
+                # NEXT sub-lookup (AbuseIPDB/URLhaus) would have added --
+                # degrades locally instead, matching every other exception
+                # type below, so a timeout here doesn't erase what's already
+                # been gathered so far or block the remaining sub-lookups
+                # from still running.
+                reason = "VirusTotal lookup timed out — reputation data unavailable"
+                _warn_vt_degraded(ip, reason)
+                blind_spots.append(
+                    BlindSpot(
+                        source="virustotal",
+                        reason=reason,
+                        next_step=None,
+                    )
+                )
+                evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
+                if overall_error is None:
+                    overall_error = "timeout"
             except ApiCallBudgetExceededError:
                 raise  # Story 4.2: must not be swallowed by the generic handler below
             except Exception:
@@ -597,7 +643,21 @@ class CipherAgent:
                             "ip", ip, "abuseipdb", CachedLookup(weight=weight, direction=direction, finding=finding)
                         )
             except httpx.TimeoutException:
-                raise
+                # [Code review, 2026-08-05] Same fix as VT's timeout handler
+                # above -- degrades locally instead of re-raising, so a
+                # timeout here doesn't discard VT's already-gathered
+                # evidence or block URLhaus from still running.
+                reason = "AbuseIPDB lookup timed out — abuse report data unavailable"
+                blind_spots.append(
+                    BlindSpot(
+                        source="abuseipdb",
+                        reason=reason,
+                        next_step=None,
+                    )
+                )
+                evidence.extend(_coverage_gap_evidence("abuseipdb_finding", reason))
+                if overall_error is None:
+                    overall_error = "timeout"
             except ApiCallBudgetExceededError:
                 raise  # Story 4.2: must not be swallowed by the generic handler below
             except Exception:
@@ -698,7 +758,21 @@ class CipherAgent:
                             "domain", domain, "virustotal", CachedLookup(weight=weight, direction=direction, finding=finding)
                         )
             except httpx.TimeoutException:
-                raise
+                # [Code review, 2026-08-05] Same fix as _analyze_ip's VT
+                # timeout handler -- degrades locally instead of re-raising,
+                # so a timeout here doesn't block URLhaus from still running.
+                reason = "VirusTotal lookup timed out — reputation data unavailable"
+                _warn_vt_degraded(domain, reason)
+                blind_spots.append(
+                    BlindSpot(
+                        source="virustotal",
+                        reason=reason,
+                        next_step=None,
+                    )
+                )
+                evidence.extend(_coverage_gap_evidence("virustotal_finding", reason))
+                if overall_error is None:
+                    overall_error = "timeout"
             except ApiCallBudgetExceededError:
                 raise  # Story 4.2: must not be swallowed by the generic handler below
             except Exception:
