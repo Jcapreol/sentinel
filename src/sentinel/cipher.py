@@ -62,16 +62,96 @@ _DOMAIN_PATTERN = re.compile(
     r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b"
 )
 
+# [Cipher domain-extraction fix, Phase 2] A curated allow-list, not the full
+# ~1500-entry IANA root zone -- _DOMAIN_PATTERN's bare "word.word...letters"
+# shape matches plenty of non-domain text (a person's name written
+# firstname.lastname, a filename, a JS/CSS identifier that survives HTML
+# stripping) that a TLD check alone rejects cheaply. Deliberately includes
+# TLDs heavily abused by real phishing infrastructure (.shop, .xyz, .top,
+# .club, .online, .site, .live, .icu, .link, .click, plus the historically-
+# free Freenom TLDs .tk/.ml/.ga/.cf/.gq) precisely because under-inclusion
+# here would silently re-introduce this exact bug for real malicious
+# domains, not just reject false positives -- see bsq2.firiri.shop, the real
+# indicator Task 6's run failed to query (deferred-work.md). An unmatched
+# but real, legitimate ccTLD is a conservative miss (extract_ioc finds no
+# IOC in that file, same as today's "no domains found" case), not a crash or
+# a wrong answer -- acceptable for a heuristic IOC pre-filter, not a DNS
+# resolver. Deliberately does NOT filter on casing (e.g. rejecting camelCase
+# labels) -- real corpus domains legitimately appear as "www.KAY.com"
+# (all-caps brand) and "DentalPlans.com" (TitleCase brand; note "l"->"P" is
+# itself a lowercase-to-uppercase transition), so a casing heuristic would
+# reject real domains, not just junk.
+_PLAUSIBLE_TLDS = frozenset(
+    {
+        # Legacy / infrastructure gTLDs
+        "com", "net", "org", "edu", "gov", "mil", "int",
+        # Common modern gTLDs (legitimate use)
+        "io", "co", "me", "tv", "cc", "info", "biz", "name", "pro", "mobi", "ai",
+        "asia", "app", "dev", "tech", "email", "cloud", "digital", "network",
+        "systems", "solutions", "agency", "company", "group", "world", "life",
+        "today", "news", "media", "blog", "design", "expert", "guru", "work",
+        "store", "site",
+        # gTLDs heavily abused by real phishing/malware infrastructure --
+        # must stay included, not just "common legitimate" ones. .cyou/.cfd
+        # added 2026-08-05 (code review) after confirming real-corpus
+        # evidence: both appear repeatedly as clear malicious C2-style
+        # infrastructure (e.g. random-label subdomains under a single base
+        # domain). .zip/.mov deliberately NOT included despite being
+        # well-known abused gTLDs elsewhere -- checked this project's real
+        # corpus specifically and the only .zip match is "Reclamado.zip", a
+        # real attachment FILENAME, not a domain; the ordinary-file-mention
+        # collision risk outweighs the absent benefit here (zero real .zip/
+        # .mov domain evidence in 10,435 files).
+        "shop", "xyz", "top", "club", "online", "live", "icu", "link", "click",
+        "pw", "tk", "ml", "ga", "cf", "gq", "win", "bid", "loan", "download",
+        "stream", "gdn", "men", "party", "review", "science", "trade", "webcam",
+        "cyou", "cfd", "cm",
+        # Added 2026-08-05 (code review, Edge Case Hunter) after confirming
+        # real-corpus evidence for each -- .sbs/.buzz/.quest/.vip/.cam all
+        # show the same random-label-subdomain phishing-infrastructure
+        # pattern already seen for .shop/.cyou/.cfd. .rest/.surf were also
+        # suggested but show zero real matches either way and are plausible
+        # English words -- skipped, same standard applied to .zip/.mov.
+        "sbs", "buzz", "quest", "vip", "cam",
+        # Major country-code TLDs (not exhaustive -- ISO 3166 has ~250; an
+        # unmatched real ccTLD is a conservative miss, see comment above)
+        "uk", "us", "ca", "au", "de", "fr", "jp", "cn", "ru", "br", "in", "it",
+        "es", "nl", "se", "no", "dk", "fi", "pl", "ch", "at", "be", "ie", "nz",
+        "mx", "kr", "sg", "hk", "tw", "za", "ae", "il", "tr", "gr", "pt", "cz",
+        "ro", "hu", "ua", "id", "th", "vn", "ph", "my", "pk", "ng", "eg", "sa",
+        "ar", "cl", "pe", "ve",
+    }
+)
+
+
+def _has_plausible_tld(domain: str) -> bool:
+    tld = domain.rsplit(".", 1)[-1].lower()
+    return tld in _PLAUSIBLE_TLDS
+
+
+def _has_valid_octets(ip: str) -> bool:
+    """_IP_PATTERN itself only checks 1-3 DIGITS per group, not that each
+    group is a real 0-255 octet -- a formatted number like "27.500.000.00"
+    (a price) matches the pattern exactly as well as a real IP, and
+    extract_ioc/CipherAgent.analyze both check IPs before domains, so an
+    unvalidated match like that preempts any real domain in the same file."""
+    return all(0 <= int(octet) <= 255 for octet in ip.split("."))
+
 
 def _extract_public_ips(text: str) -> list[str]:
-    return [ip for ip in _IP_PATTERN.findall(text) if not _PRIVATE_IP.match(ip)]
+    return [
+        ip
+        for ip in _IP_PATTERN.findall(text)
+        if _has_valid_octets(ip) and not _PRIVATE_IP.match(ip)
+    ]
 
 
 def _extract_domains(text: str) -> list[str]:
     stripped = _URL_STRIP.sub(r"\1", text)
     seen: dict[str, None] = {}
     for d in _DOMAIN_PATTERN.findall(stripped):
-        seen[d] = None
+        if _has_plausible_tld(d):
+            seen[d] = None
     return list(seen)
 
 
