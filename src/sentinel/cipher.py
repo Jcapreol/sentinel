@@ -1,4 +1,5 @@
 import re
+import sys
 from typing import Literal
 
 import httpx
@@ -83,6 +84,18 @@ def extract_ioc(text: str) -> tuple[str, str] | None:
     if domains:
         return ("domain", domains[0])
     return None
+
+
+def _warn_vt_degraded(indicator: str, reason: str) -> None:
+    """[Story 4.1] Every VT failure path below (429/other-non-200/exception)
+    already degrades silently to a low-weight neutral or coverage-gap
+    EvidenceItem, with nothing surfacing in either real-corpus script's own
+    output -- confirmed directly from this file during Task 6's real-run
+    investigation (see deferred-work.md). This is a minimal visibility fix,
+    not a full one: a single stderr line so "no errors in the log" becomes a
+    meaningful signal again, matching this project's existing per-item
+    stderr-warning precedent (e.g. ingest.py's own per-message warnings)."""
+    print(f"WARNING: VirusTotal lookup degraded for {indicator!r}: {reason}", file=sys.stderr)
 
 
 def _coverage_gap_evidence(name: str, reason: str) -> list[EvidenceItem]:
@@ -371,6 +384,7 @@ class CipherAgent:
                 )
                 if vt_resp.status_code == 429:
                     reason = "VirusTotal rate limit reached — reputation data unavailable"
+                    _warn_vt_degraded(ip, reason)
                     blind_spots.append(
                         BlindSpot(
                             source="virustotal",
@@ -389,6 +403,7 @@ class CipherAgent:
                     # malicious engines" neutral EvidenceItem indistinguishable
                     # from a genuine clean scan. Must be a coverage gap instead.
                     reason = f"VirusTotal returned unexpected status {vt_resp.status_code} — reputation data unavailable"
+                    _warn_vt_degraded(ip, reason)
                     blind_spots.append(
                         BlindSpot(
                             source="virustotal",
@@ -429,6 +444,7 @@ class CipherAgent:
                 raise  # Story 4.2: must not be swallowed by the generic handler below
             except Exception:
                 reason = "VirusTotal lookup failed — reputation data unavailable"
+                _warn_vt_degraded(ip, reason)
                 blind_spots.append(
                     BlindSpot(
                         source="virustotal",
@@ -556,6 +572,7 @@ class CipherAgent:
                 )
                 if vt_resp.status_code == 429:
                     reason = "VirusTotal rate limit reached — reputation data unavailable"
+                    _warn_vt_degraded(domain, reason)
                     blind_spots.append(
                         BlindSpot(
                             source="virustotal",
@@ -569,6 +586,7 @@ class CipherAgent:
                     overall_error = "rate_limited"
                 elif vt_resp.status_code != 200:
                     reason = f"VirusTotal returned unexpected status {vt_resp.status_code} — reputation data unavailable"
+                    _warn_vt_degraded(domain, reason)
                     blind_spots.append(
                         BlindSpot(
                             source="virustotal",
@@ -605,6 +623,7 @@ class CipherAgent:
                 raise  # Story 4.2: must not be swallowed by the generic handler below
             except Exception:
                 reason = "VirusTotal lookup failed — reputation data unavailable"
+                _warn_vt_degraded(domain, reason)
                 blind_spots.append(
                     BlindSpot(
                         source="virustotal",
