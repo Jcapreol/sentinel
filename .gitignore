@@ -29,6 +29,17 @@ data/
 .sentinel_script_state.db
 calibration_model_v1.json.lock
 
+# run_evaluation_harness.py's per-file results (Story 4.1 follow-up,
+# 2026-08-05): local, generated real-run output, never committed -- unlike
+# calibration_model_v1.json itself (the actual product artifact), this is
+# a diagnostic record of one specific run, not something to ship.
+# Anchored to the repo root (where _RESULTS_PATH actually writes) -- a bare
+# `results.json` would also match the unrelated, already-tracked
+# eval/results.json, the exact class of overbroad pattern the
+# calibration_model_v1.json.lock comment above already warns against
+# (code review 2026-08-05).
+/results.json
+
 # Python
 __pycache__/
 *.py[cod]

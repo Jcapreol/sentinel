@@ -81,6 +81,7 @@ Run with --help for all options.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import TypedDict
@@ -128,6 +129,13 @@ _CALIBRATION_MODEL_PATH = str(Path(__file__).resolve().parent / "calibration_mod
 # -- both real-corpus scripts benefit from the same Cipher-lookup cache
 # across separate invocations.
 _STATE_DB_PATH = str(Path(__file__).resolve().parent / ".sentinel_script_state.db")
+# [Story 4.1 follow-up, 2026-08-05] Per-file identity was previously
+# discarded entirely once the process exited -- only aggregate ECE bins/
+# AUC-ROC/deferral-rate survived, so no past or future result could be
+# traced back to a specific file (see deferred-work.md). This is that fix's
+# output path; same absolute-path-anchored convention as every other
+# script-owned state file above.
+_RESULTS_PATH = str(Path(__file__).resolve().parent / "results.json")
 # [Review][Patch] Shared with fit_real_calibration_model.py via
 # script_guard.py -- previously duplicated verbatim in both scripts (code
 # review 2026-08-03).
@@ -206,17 +214,32 @@ def _score_one_file(
         return None
 
 
+class ScoredFile(TypedDict):
+    content_hash: str
+    path: str
+    calibrated_confidence: float
+    label: float
+
+
 def collect_pairs(
     sampled_benign: list[CorpusFile],
     sampled_malicious: list[CorpusFile],
     watchman: SentinelAgent,
     cipher: SentinelAgent,
     deferral_band: float = 0.0,
-) -> list[tuple[float, float]]:
+) -> list[ScoredFile]:
     """Runs the triage pipeline against each sampled file, pairing its
-    calibrated_confidence with its class label (0.0 benign, 1.0 malicious).
-    Only ever called with *_held_out lists -- see this file's module
-    docstring.
+    calibrated_confidence with its class label (0.0 benign, 1.0 malicious)
+    AND the file's own identity (content_hash, path). Only ever called with
+    *_held_out lists -- see this file's module docstring.
+
+    [Story 4.1 follow-up, 2026-08-05] Previously returned bare
+    `list[tuple[float, float]]` with no file identity attached -- once this
+    function returned, there was no way to trace an aggregate result back
+    to a specific file (see deferred-work.md). `run()` still derives the
+    plain (confidence, label) pairs `compute_ece`/`compute_auc_roc`/
+    `compute_deferral_rate` expect via a simple projection, so none of
+    those three functions' own behavior changes.
 
     [Fix] deferral_band defaults to 0.0 (only the all-neutral structural
     gate applies; the conflicting-but-uncertain gate never fires) rather
@@ -227,7 +250,7 @@ def collect_pairs(
         (f, 1.0) for f in sampled_malicious
     ]
     total = len(targets)
-    pairs: list[tuple[float, float]] = []
+    scored: list[ScoredFile] = []
     benign_collected = 0
     malicious_collected = 0
     for index, (corpus_file, label) in enumerate(targets, start=1):
@@ -237,12 +260,19 @@ def collect_pairs(
         )
         calibrated_confidence = _score_one_file(corpus_file, watchman, cipher, deferral_band)
         if calibrated_confidence is not None:
-            pairs.append((calibrated_confidence, label))
+            scored.append(
+                ScoredFile(
+                    content_hash=corpus_file["content_hash"],
+                    path=corpus_file["path"],
+                    calibrated_confidence=calibrated_confidence,
+                    label=label,
+                )
+            )
             if label == 0.0:
                 benign_collected += 1
             else:
                 malicious_collected += 1
-    print(f"Collected {len(pairs)} pairs ({total - len(pairs)} skipped)", file=sys.stderr)
+    print(f"Collected {len(scored)} pairs ({total - len(scored)} skipped)", file=sys.stderr)
 
     # [Review] Without this, a total dropout of one class's samples (e.g. a
     # systemic extraction issue affecting only that class's file encoding)
@@ -263,7 +293,48 @@ def collect_pairs(
             "discrimination measurement.",
             file=sys.stderr,
         )
-    return pairs
+    return scored
+
+
+def _bin_range_for_confidence(
+    confidence: float, num_bins: int = 10
+) -> tuple[float, float] | None:
+    """Mirrors compute_ece's own bin-boundary logic exactly
+    (src/sentinel/triage/eval.py) -- deliberately NOT calling into
+    compute_ece itself or modifying it (out of scope for this fix, and
+    compute_ece's own output/behavior must stay unchanged), so a per-file
+    report can say which bin a file landed in without touching compute_ece
+    at all. If this boundary rule ever changes there, it must change here
+    too. Returns None for a confidence outside [0.0, 1.0], mirroring
+    compute_ece's own excluded_sample_count handling for the same case."""
+    for i in range(num_bins):
+        bin_min = i / num_bins
+        bin_max = (i + 1) / num_bins
+        if (bin_min <= confidence < bin_max) or (i == num_bins - 1 and confidence == bin_max):
+            return (bin_min, bin_max)
+    return None
+
+
+def write_per_file_results(scored_files: list[ScoredFile], output_path: str) -> None:
+    """Writes one JSON record per file (identity, calibrated_confidence,
+    label, which ECE bin it landed in) -- additive to the existing console
+    aggregate output, never replacing it. Direct fix for a real gap found
+    during Story 4.1 (2026-08-04): once a real run's process exited, there
+    was no way -- free or paid -- to trace an aggregate result back to a
+    specific file. See deferred-work.md."""
+    records = []
+    for sf in scored_files:
+        bin_range = _bin_range_for_confidence(sf["calibrated_confidence"])
+        records.append(
+            {
+                "content_hash": sf["content_hash"],
+                "path": sf["path"],
+                "calibrated_confidence": sf["calibrated_confidence"],
+                "label": sf["label"],
+                "ece_bin": list(bin_range) if bin_range is not None else None,
+            }
+        )
+    Path(output_path).write_text(json.dumps(records, indent=2), encoding="utf-8")
 
 
 def compute_deferral_rate(calibrated_confidences: list[float], deferral_band: float) -> float:
@@ -299,11 +370,21 @@ def run(
     deferral_band: float,
     watchman: SentinelAgent,
     cipher: SentinelAgent,
+    results_path: str | None = None,
 ) -> EvaluationReport:
     """Orchestrates validate -> identity-check -> sample -> collect pairs ->
     measure. Raises ValueError (never measures against unvalidated data, or
     against zero collected pairs) if the corpus fails validate_corpus or
     every sampled file's pipeline call fails.
+
+    [Story 4.1 follow-up, 2026-08-05] `results_path` is optional and
+    defaults to None (no file written) -- every existing caller of run()
+    that doesn't pass it keeps working completely unchanged. When given,
+    the per-file results (identity + confidence + label + ECE bin) are
+    written there via write_per_file_results, additive to the existing
+    EvaluationReport this function has always returned -- that return
+    shape, and compute_ece/compute_auc_roc/compute_deferral_rate's own
+    inputs and outputs, are all unchanged by this parameter.
 
     [Review] deferral_band is validated FIRST, before anything else --
     matching worker.py's process_message, which calls
@@ -339,17 +420,39 @@ def run(
         file=sys.stderr,
     )
 
-    pairs = collect_pairs(sampled_benign, sampled_malicious, watchman, cipher, deferral_band)
-    if not pairs:
+    scored_files = collect_pairs(sampled_benign, sampled_malicious, watchman, cipher, deferral_band)
+    if not scored_files:
         raise ValueError(
             "Collected zero (confidence, label) pairs -- either zero files were sampled "
             "(check --sample-size-per-class and the corpus's held_out split sizes) or every "
             "sampled file's pipeline call failed"
         )
 
+    # Plain (confidence, label) pairs, projected from scored_files --
+    # compute_ece/compute_auc_roc/compute_deferral_rate's own inputs and
+    # outputs are completely unchanged by carrying file identity upstream.
+    pairs = [(sf["calibrated_confidence"], sf["label"]) for sf in scored_files]
     ece_result = compute_ece(pairs)
     auc_roc = compute_auc_roc(pairs)
-    deferral_rate = compute_deferral_rate([confidence for confidence, _label in pairs], deferral_band)
+    deferral_rate = compute_deferral_rate(
+        [sf["calibrated_confidence"] for sf in scored_files], deferral_band
+    )
+
+    if results_path is not None:
+        # [Review][Patch] Guarded, not left to propagate -- this write is
+        # purely additive/diagnostic and happens AFTER ece_result/auc_roc/
+        # deferral_rate are already computed from real, paid pipeline calls.
+        # An unguarded OSError here (full disk, locked file, permissions)
+        # previously aborted the whole run uncaught, discarding an
+        # already-computed report main() never got the chance to print.
+        try:
+            write_per_file_results(scored_files, results_path)
+        except OSError as e:
+            print(
+                f"WARNING: failed to write per-file results to {results_path}: {e} -- "
+                "continuing without it (the aggregate report below is unaffected)",
+                file=sys.stderr,
+            )
 
     # [Review] compute_ece's zero-conclusive-data fallback (ece=0.0) is a
     # divide-by-zero degradation, not a real measurement -- if every bin
@@ -495,6 +598,7 @@ def main() -> None:
                 config.deferral_threshold,
                 watchman,
                 cipher,
+                results_path=_RESULTS_PATH,
             )
     except LockAlreadyHeldError as e:
         print(str(e), file=sys.stderr)
