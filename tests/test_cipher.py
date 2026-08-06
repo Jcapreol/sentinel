@@ -2,7 +2,12 @@ import httpx
 import pytest
 from pytest_mock import MockerFixture
 
-from sentinel.cipher import CipherAgent
+from sentinel.cipher import (
+    CipherAgent,
+    _extract_domains,
+    _extract_public_ips,
+    extract_ioc,
+)
 from sentinel.config import Config
 from sentinel.triage.script_guard import ApiCallBudgetExceededError, CachedLookup, LookupCache
 from sentinel.verdict import SentinelAgent
@@ -935,3 +940,160 @@ def test_cipher_budget_exceeded_on_virustotal_via_domain_propagates_uncaught(
 
     with pytest.raises(ApiCallBudgetExceededError):
         agent.analyze(_DOMAIN_ALERT)
+
+
+# --- _extract_domains / _extract_public_ips / extract_ioc -------------------
+#
+# [Cipher domain-extraction fix, Phase 2] No direct unit coverage of these
+# three functions existed before this fix -- every prior test exercised them
+# only indirectly via CipherAgent.analyze() against a fixture already
+# containing a single, clean IP/domain. Real-content fixtures below are
+# excerpts of actual corpus files (benign_corpus_raw/, gitignored -- not
+# available in CI or to other clones, so the real bytes are embedded here
+# directly rather than referenced by path), sourced during Phase 1's
+# investigation (deferred-work.md, Task 6 follow-up).
+
+
+def test_extract_public_ips_rejects_invalid_octets() -> None:
+    """_IP_PATTERN itself has no octet-range check -- a formatted number
+    like a price ("27.500.000.00") or any other 4-group dotted-digit string
+    previously matched and was returned as if it were a real IP, taking
+    priority over any real domain in the same file (extract_ioc/
+    CipherAgent.analyze both check IPs before domains)."""
+    assert _extract_public_ips("total: 27.500.000.00 due") == []
+    assert _extract_public_ips("ref 999.999.999.999 confirmed") == []
+
+
+def test_extract_public_ips_accepts_valid_boundary_octets() -> None:
+    assert _extract_public_ips("contact 8.8.255.255 now") == ["8.8.255.255"]
+    assert _extract_public_ips("see 1.2.3.0 for details") == ["1.2.3.0"]
+
+
+def test_extract_public_ips_still_filters_private_ranges() -> None:
+    """Regression: the pre-existing _PRIVATE_IP filter must survive this
+    fix unchanged -- octet-range validity and private-range exclusion are
+    two independent, both-required gates."""
+    assert _extract_public_ips("internal host 192.168.1.1") == []
+    assert _extract_public_ips("loopback 127.0.0.1") == []
+
+
+def test_extract_domains_rejects_implausible_tld() -> None:
+    """Real excerpt from benign_corpus_raw/malicious/held_out/sample-1762.eml
+    (a real recruiting-phishing forward) -- a quoted Outlook 'From:' header
+    block in the HTML body. 'guddy.kumari' (the local part of
+    guddy.kumari@pyramidconsultinginc.com) matches _DOMAIN_PATTERN's bare
+    word.word shape exactly as well as the real company domain that follows
+    it, separated only by '@'. Neither 'kumari' nor 'antal' is a real TLD."""
+    text = (
+        "<p class=\"MsoNormal\"><b>From:</b> Guddy Kumari "
+        "&lt;guddy.kumari@pyramidconsultinginc.com&gt;<br>"
+        "<b>To:</b> Praveen Antal &lt;praveen.antal@pyramidconsultinginc.com&gt;</p>"
+    )
+
+    domains = _extract_domains(text)
+
+    assert "guddy.kumari" not in domains
+    assert "praveen.antal" not in domains
+    assert "pyramidconsultinginc.com" in domains
+
+
+def test_extract_domains_accepts_known_abused_phishing_tld() -> None:
+    """The real malicious indicator from sample-1073.eml (Phase 1) --
+    .shop is a cheap, heavily-abused TLD. The allow-list must include it:
+    under-inclusion here would silently re-introduce this exact bug for
+    real malicious domains, not just reject false positives."""
+    domains = _extract_domains("unsubscribe at http://bsq2.firiri.shop/unsub")
+
+    assert "bsq2.firiri.shop" in domains
+
+
+def test_extract_domains_accepts_cyou_and_cfd_confirmed_real_phishing_infra() -> None:
+    """[Code review, 2026-08-05] Added to the allow-list after finding real
+    corpus evidence -- both TLDs appear repeatedly as clear malicious C2-
+    style infrastructure (random-label subdomains under one base domain,
+    e.g. real corpus matches like *.comocileshox.cyou and
+    app-ladioactivemail.cfd)."""
+    domains = _extract_domains("callback to http://bnourajrnuwtbcm.comocileshox.cyou/x "
+                                "and http://app-ladioactivemail.cfd/y")
+
+    assert "bnourajrnuwtbcm.comocileshox.cyou" in domains
+    assert "app-ladioactivemail.cfd" in domains
+
+
+def test_extract_domains_accepts_further_confirmed_phishing_tlds() -> None:
+    """[Code review, 2026-08-05, Edge Case Hunter] .sbs/.buzz/.quest/.vip/
+    .cam confirmed via the same real-corpus check as .cyou/.cfd above --
+    all show the same random-label-subdomain phishing pattern. .rest/.surf
+    were also suggested but show zero real matches either way and are
+    plausible English words -- not added, same standard as .zip/.mov."""
+    domains = _extract_domains(
+        "http://vd1z.sbs/a http://emailtracklink.buzz/b "
+        "http://pandajimmys.quest/c http://yahya01.algoritme.vip/d "
+        "http://creativeforu.cam/e"
+    )
+
+    assert "vd1z.sbs" in domains
+    assert "emailtracklink.buzz" in domains
+    assert "pandajimmys.quest" in domains
+    assert "yahya01.algoritme.vip" in domains
+    assert "creativeforu.cam" in domains
+
+
+def test_extract_domains_rejects_zip_and_mov_despite_being_known_abused_tlds_elsewhere() -> None:
+    """[Code review, 2026-08-05] .zip/.mov are well-known abused gTLDs in
+    the wild (they collide with common file extensions), but this
+    project's own real corpus was checked specifically: the only real
+    .zip-ending match across 10,435 files is "Reclamado.zip", an
+    attachment FILENAME, not a domain, and there are zero .mov matches at
+    all. Including them would trade an absent real-world benefit (no real
+    .zip/.mov phishing domain observed) for a concrete, common false-
+    positive source (ordinary "see attached report.zip" mentions) --
+    deliberately excluded. A regression test, not just a design note: this
+    guards the decision from being silently reversed later without
+    re-checking real evidence."""
+    domains = _extract_domains("please see attached Reclamado.zip and video.mov")
+
+    assert domains == []
+
+
+def test_extract_domains_accepts_branded_domain_regardless_of_casing() -> None:
+    """Real corpus domains appear as www.KAY.com (all-caps brand) and
+    DentalPlans.com (TitleCase brand) in real marketing email body text --
+    both are real, legitimate domains. A casing-based heuristic (e.g.
+    rejecting any lowercase-to-uppercase transition) would incorrectly
+    reject DentalPlans.com ('l' -> 'P' is such a transition) -- deliberately
+    not used here; TLD plausibility is the only filter, independent of
+    casing."""
+    domains = _extract_domains("shop now at www.KAY.com or DentalPlans.com today")
+
+    assert "www.KAY.com" in domains
+    assert "DentalPlans.com" in domains
+
+
+def test_extract_ioc_prefers_real_domain_over_leaked_script_identifiers() -> None:
+    """End-to-end regression for the exact bug pattern found in Task 6's
+    real run: extract_email_content (fix A) removes the <script> block's
+    JS identifiers entirely, then extract_ioc (fix B, via _extract_domains'
+    TLD check) correctly picks the one real domain that remains. Real
+    excerpt from benign_corpus_raw/malicious/held_out/sample-1073.eml, where
+    the un-fixed pipeline picked ("domain", "history.pushState") and queried
+    VirusTotal for it instead of the real phishing domain."""
+    from sentinel.triage.ingest import extract_email_content
+
+    raw_bytes = (
+        b"From: newsletter@example.com\r\n"
+        b"Subject: test\r\n"
+        b"Content-Type: text/html\r\n\r\n"
+        b"<html><head>"
+        b'<script ecommerce-type="extend-native-history-api">(()=>{const e=history.pushState,'
+        b"t=history.replaceState;history.pushState=function(){e.apply(history,arguments)},"
+        b"history.replaceState=function(){t.apply(history,arguments)}})()</script>"
+        b"</head>"
+        b'<body>Um sich abzumelden, klicken Sie bitte auf '
+        b'<a href="http://bsq2.firiri.shop/unsubscribe">Hier</a></body></html>'
+    )
+
+    content = extract_email_content(raw_bytes)
+    picked = extract_ioc(content)
+
+    assert picked == ("domain", "bsq2.firiri.shop")
