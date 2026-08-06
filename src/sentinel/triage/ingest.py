@@ -407,7 +407,14 @@ def _extract_body(parsed: Message) -> str:
     # else: non-text single-part body (e.g. application/pdf, image/png) --
     # deliberately not decoded as text; nothing extractable from it.
 
-    if text_plain:
+    # [Code review, 2026-08-05] .strip() -- bare truthiness previously let a
+    # decorative, whitespace-only text/plain fallback (real corpus example:
+    # 14 bytes of pure CRLF/nbsp) win over a real text/html part containing
+    # actual content, discarding it entirely. A multipart/alternative
+    # message with a near-empty plaintext part and a substantial HTML body
+    # is a real, observed pattern (image-only phishing emails commonly ship
+    # exactly this shape).
+    if text_plain and text_plain.strip():
         return text_plain
     if text_html:
         return _strip_html(text_html)
