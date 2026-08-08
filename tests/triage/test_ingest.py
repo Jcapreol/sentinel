@@ -1,6 +1,7 @@
 import ast
 import base64
 import hashlib
+import re
 import subprocess
 from pathlib import Path
 
@@ -31,6 +32,23 @@ def _gmail_config(
         abuseipdb_api_key="ab-test",
         urlhaus_api_key="uh-test",
         gmail_credentials_path=credentials_path,
+        gmail_monitored_mailbox=mailbox,
+    )
+
+
+def _oauth_config(
+    client_secret_path: str | None,
+    token_path: str | None = "secrets/oauth-token.json",
+    mailbox: str | None = "me",
+) -> Config:
+    return Config(
+        anthropic_api_key="ak-test",
+        virustotal_api_key="vt-test",
+        abuseipdb_api_key="ab-test",
+        urlhaus_api_key="uh-test",
+        gmail_auth_mode="oauth",
+        gmail_oauth_client_secret_path=client_secret_path,
+        gmail_oauth_token_path=token_path,
         gmail_monitored_mailbox=mailbox,
     )
 
@@ -76,6 +94,102 @@ def test_build_gmail_service_wraps_credential_load_failure_as_config_error(mocke
     config = _gmail_config(credentials_path="secrets/missing.json")
 
     with pytest.raises(ConfigError, match="secrets/missing.json"):
+        build_gmail_service(config)
+
+
+def test_build_gmail_service_invalid_auth_mode_raises_config_error() -> None:
+    config = _gmail_config()
+    object.__setattr__(config, "gmail_auth_mode", "bogus")
+
+    with pytest.raises(ConfigError, match="bogus"):
+        build_gmail_service(config)
+
+
+def test_build_gmail_service_service_account_mode_never_touches_oauth_path(mocker) -> None:  # type: ignore[no-untyped-def]
+    mock_creds = mocker.MagicMock()
+    mocker.patch(
+        "sentinel.triage.ingest.service_account.Credentials.from_service_account_file",
+        return_value=mock_creds,
+    )
+    mocker.patch("sentinel.triage.ingest.build")
+    oauth_get_credentials = mocker.patch("sentinel.triage.ingest.get_credentials")
+    config = _gmail_config(credentials_path="secrets/key.json", mailbox="soc@example.com")
+
+    build_gmail_service(config)
+
+    oauth_get_credentials.assert_not_called()
+
+
+# --- build_gmail_service (oauth mode) ----------------------------------------
+
+
+def test_build_gmail_service_oauth_mode_fails_fast_on_missing_client_secret_path_config() -> None:
+    config = _oauth_config(client_secret_path=None)
+    with pytest.raises(ConfigError, match="GMAIL_OAUTH_CLIENT_SECRET_PATH"):
+        build_gmail_service(config)
+
+
+def test_build_gmail_service_oauth_mode_fails_fast_on_missing_token_path_config() -> None:
+    config = _oauth_config(client_secret_path="secrets/oauth-client.json", token_path=None)
+    with pytest.raises(ConfigError, match="GMAIL_OAUTH_TOKEN_PATH"):
+        build_gmail_service(config)
+
+
+def test_build_gmail_service_oauth_mode_fails_fast_when_client_secret_file_missing(
+    tmp_path: Path,
+) -> None:
+    missing = tmp_path / "does-not-exist.json"
+    config = _oauth_config(client_secret_path=str(missing))
+
+    with pytest.raises(ConfigError, match=re.escape(str(missing))):
+        build_gmail_service(config)
+
+
+def test_build_gmail_service_oauth_mode_fails_fast_on_missing_mailbox_config(
+    tmp_path: Path,
+) -> None:
+    client_secret = tmp_path / "oauth-client.json"
+    client_secret.write_text("{}")
+    config = _oauth_config(client_secret_path=str(client_secret), mailbox=None)
+
+    with pytest.raises(ConfigError, match="GMAIL_MONITORED_MAILBOX"):
+        build_gmail_service(config)
+
+
+def test_build_gmail_service_oauth_mode_uses_shared_get_credentials(
+    mocker, tmp_path: Path  # type: ignore[no-untyped-def]
+) -> None:
+    client_secret = tmp_path / "oauth-client.json"
+    client_secret.write_text("{}")
+    token_path = tmp_path / "oauth-token.json"
+
+    mock_creds = mocker.MagicMock()
+    get_credentials_mock = mocker.patch(
+        "sentinel.triage.ingest.get_credentials", return_value=mock_creds
+    )
+    build_mock = mocker.patch("sentinel.triage.ingest.build")
+    service = build_mock.return_value
+    config = _oauth_config(client_secret_path=str(client_secret), token_path=str(token_path))
+
+    result = build_gmail_service(config)
+
+    get_credentials_mock.assert_called_once_with(client_secret, token_path)
+    build_mock.assert_called_once_with("gmail", "v1", credentials=mock_creds, cache_discovery=False)
+    assert result is service
+
+
+def test_build_gmail_service_oauth_mode_wraps_credential_load_failure_as_config_error(
+    mocker, tmp_path: Path  # type: ignore[no-untyped-def]
+) -> None:
+    client_secret = tmp_path / "oauth-client.json"
+    client_secret.write_text("{}")
+    token_path = tmp_path / "oauth-token.json"
+    mocker.patch(
+        "sentinel.triage.ingest.get_credentials", side_effect=OSError("disk error")
+    )
+    config = _oauth_config(client_secret_path=str(client_secret), token_path=str(token_path))
+
+    with pytest.raises(ConfigError, match="disk error"):
         build_gmail_service(config)
 
 
@@ -280,6 +394,49 @@ def test_poll_getprofile_http_error_reraises_with_diagnostic(mocker, capsys) -> 
 
     captured = capsys.readouterr()
     assert "getProfile failed" in captured.err
+
+
+def test_poll_getprofile_403_mentions_oauth_scope_and_delegation_guidance(
+    mocker, capsys  # type: ignore[no-untyped-def]
+) -> None:
+    """[Review] This is the AC3 fail-loudly check for insufficient
+    gmail.readonly scope: rather than a separate probe call in
+    build_gmail_service (a redundant real API call every poll cycle, since
+    poll_new_messages always immediately makes this same getProfile call
+    right after build_gmail_service returns), a 403 here gets a message
+    covering both auth modes -- oauth's cached-token-scope case and
+    service_account's domain-wide-delegation case -- since this function
+    doesn't know which auth mode produced `service`."""
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=403)
+    service.users.return_value.getProfile.return_value.execute.side_effect = HttpError(
+        resp, b"insufficient scope"
+    )
+
+    with pytest.raises(HttpError):
+        poll_new_messages(service, "me", since_history_id=None)
+
+    captured = capsys.readouterr()
+    assert "GMAIL_AUTH_MODE=oauth" in captured.err
+    assert "gmail.readonly" in captured.err
+    assert "domain-wide delegation" in captured.err
+
+
+def test_poll_getprofile_non_403_error_omits_oauth_guidance(
+    mocker, capsys  # type: ignore[no-untyped-def]
+) -> None:
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=500)
+    service.users.return_value.getProfile.return_value.execute.side_effect = HttpError(
+        resp, b"server error"
+    )
+
+    with pytest.raises(HttpError):
+        poll_new_messages(service, "soc@example.com", since_history_id=None)
+
+    captured = capsys.readouterr()
+    assert "getProfile failed" in captured.err
+    assert "GMAIL_AUTH_MODE=oauth" not in captured.err
 
 
 def test_poll_deduplicates_message_ids_across_history_records(mocker) -> None:  # type: ignore[no-untyped-def]

@@ -20,6 +20,20 @@ class Config:
     gmail_credentials_path: str | None = None
     gmail_monitored_mailbox: str | None = None
     poll_interval_seconds: int = 300
+    # "service_account" (default, existing Workspace domain-wide-delegation path)
+    # or "oauth" (personal Gmail via triage/gmail_oauth.py). Validated lazily in
+    # triage/ingest.py's build_gmail_service, mirroring the deferral_threshold/
+    # retention_days pattern below -- load() is shared by the CLI and web
+    # dashboard, which never use it.
+    gmail_auth_mode: str = "service_account"
+    # Defaults match harvest_own_inbox.py's own _DEFAULT_CLIENT_SECRET_PATH/
+    # _DEFAULT_TOKEN_PATH literals (duplicated, not imported -- config.py is
+    # foundation-layer and cannot depend on triage/*, per project-context.md's
+    # import hierarchy). A maintainer who already did the one-time OAuth
+    # consent for harvest_own_inbox.py needs to set only GMAIL_AUTH_MODE=oauth
+    # to reuse that same cached token for live triage.
+    gmail_oauth_client_secret_path: str | None = None
+    gmail_oauth_token_path: str | None = None
     # [Review][Patch] Story 3.2's eval harness now exists (calibration_model_v1.json,
     # loaded/applied by triage/scoring.py), but this default is still a hardcoded
     # literal, not dynamically read from it -- config.py is a foundation-layer file
@@ -84,6 +98,13 @@ def load() -> Config:
         gmail_credentials_path=os.environ.get("GMAIL_SERVICE_ACCOUNT_KEY_PATH"),
         gmail_monitored_mailbox=os.environ.get("GMAIL_MONITORED_MAILBOX"),
         poll_interval_seconds=poll_interval,
+        gmail_auth_mode=os.environ.get("GMAIL_AUTH_MODE", "service_account"),
+        gmail_oauth_client_secret_path=os.environ.get(
+            "GMAIL_OAUTH_CLIENT_SECRET_PATH", "secrets/oauth-client.json"
+        ),
+        gmail_oauth_token_path=os.environ.get(
+            "GMAIL_OAUTH_TOKEN_PATH", "secrets/oauth-token.json"
+        ),
         deferral_threshold=deferral_threshold,
         evidence_encryption_key=os.environ.get("SENTINEL_EVIDENCE_KEY"),
         retention_days=retention_days,

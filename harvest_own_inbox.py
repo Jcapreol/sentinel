@@ -86,7 +86,7 @@ ONE-TIME SETUP (before first run)
 
 USAGE
 -----
-    pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+    pip install -e .  # installs the sentinel package this script now imports from
     python harvest_own_inbox.py --limit 100
 
 First run opens a browser for one-time consent. Run with --help for all
@@ -101,14 +101,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# Read-only. This script never modifies, sends, or deletes anything.
-_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+from sentinel.triage.gmail_oauth import get_credentials
 
 _DEFAULT_CLIENT_SECRET_PATH = Path("secrets/oauth-client.json")
 _DEFAULT_TOKEN_PATH = Path("secrets/oauth-token.json")
@@ -131,39 +127,6 @@ _HELD_OUT_MODULUS = 5
 
 def _split_for(content_hash_hex: str) -> str:
     return "held_out" if int(content_hash_hex, 16) % _HELD_OUT_MODULUS == 0 else "tuning"
-
-
-def get_credentials(client_secret_path: Path, token_path: Path) -> Credentials:
-    """Standard Google OAuth "installed app" flow: opens a browser for
-    one-time consent, caches the resulting token so future runs don't
-    need to re-prompt. This is the normal, documented way for a script to
-    read a PERSONAL Gmail account (distinct from the service-account +
-    domain-wide-delegation flow Sentinel's production ingest.py uses,
-    which requires a Google Workspace admin -- not available for a
-    personal @gmail.com account).
-    """
-    creds: Credentials | None = None
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), _SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not client_secret_path.exists():
-                print(
-                    f"Missing OAuth client file at {client_secret_path}. "
-                    "See the ONE-TIME SETUP section in this script's docstring.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), _SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(creds.to_json())
-
-    return creds
 
 
 def build_gmail_service(client_secret_path: Path, token_path: Path) -> Any:

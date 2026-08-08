@@ -1,11 +1,22 @@
 # Gmail Mailbox Setup
 
-Sentinel's autonomous phishing triage ingests mail from a single Google
-Workspace mailbox via a service account with domain-wide delegation, scoped
-to read-only access and delegated to exactly one mailbox. This document
-covers how to provision that access.
+Sentinel's autonomous phishing triage ingests mail from a single Gmail
+mailbox. Two auth modes are supported, selected via the `GMAIL_AUTH_MODE`
+environment variable:
 
-## Legal boundary (customer responsibility)
+- **`service_account`** (default) — a Google Workspace service account with
+  domain-wide delegation, scoped to read-only access and delegated to
+  exactly one mailbox. Requires a Workspace admin. Covered in
+  [Google Workspace (service account)](#google-workspace-service-account)
+  below.
+- **`oauth`** — standard per-user OAuth consent against a personal
+  `@gmail.com` inbox. No Workspace admin required. Intended for live/manual
+  testing, not production deployment. Covered in
+  [Personal Gmail (OAuth)](#personal-gmail-oauth) below.
+
+## Google Workspace (service account)
+
+### Legal boundary (customer responsibility)
 
 > **Legal boundary (customer responsibility):** Establishing the legal right
 > to monitor the connected mailbox — employer policy, jurisdictional
@@ -18,7 +29,7 @@ covers how to provision that access.
 Do not connect a mailbox until your organization has confirmed it has the
 legal right to monitor it.
 
-## 1. Create a GCP service account
+### 1. Create a GCP service account
 
 1. In the [Google Cloud Console](https://console.cloud.google.com/), select
    (or create) the project that will own this service account.
@@ -31,7 +42,7 @@ legal right to monitor it.
 5. Note the service account's **Client ID** (also on the service account's
    detail page) — you'll need it for domain-wide delegation scoping below.
 
-## 2. Enable domain-wide delegation
+### 2. Enable domain-wide delegation
 
 1. On the service account's detail page, under **Advanced settings**, enable
    **Domain-wide delegation**.
@@ -45,7 +56,7 @@ legal right to monitor it.
    (`gmail.modify`, `gmail.metadata`, etc.) — Sentinel never needs to
    modify, send, or delete mail.
 
-## 3. Delegate to exactly one mailbox
+### 3. Delegate to exactly one mailbox
 
 Domain-wide delegation grants the service account the *ability* to
 impersonate any mailbox in the domain via `gmail.readonly` — but Sentinel
@@ -57,7 +68,7 @@ is ever accessed by Sentinel's code.
 Choose (or create) a dedicated mailbox for triage — e.g.
 `soc-triage@yourcompany.com` — rather than an individual's personal inbox.
 
-## 4. Store the key and configure environment variables
+### 4. Store the key and configure environment variables
 
 Place the downloaded JSON key at:
 
@@ -81,7 +92,66 @@ If either `GMAIL_SERVICE_ACCOUNT_KEY_PATH` or `GMAIL_MONITORED_MAILBOX` is
 missing or invalid, Sentinel fails fast with a clear error before
 attempting any poll — it will not start in a partially-configured state.
 
-## 5. Running continuously
+## Personal Gmail (OAuth)
+
+Intended for live/manual end-to-end testing against your own inbox when no
+Google Workspace admin account is available (e.g. a bare `@gmail.com`
+account, which cannot use domain-wide delegation at all). Not intended for
+production deployment — a personal OAuth grant is tied to one individual's
+consent, not an organization-managed service account.
+
+This reuses the exact same OAuth client setup, token storage/refresh logic,
+and `gmail.readonly` scope as `harvest_own_inbox.py` (the script used to
+harvest calibration-corpus data from your own inbox) — both go through
+`src/sentinel/triage/gmail_oauth.py`'s `get_credentials`, so if you've
+already done the one-time consent for that script, live triage can reuse
+the same cached token with zero extra setup.
+
+### 1. One-time setup (skip if already done for `harvest_own_inbox.py`)
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), select
+   (or create) a project.
+2. Enable the **Gmail API** for that project (**APIs & Services → Library**).
+3. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
+   Application type: **Desktop app**. Download the resulting JSON.
+4. Save it as `secrets/oauth-client.json` in this project directory
+   (`secrets/` is already gitignored — verify with
+   `git check-ignore secrets/oauth-client.json`).
+
+### 2. Configure environment variables
+
+Set these in `.env`:
+
+| Variable | Required | Description |
+|---|---|---|
+| `GMAIL_AUTH_MODE` | Yes | Set to `oauth` to use this path instead of the default `service_account`. |
+| `GMAIL_MONITORED_MAILBOX` | Yes | The Gmail address the OAuth consent belongs to. The literal value `me` also works — it's the Gmail API's own special value for "the authenticated account" and is the simplest choice for a personal inbox. |
+| `GMAIL_OAUTH_CLIENT_SECRET_PATH` | No | Path to the downloaded OAuth client JSON. Defaults to `secrets/oauth-client.json`. |
+| `GMAIL_OAUTH_TOKEN_PATH` | No | Where the cached token is read from/written to after consent. Defaults to `secrets/oauth-token.json`. |
+
+The first `sentinel-triage` run in `oauth` mode opens a browser for one-time
+consent (approve read-only Gmail access for your own account) and caches
+the resulting token — subsequent runs reuse it silently, refreshing it
+automatically once it expires.
+
+### 3. Insufficient-scope failures fail loudly
+
+A cached token can appear valid (not expired) while never having actually
+been granted `gmail.readonly` access — this can happen if an existing
+`secrets/oauth-token.json` was produced by a different consent flow, or if
+the Google Cloud project's OAuth consent screen isn't configured with the
+`gmail.readonly` scope. This isn't detectable locally from the token file
+alone — a live Gmail API call is the only reliable signal. Rather than
+adding a separate check-only API call (which would repeat, redundantly,
+every poll cycle), Sentinel relies on the `getProfile` call polling already
+makes at the start of every cycle: a resulting 403 is caught and reported
+with a clear, scope-specific message before the underlying error
+propagates and the worker exits non-zero — a loud, unambiguous failure,
+not a silent continue. If you hit this: delete the cached token file and
+re-run to re-authorize, and confirm the Cloud project's OAuth consent
+screen includes the `gmail.readonly` scope.
+
+## Running continuously
 
 Running `sentinel-triage` with no flags is the default mode: it polls every
 `SENTINEL_POLL_INTERVAL` seconds (default 300 / 5 minutes) until stopped.
