@@ -107,6 +107,64 @@ def test_gmail_fields_and_poll_interval_parsed_when_set(
     assert config.poll_interval_seconds == 60
 
 
+def test_gmail_auth_mode_defaults_to_service_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.delenv("GMAIL_AUTH_MODE", raising=False)
+
+    config = load()
+
+    assert config.gmail_auth_mode == "service_account"
+
+
+def test_gmail_auth_mode_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.setenv("GMAIL_AUTH_MODE", "oauth")
+
+    config = load()
+
+    assert config.gmail_auth_mode == "oauth"
+
+
+def test_gmail_oauth_paths_default_to_harvest_own_inbox_conventions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defaults match harvest_own_inbox.py's own _DEFAULT_CLIENT_SECRET_PATH/
+    _DEFAULT_TOKEN_PATH literals -- a maintainer who already did the one-time
+    OAuth consent for that script needs to set only GMAIL_AUTH_MODE=oauth to
+    reuse the same cached token for live triage."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.delenv("GMAIL_OAUTH_CLIENT_SECRET_PATH", raising=False)
+    monkeypatch.delenv("GMAIL_OAUTH_TOKEN_PATH", raising=False)
+
+    config = load()
+
+    assert config.gmail_oauth_client_secret_path == "secrets/oauth-client.json"
+    assert config.gmail_oauth_token_path == "secrets/oauth-token.json"
+
+
+def test_gmail_oauth_paths_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.setenv("GMAIL_OAUTH_CLIENT_SECRET_PATH", "secrets/my-client.json")
+    monkeypatch.setenv("GMAIL_OAUTH_TOKEN_PATH", "secrets/my-token.json")
+
+    config = load()
+
+    assert config.gmail_oauth_client_secret_path == "secrets/my-client.json"
+    assert config.gmail_oauth_token_path == "secrets/my-token.json"
+
+
 def test_eval_corpus_path_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
     monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")

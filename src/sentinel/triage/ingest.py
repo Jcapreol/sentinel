@@ -28,6 +28,7 @@ import sys
 import time
 from email.header import decode_header
 from email.message import Message
+from pathlib import Path
 from typing import Any
 
 from google.oauth2 import service_account
@@ -35,8 +36,10 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from sentinel.config import Config, ConfigError
+from sentinel.triage.gmail_oauth import get_credentials
 
 _GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+_VALID_AUTH_MODES = {"service_account", "oauth"}
 
 # The receiving MTA hostname whose Authentication-Results header this module
 # trusts. A message can carry multiple Authentication-Results headers (one per
@@ -61,6 +64,17 @@ class FetchFailed:
 
 
 def build_gmail_service(config: Config) -> Any:
+    if config.gmail_auth_mode not in _VALID_AUTH_MODES:
+        raise ConfigError(
+            f"Invalid GMAIL_AUTH_MODE {config.gmail_auth_mode!r}: must be "
+            "'service_account' or 'oauth'"
+        )
+    if config.gmail_auth_mode == "oauth":
+        return _build_gmail_service_oauth(config)
+    return _build_gmail_service_service_account(config)
+
+
+def _build_gmail_service_service_account(config: Config) -> Any:
     if not config.gmail_credentials_path:
         raise ConfigError(
             "Missing required environment variable: GMAIL_SERVICE_ACCOUNT_KEY_PATH"
@@ -81,6 +95,51 @@ def build_gmail_service(config: Config) -> Any:
             f"{config.gmail_credentials_path!r}: {e}"
         ) from e
 
+    return build("gmail", "v1", credentials=credentials, cache_discovery=False)
+
+
+def _build_gmail_service_oauth(config: Config) -> Any:
+    if not config.gmail_oauth_client_secret_path:
+        raise ConfigError(
+            "Missing required environment variable: GMAIL_OAUTH_CLIENT_SECRET_PATH"
+        )
+    if not config.gmail_oauth_token_path:
+        raise ConfigError(
+            "Missing required environment variable: GMAIL_OAUTH_TOKEN_PATH"
+        )
+    if not config.gmail_monitored_mailbox:
+        raise ConfigError(
+            "Missing required environment variable: GMAIL_MONITORED_MAILBOX "
+            "(for GMAIL_AUTH_MODE=oauth, set this to your Gmail address or "
+            "the literal value 'me')"
+        )
+
+    client_secret_path = Path(config.gmail_oauth_client_secret_path)
+    token_path = Path(config.gmail_oauth_token_path)
+    if not client_secret_path.exists():
+        raise ConfigError(
+            f"Missing OAuth client file at {client_secret_path}. "
+            "See docs/gmail-setup.md's Personal Gmail (OAuth) section."
+        )
+
+    try:
+        credentials = get_credentials(client_secret_path, token_path)
+    except Exception as e:
+        raise ConfigError(
+            f"Failed to load Gmail OAuth credentials from {token_path!r}: {e}"
+        ) from e
+
+    # No eager scope-verification call here: build_gmail_service is called
+    # fresh every poll cycle (worker.py's run_poll_cycle), and its sole
+    # caller always immediately calls poll_new_messages, whose own first
+    # action is already a getProfile() call (via _execute_with_retry) --
+    # a separate probe here would be a redundant real API call every single
+    # cycle. An insufficient-gmail.readonly-scope grant (this function
+    # cannot detect it locally -- see poll_new_messages) surfaces as a 403
+    # on that first real call instead, with a scope-aware message covering
+    # both auth modes (see poll_new_messages's HttpError handling) -- still
+    # a loud, clear failure, at the point where it's naturally detectable
+    # for free.
     return build("gmail", "v1", credentials=credentials, cache_discovery=False)
 
 
@@ -118,11 +177,25 @@ def poll_new_messages(
     try:
         profile = _execute_with_retry(service.users().getProfile(userId=mailbox))
     except HttpError as e:
-        print(
-            f"[ingest] getProfile failed for mailbox {mailbox!r}: {e}. Check that "
-            "gmail.readonly domain-wide delegation is configured for this mailbox.",
-            file=sys.stderr,
-        )
+        status = getattr(getattr(e, "resp", None), "status", None)
+        if status == 403:
+            print(
+                f"[ingest] getProfile failed for mailbox {mailbox!r} with 403 "
+                f"(insufficient permissions): {e}. If GMAIL_AUTH_MODE=oauth, the "
+                "cached OAuth token may not actually grant gmail.readonly -- "
+                "delete the cached token and re-run to re-authorize (see "
+                "docs/gmail-setup.md's Personal Gmail (OAuth) section). If using "
+                "the default service_account mode, check that gmail.readonly "
+                "domain-wide delegation is configured for this mailbox.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[ingest] getProfile failed for mailbox {mailbox!r}: {e}. Check "
+                "that gmail.readonly domain-wide delegation is configured for "
+                "this mailbox.",
+                file=sys.stderr,
+            )
         raise
     current_history_id = str(profile["historyId"])
 
