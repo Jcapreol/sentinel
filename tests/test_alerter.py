@@ -2,8 +2,16 @@ from dataclasses import replace
 
 import pytest
 
-from sentinel.alerter import AlertPayload, EmailAlerter, send_alert, send_test_alert
+from sentinel.alerter import (
+    SELF_ALERT_HEADER_NAME,
+    SELF_ALERT_HEADER_VALUE,
+    AlertPayload,
+    EmailAlerter,
+    send_alert,
+    send_test_alert,
+)
 from sentinel.config import Config
+from sentinel.triage.ingest import extract_header_value
 
 
 def _configured(fake_config: Config) -> Config:
@@ -136,6 +144,60 @@ def test_email_alerter_message_body_includes_all_payload_fields(
     assert "phisher@evil.example" in body
     assert "Password reset required" in body
     assert "[malicious] Suspicious login URL requesting credentials" in body
+
+
+def test_email_alerter_stamps_self_alert_marker_header(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Story 5.2.1] Every alert email must carry a distinguishing header so
+    worker.py can recognize and skip its own alerts landing back in the
+    monitored inbox (AC1) -- without this, an alert email is indistinguishable
+    from a real inbound message and the next poll cycle re-triages it,
+    scores it Malicious (its own body says so), and re-alerts forever."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = EmailAlerter(
+        host="smtp.gmail.com",
+        port=587,
+        username="me@gmail.com",
+        password="app-password",
+        recipient="alerts@example.com",
+    )
+
+    alerter.send(_payload())
+
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    assert sent_message[SELF_ALERT_HEADER_NAME] == SELF_ALERT_HEADER_VALUE
+
+
+def test_self_alert_marker_survives_send_to_parse_round_trip(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Review] The two ends of the loop-closing guarantee were previously
+    only proven correct in isolation: this test's sibling above asserts on
+    the in-memory EmailMessage object EmailAlerter builds, while worker.py's
+    self-alert tests hand-author raw bytes with the header pre-baked in.
+    Neither proves the header actually survives real MIME serialization and
+    re-parsing. This wires the two ends together: the exact EmailMessage
+    object EmailAlerter.send() constructs, serialized via .as_bytes() (real
+    MIME encoding, not a shortcut), then read back via
+    ingest.extract_header_value -- the exact function worker.py's self-alert
+    check calls on real inbound raw bytes."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = EmailAlerter(
+        host="smtp.gmail.com",
+        port=587,
+        username="me@gmail.com",
+        password="app-password",
+        recipient="alerts@example.com",
+    )
+
+    alerter.send(_payload())
+
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    raw_bytes = sent_message.as_bytes()
+    assert extract_header_value(raw_bytes, SELF_ALERT_HEADER_NAME) == SELF_ALERT_HEADER_VALUE
 
 
 def test_email_alerter_omits_subject_line_when_none(

@@ -15,11 +15,19 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.utils import parseaddr
 from pathlib import Path
 from types import FrameType
 from typing import Literal
 
-from sentinel.alerter import AlertPayload, send_alert, send_test_alert
+from sentinel.alerter import (
+    SELF_ALERT_HEADER_NAME,
+    SELF_ALERT_HEADER_VALUE,
+    SELF_ALERT_SUBJECT_PREFIX,
+    AlertPayload,
+    send_alert,
+    send_test_alert,
+)
 from sentinel.cipher import CipherAgent
 from sentinel.config import Config, ConfigError
 from sentinel.config import load as load_config
@@ -29,7 +37,9 @@ from sentinel.triage.ingest import (
     FetchFailed,
     build_gmail_service,
     extract_email_content,
+    extract_header_value,
     extract_sender_and_content_hash,
+    fetch_headers_by_name,
     fetch_headers_for_messages,
     fetch_raw_message_bytes,
     poll_new_messages,
@@ -344,6 +354,62 @@ def _truncate(text: str, max_len: int) -> str:
     return text[: max_len - 1] + "…"
 
 
+def _is_self_alert(
+    marker_value: str | None, sender: str | None, subject: str | None, config: Config
+) -> bool:
+    """[Story 5.2.1] True if this inbound message is Sentinel's own alert
+    email landing back in the monitored mailbox -- without this check, an
+    alert is indistinguishable from a real inbound message: its own body
+    says "Malicious", so the next poll would triage and score it Malicious,
+    fire another alert, and loop forever (the exact incident that muted
+    alerting in production -- see this story's Context).
+
+    [Review] The marker header ALONE is deliberately never sufficient, even
+    though AC1/AC2 describe it as "the primary marker" -- it is parsed
+    straight out of attacker-controlled inbound bytes. A real phishing
+    email that simply copies the (public, guessable) header name and value
+    would otherwise get a silent, complete bypass of triage -- a strictly
+    worse outcome than the feedback loop this story exists to close, since
+    it defeats detection instead of merely mis-firing a notification. Every
+    self-alert this instance could genuinely have sent was sent FROM
+    config.alert_smtp_username (EmailAlerter.send always sets the SMTP
+    "From" to exactly that account) -- so requiring the inbound sender to
+    match that same account, for BOTH the header check and the AC3
+    sender+subject fallback, closes the forgery hole while changing nothing
+    about the guarantee that matters: an alert this instance actually sent
+    is always recognized, because its sender always matches by
+    construction. It also fails safe when alerting was never configured
+    (config.alert_smtp_username is None) -- with no configured sending
+    account, this instance could never have produced a genuine self-alert,
+    so nothing is skipped on sender grounds alone.
+
+    Primary marker (AC1/AC2): the header EmailAlerter stamps on every alert
+    it sends, required together with the sender match above.
+
+    Secondary guard (AC3): belt-and-suspenders fallback for the rare case a
+    mail path strips custom headers. Requires the subject to ALSO start
+    with the exact prefix EmailAlerter uses, on top of the same sender
+    match -- subject alone is far too broad: a normal email merely
+    mentioning "alert" in its subject must still be triaged (AC5).
+
+    parseaddr normalizes a "Display Name <addr>" From header down to its
+    bare address before comparing -- a real self-sent Gmail message commonly
+    carries a display name that config.alert_smtp_username (a bare address)
+    will never contain.
+    """
+    if config.alert_smtp_username is None or sender is None:
+        return False
+    _, sender_address = parseaddr(sender)
+    _, configured_address = parseaddr(config.alert_smtp_username)
+    if not sender_address or not configured_address:
+        return False
+    if sender_address.lower() != configured_address.lower():
+        return False
+    if marker_value == SELF_ALERT_HEADER_VALUE:
+        return True
+    return subject is not None and subject.startswith(SELF_ALERT_SUBJECT_PREFIX)
+
+
 def _maybe_dispatch_alert(
     config: Config, report: TriageReport, sender: str | None, subject: str | None
 ) -> None:
@@ -466,6 +532,35 @@ def run_poll_cycle(
                 )
                 sender = None
                 subject = None  # no email content was ever fetched on this path
+
+                # [Story 5.2.1] Without raw bytes, the marker can't be read
+                # from content already in hand (there is none) -- a second,
+                # independent metadata-only fetch recovers it, so a
+                # self-alert whose raw-content fetch happened to fail isn't
+                # misclassified as an ordinary coverage-gap message and
+                # re-alerted on (which would reopen exactly the loop this
+                # story exists to close). fetch_headers_by_name never
+                # raises: if this ALSO fails, marker/sender stay None and
+                # _is_self_alert correctly falls through to the existing
+                # coverage-gap behavior below, unchanged from before this
+                # story.
+                fallback_headers = fetch_headers_by_name(
+                    service, mailbox, message_id, [SELF_ALERT_HEADER_NAME, "From"]
+                )
+                if _is_self_alert(
+                    fallback_headers[SELF_ALERT_HEADER_NAME],
+                    fallback_headers["From"],
+                    None,
+                    config,
+                ):
+                    print(
+                        f"[worker] Skipping self-generated alert message {message_id!r} "
+                        "(recognized via fallback header fetch after its raw-content "
+                        "fetch failed) — not persisted",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 # Deliberate, narrow exception to "message_hash is always a content
                 # hash" (Story 1.5's invariant) — we never got the content to hash,
                 # so we fall back to an ID-based hash. Named explicitly in the
@@ -491,6 +586,25 @@ def run_poll_cycle(
                 sender, content_hash = extract_sender_and_content_hash(raw_bytes)
                 email_content = extract_email_content(raw_bytes)
                 subject = _extract_subject_line(email_content)
+
+                # [Story 5.2.1] Checked here, before process_message is ever
+                # called and before this message reaches persist_evidence_
+                # record below -- a self-alert must be neither triaged,
+                # scored, nor persisted (AC2). continue (from inside this
+                # try) skips both except and else, exactly like the
+                # is_message_processed skip above: not a failure, not a
+                # persisted success, just correctly ignored. The checkpoint
+                # still advances past it normally, so it is never revisited.
+                marker_value = extract_header_value(raw_bytes, SELF_ALERT_HEADER_NAME)
+                if _is_self_alert(marker_value, sender, subject, config):
+                    print(
+                        f"[worker] Skipping self-generated alert message {message_id!r} "
+                        f"(sender={sender!r}, subject={subject!r}) — Sentinel's own "
+                        "alert email, not triaged, not persisted",
+                        file=sys.stderr,
+                    )
+                    continue
+
                 report = process_message(
                     message_id, auth_results_header, email_content, watchman, cipher, config
                 )
