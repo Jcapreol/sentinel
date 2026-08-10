@@ -25,6 +25,7 @@ from sentinel.triage.worker import (
     process_message,
     run_continuous_loop,
     run_poll_cycle,
+    run_view,
 )
 from sentinel.verdict import AgentResult, SentinelAgent
 
@@ -1440,6 +1441,80 @@ def test_once_calls_run_poll_cycle_and_exits_zero(
     assert exc.value.code == 0
 
 
+def test_once_without_db_path_falls_back_to_config_evidence_db_path(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    """[Review] --db-path previously defaulted to a separate CWD-relative
+    literal, independent of config.evidence_db_path -- the two only
+    coincided by accident of launch directory. Both reviewers flagged
+    this as the same silent-path-divergence bug class AC2 exists to
+    prevent, just reintroduced between --view and every other mode.
+    Fixed: all modes now share the same absolute, config-resolved
+    fallback when --db-path is omitted."""
+    mocker.patch("sys.argv", ["sentinel-triage", "--once"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert spy.call_args.args[1] == store_config.evidence_db_path
+
+
+def test_default_continuous_mode_without_db_path_falls_back_to_config_evidence_db_path(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_continuous_loop")
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert spy.call_args.args[1] == store_config.evidence_db_path
+
+
+def test_replay_without_db_path_falls_back_to_config_evidence_db_path(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    # _run_replay always sys.exit()s for real (never returns normally) --
+    # mocked here, it does neither, so _run()'s own `return` after calling
+    # it is what actually ends this call, with no SystemExit to catch.
+    mocker.patch("sys.argv", ["sentinel-triage", "--replay", "somehash"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker._run_replay")
+
+    main()
+
+    assert spy.call_args.args[1] == store_config.evidence_db_path
+
+
+def test_relative_evidence_db_path_exits_nonzero_with_clear_error(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC2: evidence_db_path must never be a bare CWD-relative path. If
+    SENTINEL_EVIDENCE_DB_PATH is set to a relative value, that must fail
+    loudly at dispatch time, not silently resolve against whatever CWD
+    happens to be active (both reviewers reproduced this as a real gap
+    in the SENTINEL_EVIDENCE_DB_PATH override path specifically)."""
+    relative_config = replace(store_config, evidence_db_path="data/evidence.db")
+    mocker.patch("sys.argv", ["sentinel-triage", "--once"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=relative_config)
+    spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+    spy.assert_not_called()
+    assert "absolute" in capsys.readouterr().err.lower()
+
+
 def test_replay_and_once_together_exits_nonzero_with_usage_error(
     mocker,  # type: ignore[no-untyped-def]
     store_config: Config,
@@ -1484,6 +1559,298 @@ def test_config_error_exits_nonzero_before_dispatch(
     spy.assert_not_called()
     captured = capsys.readouterr()
     assert "ANTHROPIC_API_KEY" in captured.err
+
+
+# --- --view CLI dispatch ------------------------------------------------------
+
+
+def test_view_flag_calls_run_view_with_defaults_and_exits_zero(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage", "--view"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_view")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    spy.assert_called_once_with(store_config, store_config.evidence_db_path, 20, None)
+    assert exc.value.code == 0
+
+
+def test_view_with_limit_and_verdict_options_passes_them_through(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    mocker.patch(
+        "sys.argv", ["sentinel-triage", "--view", "--limit", "5", "--verdict", "Deferred"]
+    )
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_view")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    spy.assert_called_once_with(store_config, store_config.evidence_db_path, 5, "Deferred")
+    assert exc.value.code == 0
+
+
+def test_view_respects_explicit_db_path_override(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    store_db_path: str,
+) -> None:
+    """[Review] --db-path was previously silently ignored by --view --
+    documented as a top-level flag with no indication it was a no-op
+    under this mode. Fixed: --view now honors an explicit --db-path the
+    same as every other mode."""
+    mocker.patch("sys.argv", ["sentinel-triage", "--view", "--db-path", store_db_path])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_view")
+
+    with pytest.raises(SystemExit):
+        main()
+
+    spy.assert_called_once_with(store_config, store_db_path, 20, None)
+
+
+def test_verdict_invalid_choice_exits_nonzero_with_usage_error(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Review] --verdict was an unvalidated free-text string -- a typo'd
+    or wrong-case value silently produced zero results, indistinguishable
+    from a correctly-spelled filter with genuinely no matches. Fixed via
+    argparse choices=, giving a clear usage error instead."""
+    mocker.patch("sys.argv", ["sentinel-triage", "--view", "--verdict", "malicious"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_view")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+    spy.assert_not_called()
+    assert "invalid choice" in capsys.readouterr().err.lower()
+
+
+def test_view_and_replay_together_exits_nonzero_with_usage_error(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage", "--view", "--replay", "somehash"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    view_spy = mocker.patch("sentinel.triage.worker.run_view")
+    replay_spy = mocker.patch("sentinel.triage.worker._run_replay")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+    view_spy.assert_not_called()
+    replay_spy.assert_not_called()
+    assert capsys.readouterr().err != ""
+
+
+def test_view_and_once_together_exits_nonzero_with_usage_error(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage", "--view", "--once"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    view_spy = mocker.patch("sentinel.triage.worker.run_view")
+    once_spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+    view_spy.assert_not_called()
+    once_spy.assert_not_called()
+    assert capsys.readouterr().err != ""
+
+
+def test_help_lists_view_limit_and_verdict_options(
+    mocker,  # type: ignore[no-untyped-def]
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1: --view must be discoverable via --help."""
+    mocker.patch("sys.argv", ["sentinel-triage", "--help"])
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "--view" in out
+    assert "--limit" in out
+    assert "--verdict" in out
+
+
+# --- run_view -------------------------------------------------------------------
+
+
+def _persist(
+    db_path: str,
+    config: Config,
+    message_hash: str,
+    verdict: str = "Malicious",
+    sender: str | None = "alice@example.com",
+    evidence: list[EvidenceItem] | None = None,
+    timestamp: str = "2026-08-09T00:00:00+00:00",
+) -> None:
+    report = _make_report(verdict=verdict, evidence=evidence, timestamp=timestamp)
+    record = EvidenceRecord(
+        message_id=message_hash,
+        sender=sender,
+        report=report,
+        deferral_threshold_used=config.deferral_threshold,
+    )
+    persist_evidence_record(db_path, message_hash, record, config)
+
+
+def test_run_view_renders_table_with_required_columns(
+    store_db_path: str,
+    store_config: Config,
+    make_evidence_item,  # type: ignore[no-untyped-def]
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(
+        store_db_path,
+        config,
+        "hash1",
+        verdict="Malicious",
+        sender="phisher@evil.example",
+        evidence=[
+            make_evidence_item(
+                name="watchman_finding",
+                finding="Suspicious login URL requesting credentials",
+                weight=0.7,
+                direction="malicious",
+            )
+        ],
+        timestamp="2026-08-09T12:00:00+00:00",
+    )
+
+    run_view(config, store_db_path, 20, None)
+
+    err = capsys.readouterr().err
+    assert "2026-08-09T12:00:00" in err
+    assert "phisher@evil.example" in err
+    assert "Malicious" in err
+    assert "Suspicious login URL" in err
+    assert "1 shown, 0 skipped" in err
+
+
+def test_run_view_empty_database_prints_clean_message_not_error(
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(store_db_path, config, "temp-hash")
+    import sqlite3
+
+    conn = sqlite3.connect(store_db_path)
+    conn.execute("DELETE FROM evidence_records")
+    conn.commit()
+    conn.close()
+
+    run_view(config, store_db_path, 20, None)
+
+    err = capsys.readouterr().err
+    assert "no" in err.lower() or "0 shown" in err
+    assert "0 shown, 0 skipped" in err
+
+
+def test_run_view_missing_database_file_prints_clean_message_not_traceback(
+    tmp_path: Path,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing_path = str(tmp_path / "never-created.db")
+    config = replace(store_config, evidence_db_path=missing_path)
+
+    run_view(config, missing_path, 20, None)
+
+    err = capsys.readouterr().err
+    assert "no evidence database" in err.lower()
+
+
+def test_run_view_undecryptable_record_skipped_and_reported(
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from cryptography.fernet import Fernet
+
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(store_db_path, config, "hash-good")
+    other_key_config = replace(config, evidence_encryption_key=Fernet.generate_key().decode())
+    _persist(store_db_path, other_key_config, "hash-bad-key")
+
+    run_view(config, store_db_path, 20, None)
+
+    err = capsys.readouterr().err
+    assert "1 shown, 1 skipped" in err
+
+
+def test_run_view_verdict_filter_shows_only_matching(
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(store_db_path, config, "hash-malicious", verdict="Malicious", sender="a@example.com")
+    _persist(store_db_path, config, "hash-benign", verdict="Benign", sender="b@example.com")
+
+    run_view(config, store_db_path, 20, "Benign")
+
+    err = capsys.readouterr().err
+    assert "b@example.com" in err
+    assert "a@example.com" not in err
+    assert "1 shown, 0 skipped" in err
+
+
+def test_run_view_respects_limit_showing_most_recent_first(
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(store_db_path, config, "hash-a", sender="a@example.com")
+    _persist(store_db_path, config, "hash-b", sender="b@example.com")
+    _persist(store_db_path, config, "hash-c", sender="c@example.com")
+    import sqlite3
+
+    conn = sqlite3.connect(store_db_path)
+    conn.execute(
+        "UPDATE evidence_records SET created_at = ? WHERE message_hash = ?",
+        ("2026-01-01T00:00:00+00:00", "hash-a"),
+    )
+    conn.execute(
+        "UPDATE evidence_records SET created_at = ? WHERE message_hash = ?",
+        ("2026-01-02T00:00:00+00:00", "hash-b"),
+    )
+    conn.execute(
+        "UPDATE evidence_records SET created_at = ? WHERE message_hash = ?",
+        ("2026-01-03T00:00:00+00:00", "hash-c"),
+    )
+    conn.commit()
+    conn.close()
+
+    run_view(config, store_db_path, 2, None)
+
+    err = capsys.readouterr().err
+    assert "c@example.com" in err
+    assert "b@example.com" in err
+    assert "a@example.com" not in err
+    assert "2 shown, 0 skipped" in err
 
 
 # --- structural / boundary checks --------------------------------------------

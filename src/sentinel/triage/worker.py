@@ -1,17 +1,20 @@
 """Single-message triage pipeline (investigate -> score -> verdict -> report)
-plus the sentinel-triage CLI entry point and its three modes: the default
-continuous poll loop (run_continuous_loop), --once (one poll cycle), and
---replay <message_hash> (audit a stored verdict).
+plus the sentinel-triage CLI entry point and its four modes: the default
+continuous poll loop (run_continuous_loop), --once (one poll cycle),
+--replay <message_hash> (audit a stored verdict), and --view (read-only
+recent-verdicts table, Story 5.1).
 """
 
 import argparse
 import hashlib
 import math
 import signal
+import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from types import FrameType
 from typing import Literal
 
@@ -44,12 +47,11 @@ from sentinel.triage.store import (
     persist_evidence_record,
     purge_expired,
     read_evidence_record,
+    read_recent_evidence_records,
     save_history_checkpoint,
 )
 from sentinel.verdict import SentinelAgent
 from sentinel.watchman import WatchmanAgent
-
-_DEFAULT_DB_PATH = "data/evidence.db"
 
 
 def _require_valid_deferral_threshold(config: Config) -> None:
@@ -576,6 +578,88 @@ def _run_replay(message_hash: str, db_path: str, config: Config) -> None:
     sys.exit(0)
 
 
+_VIEW_FINDING_MAX_LEN = 50
+
+
+def _format_finding_summary(evidence: list[EvidenceItem]) -> str:
+    """Short summary of a record's most notable finding for the --view
+    table (AC3) -- the highest-weight directional (malicious/benign)
+    finding, truncated, with a "(+N more)" suffix if there are others.
+    Neutral (coverage-gap/no-signal) items are excluded: they're never the
+    interesting part of a row at a glance."""
+    directional = [item for item in evidence if item["direction"] != "neutral"]
+    if not directional:
+        return "(no directional findings)"
+    directional.sort(key=lambda item: item["weight"], reverse=True)
+    top = directional[0]
+    finding_text = top["finding"]
+    if len(finding_text) > _VIEW_FINDING_MAX_LEN:
+        finding_text = finding_text[: _VIEW_FINDING_MAX_LEN - 1] + "…"
+    summary = f"[{top['direction']}] {finding_text}"
+    if len(directional) > 1:
+        summary += f" (+{len(directional) - 1} more)"
+    return summary
+
+
+def _format_view_table(records: list[tuple[str, EvidenceRecord]]) -> str:
+    header = f"{'TIMESTAMP':<26} {'SENDER':<30} {'VERDICT':<10} {'CONF':>6}  TOP FINDING"
+    lines = [header, "-" * len(header)]
+    for _message_hash, record in records:
+        report = record["report"]
+        sender = (record["sender"] or "(unknown sender)")[:30]
+        timestamp = report["timestamp"][:25]
+        verdict = report["verdict"]
+        confidence = f"{report['calibrated_confidence']:.3f}"
+        finding_summary = _format_finding_summary(report["evidence"])
+        lines.append(
+            f"{timestamp:<26} {sender:<30} {verdict:<10} {confidence:>6}  {finding_summary}"
+        )
+    return "\n".join(lines)
+
+
+def run_view(config: Config, db_path: str, limit: int, verdict_filter: str | None) -> None:
+    """Story 5.1: read-only recent-verdicts table. Never writes to stdout
+    (project-context.md's stdout rule reserves it for _run_replay alone) --
+    everything here goes to stderr, matching run_poll_cycle/
+    run_continuous_loop's existing human-readable-operational-output
+    convention. Never raises on a missing, locked, or
+    record-level-unusable database -- all are reported as a clean
+    message, per AC4/AC5's "must never crash" requirement. db_path is
+    caller-resolved (see _run) rather than read off config directly here,
+    matching every other mode's existing (config, db_path, ...) calling
+    convention."""
+    try:
+        records, skipped = read_recent_evidence_records(db_path, config)
+    except sqlite3.OperationalError as exc:
+        # [Review] Distinguish "no file yet" from "file exists but the
+        # connection still failed" (locked by a concurrently-running
+        # sentinel-triage process, permission denied, corrupt file) --
+        # both raise the identical sqlite3.OperationalError, and
+        # conflating them under one "doesn't exist yet" message would
+        # actively misdirect an operator debugging a transient lock.
+        if not Path(db_path).exists():
+            print(f"sentinel-triage: no evidence database found at {db_path!r} yet.", file=sys.stderr)
+        else:
+            print(
+                f"sentinel-triage: could not open evidence database at {db_path!r}: {exc}",
+                file=sys.stderr,
+            )
+        return
+
+    if verdict_filter is not None:
+        records = [r for r in records if r[1]["report"]["verdict"] == verdict_filter]
+    shown = records[: max(limit, 0)]
+
+    if shown:
+        print(_format_view_table(shown), file=sys.stderr)
+    elif limit <= 0:
+        print(f"No records shown (--limit {limit}).", file=sys.stderr)
+    else:
+        print("No evidence records found.", file=sys.stderr)
+
+    print(f"{len(shown)} shown, {skipped} skipped (undecryptable)", file=sys.stderr)
+
+
 def main() -> None:
     try:
         _run()
@@ -603,8 +687,28 @@ def _run() -> None:
     mode_group.add_argument(
         "--once", action="store_true", help="Perform exactly one poll cycle and exit"
     )
+    mode_group.add_argument(
+        "--view",
+        action="store_true",
+        help="Display recent triage verdicts as a read-only table and exit",
+    )
     parser.add_argument(
-        "--db-path", default=_DEFAULT_DB_PATH, help="Path to the evidence store SQLite file"
+        "--db-path",
+        default=None,
+        help="Path to the evidence store SQLite file "
+        "(default: config's evidence_db_path, an absolute, CWD-independent path)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="With --view, max records to show, most recent first (default: 20)",
+    )
+    parser.add_argument(
+        "--verdict",
+        default=None,
+        choices=["Malicious", "Benign", "Deferred"],
+        help="With --view, show only records matching this verdict",
     )
     args = parser.parse_args()
 
@@ -614,15 +718,40 @@ def _run() -> None:
         print(f"sentinel-triage: {exc}", file=sys.stderr)
         sys.exit(2)
 
+    # [Review] --db-path previously defaulted to a CWD-relative literal
+    # ("data/evidence.db") independently of config.evidence_db_path's own
+    # absolute default -- the two coincided only by accident of whatever
+    # directory a mode happened to be launched from, silently reproducing
+    # AC2's "never a bare CWD-relative path" bug at the seam between --view
+    # and every other mode. Unified: an explicit --db-path is honored
+    # verbatim by every mode (unchanged from before); omitting it now falls
+    # back to the same absolute, config-resolved path for all four modes,
+    # not just --view.
+    if args.db_path is not None:
+        db_path = args.db_path
+    else:
+        if not Path(config.evidence_db_path).is_absolute():
+            print(
+                f"sentinel-triage: evidence_db_path must be an absolute path, got "
+                f"{config.evidence_db_path!r} — check SENTINEL_EVIDENCE_DB_PATH",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        db_path = config.evidence_db_path
+
     if args.replay is not None:
-        _run_replay(args.replay, args.db_path, config)
+        _run_replay(args.replay, db_path, config)
         return  # unreachable in practice; kept for explicit control flow
 
     if args.once:
-        run_poll_cycle(config, args.db_path, WatchmanAgent(config), CipherAgent(config))
+        run_poll_cycle(config, db_path, WatchmanAgent(config), CipherAgent(config))
         sys.exit(0)
 
-    run_continuous_loop(config, args.db_path)
+    if args.view:
+        run_view(config, db_path, args.limit, args.verdict)
+        sys.exit(0)
+
+    run_continuous_loop(config, db_path)
     sys.exit(0)
 
 

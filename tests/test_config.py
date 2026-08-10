@@ -165,6 +165,35 @@ def test_gmail_oauth_paths_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> N
     assert config.gmail_oauth_token_path == "secrets/my-token.json"
 
 
+def test_evidence_db_path_defaults_to_absolute_repo_root_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.delenv("SENTINEL_EVIDENCE_DB_PATH", raising=False)
+
+    config = load()
+
+    from pathlib import Path
+
+    assert Path(config.evidence_db_path).is_absolute()
+    assert config.evidence_db_path.replace("\\", "/").endswith("data/evidence.db")
+
+
+def test_evidence_db_path_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+    monkeypatch.setenv("SENTINEL_EVIDENCE_DB_PATH", "/custom/path/evidence.db")
+
+    config = load()
+
+    assert config.evidence_db_path == "/custom/path/evidence.db"
+
+
 def test_eval_corpus_path_defaults_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
     monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")

@@ -1,9 +1,16 @@
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Repo root, sibling to pyproject.toml -- mirrors scoring.py's
+# _CALIBRATION_MODEL_PATH pattern (Path(__file__).resolve(), not CWD) so the
+# default evidence-db location doesn't depend on the caller's working
+# directory. parents[0]=sentinel, [1]=src, [2]=repo root.
+_DEFAULT_EVIDENCE_DB_PATH = str(Path(__file__).resolve().parents[2] / "data" / "evidence.db")
 
 
 class ConfigError(Exception):
@@ -47,6 +54,11 @@ class Config:
     evidence_encryption_key: str | None = None
     retention_days: int = 30
     eval_corpus_path: str | None = None
+    # Always a concrete absolute path (unlike the Gmail/eval_corpus_path
+    # fields) -- Story 5.1's read-only viewer command needs a definite
+    # location to open, and a CWD-relative default was the root cause of a
+    # real silent-empty-output bug (see triage-5-1's story file).
+    evidence_db_path: str = _DEFAULT_EVIDENCE_DB_PATH
 
 
 def load() -> Config:
@@ -109,4 +121,7 @@ def load() -> Config:
         evidence_encryption_key=os.environ.get("SENTINEL_EVIDENCE_KEY"),
         retention_days=retention_days,
         eval_corpus_path=os.environ.get("EVAL_CORPUS_PATH"),
+        evidence_db_path=os.environ.get(
+            "SENTINEL_EVIDENCE_DB_PATH", _DEFAULT_EVIDENCE_DB_PATH
+        ),
     )

@@ -5,17 +5,20 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from cryptography.fernet import Fernet
 
 from sentinel.config import Config, ConfigError
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.report import TriageReport
 from sentinel.triage.store import (
     EvidenceRecord,
+    _connect_read_only,
     is_message_processed,
     load_history_checkpoint,
     persist_evidence_record,
     purge_expired,
     read_evidence_record,
+    read_recent_evidence_records,
     save_history_checkpoint,
 )
 
@@ -330,6 +333,128 @@ def test_persist_same_message_hash_twice_yields_one_record_first_write_wins(
     assert row_count == 1
     assert result is not None
     assert result["report"]["timestamp"] == "2026-01-01T00:00:00+00:00"
+
+
+# --- read_recent_evidence_records --------------------------------------------------
+
+
+def test_read_recent_returns_all_decrypted_ordered_most_recent_first(
+    store_db_path: str, store_config: Config
+) -> None:
+    persist_evidence_record(store_db_path, "hash-oldest", _make_record(message_id="m1"), store_config)
+    persist_evidence_record(store_db_path, "hash-middle", _make_record(message_id="m2"), store_config)
+    persist_evidence_record(store_db_path, "hash-newest", _make_record(message_id="m3"), store_config)
+
+    conn = sqlite3.connect(store_db_path)
+    conn.execute(
+        "UPDATE evidence_records SET created_at = ? WHERE message_hash = ?",
+        ("2026-01-01T00:00:00+00:00", "hash-oldest"),
+    )
+    conn.execute(
+        "UPDATE evidence_records SET created_at = ? WHERE message_hash = ?",
+        ("2026-01-02T00:00:00+00:00", "hash-middle"),
+    )
+    conn.execute(
+        "UPDATE evidence_records SET created_at = ? WHERE message_hash = ?",
+        ("2026-01-03T00:00:00+00:00", "hash-newest"),
+    )
+    conn.commit()
+    conn.close()
+
+    records, skipped = read_recent_evidence_records(store_db_path, store_config)
+
+    assert skipped == 0
+    assert [h for h, _ in records] == ["hash-newest", "hash-middle", "hash-oldest"]
+    assert records[0][1]["message_id"] == "m3"
+
+
+def test_read_recent_skips_undecryptable_record_and_counts_it(
+    store_db_path: str, store_config: Config
+) -> None:
+    persist_evidence_record(store_db_path, "hash-good", _make_record(), store_config)
+
+    other_key_config = replace(
+        store_config, evidence_encryption_key=Fernet.generate_key().decode()
+    )
+    persist_evidence_record(store_db_path, "hash-bad-key", _make_record(), other_key_config)
+
+    records, skipped = read_recent_evidence_records(store_db_path, store_config)
+
+    assert skipped == 1
+    assert [h for h, _ in records] == ["hash-good"]
+
+
+def test_read_recent_skips_malformed_but_decryptable_record_and_counts_it(
+    store_db_path: str, store_config: Config
+) -> None:
+    """[Review] A record that decrypts fine under the correct key but is
+    missing fields this codebase's EvidenceRecord/TriageReport shape
+    requires (e.g. a legacy record from before a schema field was added --
+    this has real precedent: deferral_threshold_used was added to
+    EvidenceRecord in Story 1.6) must be treated the same as an
+    undecryptable one -- skipped and counted, never raised. Both
+    reviewers independently reproduced a KeyError crash here before this
+    fix; this is the regression test for that."""
+    persist_evidence_record(store_db_path, "hash-good", _make_record(), store_config)
+
+    fernet = Fernet(store_config.evidence_encryption_key.encode())  # type: ignore[union-attr]
+    malformed_payload = fernet.encrypt(b'{"message_id": "m2"}')  # missing "report", "sender"
+    conn = sqlite3.connect(store_db_path)
+    conn.execute(
+        "INSERT INTO evidence_records "
+        "(message_hash, verdict_json, created_at, expires_at, schema_version) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("hash-malformed", malformed_payload, "2026-08-09T00:00:00+00:00", "2099-01-01T00:00:00+00:00", 1),
+    )
+    conn.commit()
+    conn.close()
+
+    records, skipped = read_recent_evidence_records(store_db_path, store_config)
+
+    assert skipped == 1
+    assert [h for h, _ in records] == ["hash-good"]
+
+
+def test_read_recent_empty_database_returns_empty_list_and_zero_skipped(
+    store_db_path: str, store_config: Config
+) -> None:
+    """An existing db file with a created-but-empty evidence_records table
+    -- distinct from a db file that doesn't exist at all (see the missing-
+    file test below, which must raise, not return an empty result)."""
+    persist_evidence_record(store_db_path, "temp-hash", _make_record(), store_config)
+    conn = sqlite3.connect(store_db_path)
+    conn.execute("DELETE FROM evidence_records")
+    conn.commit()
+    conn.close()
+
+    records, skipped = read_recent_evidence_records(store_db_path, store_config)
+
+    assert records == []
+    assert skipped == 0
+
+
+def test_read_recent_missing_database_file_raises_clear_error(
+    tmp_path: Path, store_config: Config
+) -> None:
+    missing_path = str(tmp_path / "does-not-exist.db")
+
+    with pytest.raises(sqlite3.OperationalError):
+        read_recent_evidence_records(missing_path, store_config)
+
+
+def test_read_recent_connection_is_genuinely_read_only(
+    store_db_path: str, store_config: Config
+) -> None:
+    """AC5: proves the connection itself rejects writes, not just that this
+    function happens not to call INSERT."""
+    persist_evidence_record(store_db_path, "hash1", _make_record(), store_config)
+
+    conn = _connect_read_only(store_db_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("DELETE FROM evidence_records")
+    finally:
+        conn.close()
 
 
 # --- structural / boundary checks ------------------------------------------------
