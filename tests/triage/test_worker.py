@@ -25,6 +25,7 @@ from sentinel.triage.worker import (
     process_message,
     run_continuous_loop,
     run_poll_cycle,
+    run_test_alert,
     run_view,
 )
 from sentinel.verdict import AgentResult, SentinelAgent
@@ -2077,6 +2078,130 @@ def test_help_lists_view_limit_and_verdict_options(
     assert "--view" in out
     assert "--limit" in out
     assert "--verdict" in out
+
+
+# --- --test-alert CLI dispatch --------------------------------------------------
+
+
+def test_help_lists_test_alert_option(
+    mocker,  # type: ignore[no-untyped-def]
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage", "--help"])
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0
+    assert "--test-alert" in capsys.readouterr().out
+
+
+def test_test_alert_flag_calls_run_test_alert_and_exits_zero_on_success(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage", "--test-alert"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    spy = mocker.patch("sentinel.triage.worker.run_test_alert", return_value=True)
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    spy.assert_called_once_with(store_config)
+    assert exc.value.code == 0
+
+
+def test_test_alert_flag_exits_nonzero_on_failure(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    mocker.patch("sys.argv", ["sentinel-triage", "--test-alert"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    mocker.patch("sentinel.triage.worker.run_test_alert", return_value=False)
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+
+
+@pytest.mark.parametrize("other_flag", ["--once", "--view", "--replay somehash"])
+def test_test_alert_and_another_mode_together_exits_nonzero_with_usage_error(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+    other_flag: str,
+) -> None:
+    argv = ["sentinel-triage", "--test-alert", *other_flag.split()]
+    mocker.patch("sys.argv", argv)
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    test_alert_spy = mocker.patch("sentinel.triage.worker.run_test_alert")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+    test_alert_spy.assert_not_called()
+    assert capsys.readouterr().err != ""
+
+
+def test_test_alert_never_touches_gmail_evidence_store_or_db_path_validation(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    """The whole point of --test-alert is to exercise only the alert-send
+    path -- it must not construct a Gmail service, touch the evidence
+    store, or even go through the evidence_db_path resolution/validation
+    every other mode requires. Proven here with a deliberately INVALID
+    (relative) evidence_db_path that would make --view/--once/--replay
+    fail at dispatch time -- --test-alert must not care."""
+    config = replace(store_config, evidence_db_path="a/relative/path.db")
+    mocker.patch("sys.argv", ["sentinel-triage", "--test-alert"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=config)
+    gmail_spy = mocker.patch("sentinel.triage.worker.build_gmail_service")
+    read_spy = mocker.patch("sentinel.triage.worker.read_recent_evidence_records")
+    persist_spy = mocker.patch("sentinel.triage.worker.persist_evidence_record")
+    mocker.patch("sentinel.triage.worker.send_test_alert", return_value=(True, "ok"))
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 0  # did NOT hit the "evidence_db_path must be absolute" exit(2)
+    gmail_spy.assert_not_called()
+    read_spy.assert_not_called()
+    persist_spy.assert_not_called()
+
+
+def test_run_test_alert_prints_result_and_returns_success(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch(
+        "sentinel.triage.worker.send_test_alert",
+        return_value=(True, "Test alert sent successfully to alerts@example.com."),
+    )
+
+    result = run_test_alert(store_config)
+
+    assert result is True
+    assert "alerts@example.com" in capsys.readouterr().err
+
+
+def test_run_test_alert_prints_failure_message_and_returns_false(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    mocker.patch(
+        "sentinel.triage.worker.send_test_alert",
+        return_value=(False, "SMTP channel is not fully configured."),
+    )
+
+    result = run_test_alert(store_config)
+
+    assert result is False
+    assert "not fully configured" in capsys.readouterr().err
 
 
 # --- run_view -------------------------------------------------------------------

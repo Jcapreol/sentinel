@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from sentinel.alerter import AlertPayload, EmailAlerter, send_alert
+from sentinel.alerter import AlertPayload, EmailAlerter, send_alert, send_test_alert
 from sentinel.config import Config
 
 
@@ -174,3 +174,87 @@ def test_send_alert_catches_and_warns_on_send_failure(
 
     err = capsys.readouterr().err
     assert "failed to send" in err.lower()
+
+
+# --- send_test_alert (sentinel-triage --test-alert) ---------------------------
+
+
+def test_send_test_alert_returns_true_and_success_message_when_sent(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    config = _configured(fake_config)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+
+    success, message = send_test_alert(config)
+
+    assert success is True
+    assert "alerts@example.com" in message
+    smtp_instance.send_message.assert_called_once()
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    body = sent_message.get_content()
+    assert "test" in body.lower()
+
+
+def test_send_test_alert_uses_the_real_configured_port(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    """Confirms send_test_alert goes through the exact same EmailAlerter
+    path as a real alert -- including the port-465-implicit-TLS branch,
+    not some separate/simplified test-only code path."""
+    config = replace(_configured(fake_config), alert_smtp_port=465)
+    smtp_ssl_cls = mocker.patch("sentinel.alerter.smtplib.SMTP_SSL")
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+
+    success, _message = send_test_alert(config)
+
+    assert success is True
+    smtp_ssl_cls.assert_called_once_with("smtp.gmail.com", 465, timeout=mocker.ANY)
+    smtp_cls.assert_not_called()
+
+
+def test_send_test_alert_returns_false_with_clear_message_when_not_configured(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    config = replace(_configured(fake_config), alert_smtp_host=None)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+
+    success, message = send_test_alert(config)
+
+    assert success is False
+    assert "not fully configured" in message.lower()
+    smtp_cls.assert_not_called()
+
+
+def test_send_test_alert_returns_false_with_exact_error_on_send_failure(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    config = _configured(fake_config)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_cls.side_effect = OSError("connection refused")
+
+    success, message = send_test_alert(config)
+
+    assert success is False
+    assert "OSError" in message
+    assert "connection refused" in message
+
+
+def test_send_test_alert_does_not_print_to_stderr_itself(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unlike send_alert (fire-and-forget, prints its own warnings),
+    send_test_alert returns its result for the CLI caller to print --
+    it must not ALSO print anything itself, or --test-alert's output
+    would be duplicated."""
+    config = replace(_configured(fake_config), alert_smtp_host=None)
+
+    send_test_alert(config)
+
+    assert capsys.readouterr().err == ""
