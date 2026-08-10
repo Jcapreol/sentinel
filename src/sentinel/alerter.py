@@ -10,6 +10,7 @@ triage/worker.py calls into, not a triage/ file itself.
 
 import smtplib
 import sys
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Protocol, TypedDict
 
@@ -91,25 +92,42 @@ class EmailAlerter:
                 smtp.send_message(message)
 
 
-def send_alert(config: Config, payload: AlertPayload) -> None:
-    """Fire-and-forget: never raises. AC6's "must never crash or block
-    message processing" guarantee lives here -- every failure mode
-    (misconfigured channel, network error, timeout, bad credentials) is
-    caught and logged as a single warning line, never propagated."""
+_SMTP_NOT_CONFIGURED_MESSAGE = (
+    "SMTP channel is not fully configured (need SENTINEL_ALERT_SMTP_HOST/"
+    "USERNAME/PASSWORD/RECIPIENT)."
+)
+
+
+def _build_email_alerter(config: Config) -> tuple[Alerter, str] | None:
+    """Returns (alerter, recipient) if host/username/password/recipient
+    are all present, else None. Shared by send_alert (fire-and-forget,
+    prints its own warning on None) and send_test_alert (--test-alert,
+    returns the same condition as part of its (bool, str) result instead)
+    so the "is this channel usable at all" check exists in exactly one
+    place."""
     host = config.alert_smtp_host
     username = config.alert_smtp_username
     password = config.alert_smtp_password
     recipient = config.alert_smtp_recipient
     if host is None or username is None or password is None or recipient is None:
+        return None
+    return EmailAlerter(host, config.alert_smtp_port, username, password, recipient), recipient
+
+
+def send_alert(config: Config, payload: AlertPayload) -> None:
+    """Fire-and-forget: never raises. AC6's "must never crash or block
+    message processing" guarantee lives here -- every failure mode
+    (misconfigured channel, network error, timeout, bad credentials) is
+    caught and logged as a single warning line, never propagated."""
+    built = _build_email_alerter(config)
+    if built is None:
         print(
-            "[alerter] WARNING: alerting is enabled but the SMTP channel is "
-            "not fully configured (need SENTINEL_ALERT_SMTP_HOST/USERNAME/"
-            "PASSWORD/RECIPIENT) -- skipping this alert.",
+            f"[alerter] WARNING: alerting is enabled but the {_SMTP_NOT_CONFIGURED_MESSAGE} "
+            "-- skipping this alert.",
             file=sys.stderr,
         )
         return
-
-    alerter: Alerter = EmailAlerter(host, config.alert_smtp_port, username, password, recipient)
+    alerter, _recipient = built
     try:
         alerter.send(payload)
     except Exception as e:
@@ -117,3 +135,35 @@ def send_alert(config: Config, payload: AlertPayload) -> None:
             f"[alerter] WARNING: failed to send alert: {type(e).__name__}: {e}",
             file=sys.stderr,
         )
+
+
+def send_test_alert(config: Config) -> tuple[bool, str]:
+    """[sentinel-triage --test-alert] Sends one synthetic alert through
+    the exact same EmailAlerter path send_alert uses (including the
+    port-465-implicit-TLS branch) -- but unlike send_alert's deliberately
+    silent-on-success, warn-and-continue contract, this returns an
+    explicit (success, message) for the CLI to print. Does not print
+    anything itself: the caller decides how/where to display the result.
+    Never touches Gmail, the evidence store, or the triage pipeline --
+    this function's only job is exercising the alert-send path on
+    demand."""
+    built = _build_email_alerter(config)
+    if built is None:
+        return False, _SMTP_NOT_CONFIGURED_MESSAGE
+    alerter, recipient = built
+
+    payload = AlertPayload(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        sender="sentinel-triage --test-alert",
+        subject=None,
+        verdict="Malicious",
+        calibrated_confidence=1.0,
+        findings=[
+            "[malicious] This is a synthetic test alert -- no real message was triaged."
+        ],
+    )
+    try:
+        alerter.send(payload)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return True, f"Test alert sent successfully to {recipient}."

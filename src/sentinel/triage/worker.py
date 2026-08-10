@@ -1,8 +1,9 @@
 """Single-message triage pipeline (investigate -> score -> verdict -> report)
-plus the sentinel-triage CLI entry point and its four modes: the default
+plus the sentinel-triage CLI entry point and its five modes: the default
 continuous poll loop (run_continuous_loop), --once (one poll cycle),
---replay <message_hash> (audit a stored verdict), and --view (read-only
-recent-verdicts table, Story 5.1).
+--replay <message_hash> (audit a stored verdict), --view (read-only
+recent-verdicts table, Story 5.1), and --test-alert (send one synthetic
+alert to verify SMTP delivery, touching nothing else, Story 5.2 follow-up).
 """
 
 import argparse
@@ -18,7 +19,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal
 
-from sentinel.alerter import AlertPayload, send_alert
+from sentinel.alerter import AlertPayload, send_alert, send_test_alert
 from sentinel.cipher import CipherAgent
 from sentinel.config import Config, ConfigError
 from sentinel.config import load as load_config
@@ -775,6 +776,27 @@ def run_view(config: Config, db_path: str, limit: int, verdict_filter: str | Non
     print(f"{len(shown)} shown, {skipped} skipped (undecryptable)", file=sys.stderr)
 
 
+def run_test_alert(config: Config) -> bool:
+    """sentinel-triage --test-alert: sends one synthetic alert through the
+    real SMTP/Alerter path so an operator can verify email delivery on
+    demand, independent of whether SENTINEL_ALERT_ENABLED is set (that
+    flag only gates the live per-message triage path; a deliberate,
+    explicit test invocation should work regardless -- otherwise you
+    couldn't test your SMTP config before turning live alerting on).
+    Touches nothing else: no Gmail service, no evidence store, no
+    triage pipeline -- see _run's dispatch, which calls this before ever
+    resolving/validating an evidence db_path."""
+    success, message = send_test_alert(config)
+    print(f"sentinel-triage: {message}", file=sys.stderr)
+    if success and not config.alert_enabled:
+        print(
+            "sentinel-triage: note — SENTINEL_ALERT_ENABLED is not set, so live "
+            "triage alerts will NOT fire even though this test send succeeded.",
+            file=sys.stderr,
+        )
+    return success
+
+
 def main() -> None:
     try:
         _run()
@@ -807,6 +829,12 @@ def _run() -> None:
         action="store_true",
         help="Display recent triage verdicts as a read-only table and exit",
     )
+    mode_group.add_argument(
+        "--test-alert",
+        action="store_true",
+        help="Send one synthetic alert through the real SMTP channel to verify "
+        "delivery, then exit. Touches nothing else (no Gmail, no evidence store).",
+    )
     parser.add_argument(
         "--db-path",
         default=None,
@@ -832,6 +860,14 @@ def _run() -> None:
     except ConfigError as exc:
         print(f"sentinel-triage: {exc}", file=sys.stderr)
         sys.exit(2)
+
+    # --test-alert dispatches before db_path is ever resolved/validated --
+    # it deliberately touches nothing related to the evidence store (no
+    # Gmail service, no db_path, no triage pipeline), so it must not be
+    # able to fail on an evidence_db_path problem that's irrelevant to it.
+    if args.test_alert:
+        success = run_test_alert(config)
+        sys.exit(0 if success else 1)
 
     # [Review] --db-path previously defaulted to a CWD-relative literal
     # ("data/evidence.db") independently of config.evidence_db_path's own
