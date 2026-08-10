@@ -326,6 +326,49 @@ def fetch_headers_for_messages(
     return results
 
 
+def fetch_headers_by_name(
+    service: Any, mailbox: str, message_id: str, header_names: list[str]
+) -> dict[str, str | None]:
+    """Lightweight metadata-only fetch of the named headers for one message
+    -- independent of, and does not require, the raw-content fetch.
+
+    [Story 5.2.1] Used as a fallback when fetch_raw_message_bytes has
+    already failed for a message: worker.py's self-alert marker check
+    normally runs on raw bytes already fetched, but if that fetch fails
+    there are no raw bytes to check, and without this, a message that is
+    genuinely one of Sentinel's own alert emails would fall through to the
+    ordinary coverage-gap path and could be re-alerted on. This function
+    lets that check still happen using a second, independent metadata
+    fetch. Never raises -- returns every requested name mapped to None on
+    any failure (including a retry-exhausted one) rather than propagating,
+    since this already runs inside worker.py's own failure-handling branch
+    and must not itself become a new source of failure there.
+
+    Case-insensitive name matching on the response, mirroring
+    email.message.Message.get's semantics that extract_header_value (the
+    raw-bytes counterpart of this function) already relies on -- Gmail's
+    returned header casing is not guaranteed to exactly match the
+    requested metadataHeaders casing.
+    """
+    try:
+        message = _execute_with_retry(
+            service.users().messages().get(
+                userId=mailbox,
+                id=message_id,
+                format="metadata",
+                metadataHeaders=header_names,
+            )
+        )
+    except Exception:
+        return dict.fromkeys(header_names)
+    found = {
+        str(header["name"]).lower(): str(header["value"])
+        for header in message.get("payload", {}).get("headers", [])
+        if header.get("name") is not None and header.get("value") is not None
+    }
+    return {name: found.get(name.lower()) for name in header_names}
+
+
 def fetch_raw_message_bytes(service: Any, mailbox: str, message_id: str) -> bytes:
     """Fetches the full raw RFC 822 message content, decoded from Gmail's
     base64url encoding. A materially broader read than the header-only
@@ -352,6 +395,19 @@ def extract_sender_and_content_hash(raw_bytes: bytes) -> tuple[str | None, str]:
     sender = parsed.get("From")
     content_hash = hashlib.sha256(raw_bytes).hexdigest()
     return sender, content_hash
+
+
+def extract_header_value(raw_bytes: bytes, header_name: str) -> str | None:
+    """Pure function, no network call. Returns the named header's value from
+    raw message bytes already fetched by fetch_raw_message_bytes, or None if
+    the header is absent (Message.get's lookup is case-insensitive, matching
+    real header semantics). Generic by design, not hardcoded to any one
+    header name -- worker.py's self-alert marker check (Story 5.2.1) is its
+    only caller today, but this function itself carries no self-alert-
+    specific knowledge."""
+    parsed = email.message_from_bytes(raw_bytes)
+    value = parsed.get(header_name)
+    return str(value) if value is not None else None
 
 
 _TAG_PATTERN = re.compile(r"<[^>]+>")

@@ -27,6 +27,20 @@ _SMTP_TIMEOUT_SECONDS = 10
 # diagnostic).
 _IMPLICIT_TLS_PORT = 465
 
+# [Story 5.2.1] Every alert this module sends carries this header + value --
+# the primary signal worker.py uses to recognize and skip its own alert
+# emails landing back in the monitored inbox. Without it, an alert email is
+# indistinguishable from a real inbound message: it lands, the next poll
+# triages it, its own body says "Malicious", so it scores Malicious and
+# fires another alert -- forever. A fixed name/value is sufficient for this
+# single-instance deployment (see this story's Dev Notes).
+SELF_ALERT_HEADER_NAME = "X-Sentinel-Alert"
+SELF_ALERT_HEADER_VALUE = "1"
+# Shared with worker.py's secondary (sender+subject) self-alert guard, which
+# checks an inbound Subject against this same prefix -- imported rather than
+# duplicated so the two can never drift apart.
+SELF_ALERT_SUBJECT_PREFIX = "Sentinel alert:"
+
 
 class AlertPayload(TypedDict):
     timestamp: str
@@ -76,9 +90,10 @@ class EmailAlerter:
 
     def send(self, payload: AlertPayload) -> None:
         message = EmailMessage()
-        message["Subject"] = f"Sentinel alert: {payload['verdict']}"
+        message["Subject"] = f"{SELF_ALERT_SUBJECT_PREFIX} {payload['verdict']}"
         message["From"] = self._username
         message["To"] = self._recipient
+        message[SELF_ALERT_HEADER_NAME] = SELF_ALERT_HEADER_VALUE
         message.set_content(_format_alert_body(payload))
 
         if self._port == _IMPLICIT_TLS_PORT:

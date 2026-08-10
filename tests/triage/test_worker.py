@@ -914,8 +914,9 @@ def test_run_poll_cycle_raw_fetch_failure_persists_deferred_coverage_gap(
         "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]
     }
     service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
-        {"payload": {"headers": []}},
-        RuntimeError("boom"),
+        {"payload": {"headers": []}},  # Authentication-Results metadata fetch
+        RuntimeError("boom"),  # raw content fetch fails
+        {"payload": {"headers": []}},  # Story 5.2.1 fallback marker/sender fetch
     ]
 
     run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
@@ -925,6 +926,89 @@ def test_run_poll_cycle_raw_fetch_failure_persists_deferred_coverage_gap(
     assert record is not None
     assert record["report"]["verdict"] == "Deferred"
     assert record["sender"] is None
+
+
+def test_run_poll_cycle_raw_fetch_failure_still_recognizes_self_alert_via_fallback_fetch(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Review] If Sentinel's own alert email's raw-content fetch happens to
+    fail transiently, the marker can't be read from raw bytes -- there are
+    none. Without a fallback, it would fall through to the ordinary
+    coverage-gap path and could be re-alerted on, reopening exactly the
+    loop this story exists to close. A second, independent metadata-only
+    fetch (fetch_headers_by_name) recovers the marker/sender in this case,
+    so it is still recognized and neither persisted nor re-alerted on."""
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {"payload": {"headers": []}},  # Authentication-Results metadata fetch
+        RuntimeError("boom"),  # raw content fetch fails
+        {  # Story 5.2.1 fallback marker/sender fetch
+            "payload": {
+                "headers": [
+                    {"name": "X-Sentinel-Alert", "value": "1"},
+                    {"name": "From", "value": "me@gmail.com"},
+                ]
+            }
+        },
+    ]
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_not_called()
+    fallback_hash = hashlib.sha256(b"m1").hexdigest()
+    assert read_evidence_record(store_db_path, fallback_hash, config) is None
+    assert is_message_processed(store_db_path, "m1") is False
+
+
+def test_run_poll_cycle_raw_fetch_failure_fallback_check_itself_failing_does_not_crash(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """If the fallback metadata fetch ALSO fails (e.g. a sustained Gmail-side
+    outage affecting both endpoints), this must not crash the message -- it
+    falls through to the existing, pre-5.2.1 coverage-gap behavior exactly
+    as before this story."""
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _gmail_config(store_config)
+
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {"payload": {"headers": []}},
+        RuntimeError("boom"),
+        RuntimeError("fallback fetch also fails"),
+    ]
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise
+
+    fallback_hash = hashlib.sha256(b"m1").hexdigest()
+    record = read_evidence_record(store_db_path, fallback_hash, config)
+    assert record is not None
+    assert record["report"]["verdict"] == "Deferred"
 
 
 def test_run_poll_cycle_raw_fetch_failure_does_not_stop_remaining_messages(
@@ -953,6 +1037,7 @@ def test_run_poll_cycle_raw_fetch_failure_does_not_stop_remaining_messages(
     service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
         {"payload": {"headers": []}},  # m1 header fetch ok
         RuntimeError("boom"),  # m1 raw fetch fails
+        {"payload": {"headers": []}},  # m1 Story 5.2.1 fallback marker/sender fetch
         {"payload": {"headers": []}},  # m2 header fetch ok
         {"raw": encoded_m2},  # m2 raw fetch ok
     ]
@@ -1781,6 +1866,7 @@ def test_alert_payload_subject_is_none_on_raw_fetch_failure_path(
     service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
         {"payload": {"headers": []}},
         Exception("raw fetch failed"),
+        {"payload": {"headers": []}},  # Story 5.2.1 fallback marker/sender fetch
     ]
     alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
 
@@ -1792,6 +1878,213 @@ def test_alert_payload_subject_is_none_on_raw_fetch_failure_path(
     payload = alert_spy.call_args.args[1]
     assert payload["subject"] is None
     assert payload["sender"] is None
+
+
+# --- self-alert feedback-loop prevention (Story 5.2.1) -----------------------
+
+
+def test_self_alert_marker_header_skips_triage_persistence_and_alert(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC2/AC4: a message carrying Sentinel's own alert marker header,
+    genuinely sent from the configured alert account, must never be
+    triaged, scored, persisted, or re-alerted on -- and the skip must be
+    logged so the operator can see it was recognized and ignored."""
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = (
+        b"From: me@gmail.com\r\nSubject: Sentinel alert: Malicious\r\n"
+        b"X-Sentinel-Alert: 1\r\n\r\n"
+        b"Sentinel triage alert: Malicious (confidence=1.000)"
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    process_spy = mocker.patch("sentinel.triage.worker.process_message")
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    process_spy.assert_not_called()
+    alert_spy.assert_not_called()
+    assert is_message_processed(store_db_path, "m1") is False
+    assert "skip" in capsys.readouterr().err.lower()
+
+
+def test_self_alert_skip_is_not_a_failure_and_checkpoint_still_advances(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """A skipped self-alert must not be treated as a per-message failure --
+    it should not cap the checkpoint the way a genuine processing failure
+    does (see the any_failures mechanism), since there is nothing to retry."""
+    from sentinel.triage.store import load_history_checkpoint
+
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = (
+        b"From: me@gmail.com\r\nSubject: Sentinel alert: Malicious\r\n"
+        b"X-Sentinel-Alert: 1\r\n\r\nbody"
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert load_history_checkpoint(store_db_path) == "1000"
+
+
+def test_forged_marker_header_from_unrelated_sender_does_not_bypass_triage(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Review] The marker header alone must never be sufficient to skip a
+    message: it is parsed straight out of attacker-controlled inbound
+    bytes. Since the header name/value are fixed and public (this is open
+    source), a real phishing email that simply copies them would otherwise
+    get a silent, complete bypass of triage -- worse than the feedback loop
+    this story exists to close, since it defeats detection instead of
+    merely mis-firing a notification. Proven here: a message carrying the
+    exact marker header, but from a sender that does NOT match the
+    configured alert-sending account, must still be triaged normally."""
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = (
+        b"From: phisher@evil.example\r\nSubject: Urgent: verify your account\r\n"
+        b"X-Sentinel-Alert: 1\r\n\r\nClick here: http://evil.example/login"
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert is_message_processed(store_db_path, "m1") is True
+
+
+def test_forged_marker_header_when_alerting_never_configured_does_not_bypass_triage(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Review] Fails safe when alert_smtp_username is unset: with no
+    configured sending account, this instance could never have produced a
+    genuine self-alert, so the marker header carries no trust on its own
+    and must not skip anything."""
+    config = _alert_config(store_config)  # alert_smtp_username defaults to None
+    raw_content = (
+        b"From: phisher@evil.example\r\nSubject: Urgent: verify your account\r\n"
+        b"X-Sentinel-Alert: 1\r\n\r\nClick here: http://evil.example/login"
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert is_message_processed(store_db_path, "m1") is True
+
+
+def test_self_alert_secondary_guard_sender_and_subject_match_skips_without_header(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """AC3: fallback guard for when the marker header is stripped somewhere
+    in the mail path -- inbound sender matching the configured alert sender
+    AND subject starting with the alert subject prefix is also treated as a
+    self-alert. Also proves parseaddr normalization: a real self-sent Gmail
+    message commonly carries a display name the bare configured address
+    will never contain."""
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = (
+        b"From: Jackson Capreol <me@gmail.com>\r\n"
+        b"Subject: Sentinel alert: Deferred\r\n\r\nbody"
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    process_spy = mocker.patch("sentinel.triage.worker.process_message")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    process_spy.assert_not_called()
+    assert is_message_processed(store_db_path, "m1") is False
+
+
+def test_self_alert_secondary_guard_matching_subject_but_different_sender_is_triaged(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """AC3/AC5: the secondary guard requires BOTH sender and subject to
+    match -- subject alone (even the exact alert prefix) must not be
+    enough, or a phisher could spoof the subject line to evade triage
+    entirely."""
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = (
+        b"From: phisher@evil.example\r\nSubject: Sentinel alert: Malicious\r\n\r\nbody"
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert is_message_processed(store_db_path, "m1") is True
+
+
+def test_self_alert_secondary_guard_matching_sender_but_different_subject_is_triaged(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """AC3/AC5: sender alone must not be enough either -- a normal message
+    the operator sends themselves to their own monitored mailbox for an
+    unrelated reason must still be triaged."""
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = b"From: me@gmail.com\r\nSubject: Please review this\r\n\r\nbody"
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Benign"),
+    )
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert is_message_processed(store_db_path, "m1") is True
+
+
+def test_normal_message_mentioning_sentinel_and_alert_is_triaged_normally(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """AC5: guards against over-filtering -- a realistic normal email that
+    merely mentions "Sentinel" or "alert" in its subject or body, from an
+    unconfigured sender, with alerting's SMTP sender never configured (the
+    common case for most operators), must still be triaged normally. The
+    sender-only and subject-only boundary cases are isolated more tightly
+    by test_self_alert_secondary_guard_matching_subject_but_different_
+    sender_is_triaged and its sibling below."""
+    config = _alert_config(store_config)  # alert_smtp_username defaults to None
+    raw_content = (
+        b"From: newsletter@example.com\r\n"
+        b"Subject: Sentinel alert system now in beta\r\n\r\n"
+        b"Read about our new Sentinel alert monitoring feature."
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Benign"),
+    )
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert is_message_processed(store_db_path, "m1") is True
 
 
 # --- main() / _run() CLI dispatch -------------------------------------------------
