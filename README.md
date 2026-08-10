@@ -242,6 +242,8 @@ SENTINEL does not store or transmit your incident data beyond the analysis APIs.
 
 No alert content, IOCs, or log lines are written to disk at any point. The only external transmissions are to the Anthropic API (Watchman behavioral analysis) and the VirusTotal, AbuseIPDB, and URLhaus APIs (Cipher threat intelligence) as required to produce a verdict.
 
+**The `sentinel-triage` autonomous phishing-triage pipeline is different**: unlike the one-shot `sentinel` CLI above, it persists an encrypted evidence record for every message it triages, so verdicts can be reviewed and replayed later. See [docs/security.md](docs/security.md) for how secrets (including the evidence encryption key) are stored, backed up, and rotated, and [docs/gmail-setup.md](docs/gmail-setup.md) for the pipeline's Gmail credential setup.
+
 ## Connectivity Requirements
 
 SENTINEL requires internet access to the Anthropic, VirusTotal, AbuseIPDB, and URLhaus APIs. Air-gapped environments are not supported in v1.
