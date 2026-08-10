@@ -12,6 +12,8 @@ load_dotenv()
 # directory. parents[0]=sentinel, [1]=src, [2]=repo root.
 _DEFAULT_EVIDENCE_DB_PATH = str(Path(__file__).resolve().parents[2] / "data" / "evidence.db")
 
+_TRUTHY_STRINGS = {"1", "true", "yes", "on"}
+
 
 class ConfigError(Exception):
     pass
@@ -59,6 +61,19 @@ class Config:
     # location to open, and a CWD-relative default was the root cause of a
     # real silent-empty-output bug (see triage-5-1's story file).
     evidence_db_path: str = _DEFAULT_EVIDENCE_DB_PATH
+    # Story 5.2: alert dispatch on Deferred-or-worse verdicts. Disabled by
+    # default so existing runs are unaffected until an operator opts in AND
+    # configures a channel (AC3). alert_threshold's validity ("Deferred" or
+    # "Malicious" only) is checked lazily where used (worker.py's alert
+    # dispatch), not here -- same reasoning as deferral_threshold/
+    # retention_days above.
+    alert_enabled: bool = False
+    alert_threshold: str = "Deferred"
+    alert_smtp_host: str | None = None
+    alert_smtp_port: int = 587
+    alert_smtp_username: str | None = None
+    alert_smtp_password: str | None = None
+    alert_smtp_recipient: str | None = None
 
 
 def load() -> Config:
@@ -101,6 +116,21 @@ def load() -> Config:
     # first actual use in sentinel.triage.store, mirroring
     # build_gmail_service()'s fail-fast-at-point-of-use pattern.
 
+    alert_enabled = os.environ.get("SENTINEL_ALERT_ENABLED", "").strip().lower() in _TRUTHY_STRINGS
+
+    alert_smtp_port_raw = os.environ.get("SENTINEL_ALERT_SMTP_PORT")
+    try:
+        alert_smtp_port = int(alert_smtp_port_raw) if alert_smtp_port_raw else 587
+    except ValueError:
+        # [Review] A malformed SENTINEL_ALERT_SMTP_PORT must not break
+        # load() for every mode (CLI, web dashboard, --view, --once,
+        # continuous loop) regardless of whether alerting is even enabled
+        # -- falls back to the default silently; a real misconfiguration
+        # still surfaces via send_alert's own connection-failure warning
+        # once alerting actually runs, matching alert_threshold's own
+        # "checked lazily where used, not here" design.
+        alert_smtp_port = 587
+
     return Config(
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         virustotal_api_key=os.environ["VIRUSTOTAL_API_KEY"],
@@ -124,4 +154,11 @@ def load() -> Config:
         evidence_db_path=os.environ.get(
             "SENTINEL_EVIDENCE_DB_PATH", _DEFAULT_EVIDENCE_DB_PATH
         ),
+        alert_enabled=alert_enabled,
+        alert_threshold=os.environ.get("SENTINEL_ALERT_THRESHOLD", "Deferred"),
+        alert_smtp_host=os.environ.get("SENTINEL_ALERT_SMTP_HOST"),
+        alert_smtp_port=alert_smtp_port,
+        alert_smtp_username=os.environ.get("SENTINEL_ALERT_SMTP_USERNAME"),
+        alert_smtp_password=os.environ.get("SENTINEL_ALERT_SMTP_PASSWORD"),
+        alert_smtp_recipient=os.environ.get("SENTINEL_ALERT_SMTP_RECIPIENT"),
     )

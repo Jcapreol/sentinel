@@ -392,3 +392,140 @@ def test_config_is_frozen(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load()
     with pytest.raises(FrozenInstanceError):
         config.anthropic_api_key = "mutated"  # type: ignore[misc]
+
+
+def _base_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ak-test")
+    monkeypatch.setenv("VIRUSTOTAL_API_KEY", "vt-test")
+    monkeypatch.setenv("ABUSEIPDB_API_KEY", "ab-test")
+    monkeypatch.setenv("URLHAUS_API_KEY", "uh-test")
+
+
+def test_alert_enabled_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.delenv("SENTINEL_ALERT_ENABLED", raising=False)
+
+    config = load()
+
+    assert config.alert_enabled is False
+
+
+@pytest.mark.parametrize("value", ["true", "True", "TRUE", "1", "yes", "on"])
+def test_alert_enabled_parses_truthy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_ENABLED", value)
+
+    config = load()
+
+    assert config.alert_enabled is True
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no", "off", ""])
+def test_alert_enabled_parses_falsy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A bare bool(str) parse would make SENTINEL_ALERT_ENABLED=false
+    enable it (a non-empty string is truthy) -- this is the regression
+    guard for that footgun."""
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_ENABLED", value)
+
+    config = load()
+
+    assert config.alert_enabled is False
+
+
+def test_alert_threshold_defaults_to_deferred(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.delenv("SENTINEL_ALERT_THRESHOLD", raising=False)
+
+    config = load()
+
+    assert config.alert_threshold == "Deferred"
+
+
+def test_alert_threshold_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_THRESHOLD", "Malicious")
+
+    config = load()
+
+    assert config.alert_threshold == "Malicious"
+
+
+def test_alert_smtp_fields_default_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    for var in (
+        "SENTINEL_ALERT_SMTP_HOST",
+        "SENTINEL_ALERT_SMTP_USERNAME",
+        "SENTINEL_ALERT_SMTP_PASSWORD",
+        "SENTINEL_ALERT_SMTP_RECIPIENT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("SENTINEL_ALERT_SMTP_PORT", raising=False)
+
+    config = load()
+
+    assert config.alert_smtp_host is None
+    assert config.alert_smtp_username is None
+    assert config.alert_smtp_password is None
+    assert config.alert_smtp_recipient is None
+    assert config.alert_smtp_port == 587
+
+
+def test_alert_smtp_fields_parsed_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("SENTINEL_ALERT_SMTP_PORT", "465")
+    monkeypatch.setenv("SENTINEL_ALERT_SMTP_USERNAME", "me@gmail.com")
+    monkeypatch.setenv("SENTINEL_ALERT_SMTP_PASSWORD", "app-password")
+    monkeypatch.setenv("SENTINEL_ALERT_SMTP_RECIPIENT", "alerts@example.com")
+
+    config = load()
+
+    assert config.alert_smtp_host == "smtp.gmail.com"
+    assert config.alert_smtp_port == 465
+    assert config.alert_smtp_username == "me@gmail.com"
+    assert config.alert_smtp_password == "app-password"
+    assert config.alert_smtp_recipient == "alerts@example.com"
+
+
+def test_load_does_not_raise_on_malformed_alert_smtp_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[Review] SENTINEL_ALERT_SMTP_PORT was previously parsed eagerly and
+    unconditionally in load() -- a malformed value broke config loading
+    for EVERY mode (CLI, web dashboard, --view, --once, continuous loop),
+    not just alerting, and regardless of whether SENTINEL_ALERT_ENABLED
+    was even set. Falls back to the default (587) on a malformed value,
+    matching alert_threshold's own "checked lazily where used, not here"
+    design -- any real misconfiguration still surfaces via send_alert's
+    own connection-failure warning once alerting actually runs."""
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_SMTP_PORT", "not-a-number")
+
+    config = load()  # must not raise
+
+    assert config.alert_smtp_port == 587
+
+
+def test_load_succeeds_without_any_alert_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI/web dashboard must keep working with zero alert configuration --
+    alerting is opt-in and load() is shared by paths that never use it."""
+    _base_env(monkeypatch)
+    for var in (
+        "SENTINEL_ALERT_ENABLED",
+        "SENTINEL_ALERT_THRESHOLD",
+        "SENTINEL_ALERT_SMTP_HOST",
+        "SENTINEL_ALERT_SMTP_PORT",
+        "SENTINEL_ALERT_SMTP_USERNAME",
+        "SENTINEL_ALERT_SMTP_PASSWORD",
+        "SENTINEL_ALERT_SMTP_RECIPIENT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    config = load()  # must not raise
+
+    assert config.anthropic_api_key == "ak-test"
