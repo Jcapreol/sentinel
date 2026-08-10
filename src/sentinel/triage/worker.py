@@ -18,6 +18,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal
 
+from sentinel.alerter import AlertPayload, send_alert
 from sentinel.cipher import CipherAgent
 from sentinel.config import Config, ConfigError
 from sentinel.config import load as load_config
@@ -291,6 +292,108 @@ def process_message(
     )
 
 
+_ALERT_VERDICT_SEVERITY = {"Benign": 0, "Deferred": 1, "Malicious": 2}
+# [Review] Deliberately a SEPARATE set from _ALERT_VERDICT_SEVERITY above,
+# not derived from its keys -- the severity dict needs a "Benign" entry to
+# rank verdicts at all, but "Benign" is never a valid THRESHOLD (AC2: only
+# "Deferred" or "Malicious"). Using the severity dict's keys for both jobs
+# meant SENTINEL_ALERT_THRESHOLD=Benign passed validation and then, since
+# rank 0 is <= every verdict's rank, silently alerted on every message,
+# including genuinely benign ones -- found in review, regression-tested.
+_ALERT_VALID_THRESHOLDS = {"Deferred", "Malicious"}
+_ALERT_MAX_FINDINGS = 2
+_ALERT_FINDING_MAX_LEN = 200
+
+
+def _verdict_meets_alert_threshold(verdict: str, threshold: str) -> bool:
+    """[Story 5.2] Explicit severity ranking, not string/enum-order
+    comparison -- TriageReport["verdict"]'s Literal declaration order
+    ("Malicious", "Benign", "Deferred") is not severity order. Returns
+    False (never raises) for an unrecognized verdict -- an invalid verdict
+    must never crash message processing (the record is already persisted
+    by the time this runs), it must just fail to alert. `threshold`'s own
+    validity is checked separately by the caller (_ALERT_VALID_THRESHOLDS),
+    before this function is ever called."""
+    verdict_rank = _ALERT_VERDICT_SEVERITY.get(verdict)
+    threshold_rank = _ALERT_VERDICT_SEVERITY.get(threshold)
+    if verdict_rank is None or threshold_rank is None:
+        return False
+    return verdict_rank >= threshold_rank
+
+
+def _extract_subject_line(email_content: str) -> str | None:
+    """email_content's first line is expected to be "Subject: {subject}"
+    (see ingest.py's extract_email_content) -- parsed back out here only
+    for the alert payload, never persisted or exposed elsewhere. [Review]
+    A crafted RFC 2047 encoded-word Subject can decode to text containing
+    an embedded newline; partition("\\n") then only sees the portion
+    before it -- a safe, silent truncation (nothing after the embedded
+    newline is used for anything), not a parse failure or injection risk,
+    just not literally "always" the exact original subject verbatim."""
+    first_line, _, _ = email_content.partition("\n")
+    if not first_line.startswith("Subject: "):
+        return None
+    subject = first_line[len("Subject: "):]
+    return subject if subject else None
+
+
+def _truncate(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _maybe_dispatch_alert(
+    config: Config, report: TriageReport, sender: str | None, subject: str | None
+) -> None:
+    """[Story 5.2] Called only from run_poll_cycle's success path, after
+    persist_evidence_record has already committed -- alerting must never
+    affect whether a message counts as successfully processed. Never
+    raises: this function's own body is deliberately covered end-to-end by
+    ONE try/except, not just the final send_alert call -- run_poll_cycle's
+    `else:` clause that calls this is itself deliberately OUTSIDE the
+    surrounding try/except (so a broken stderr print isn't misclassified
+    as a processing failure), which means an exception raised anywhere in
+    this function would otherwise propagate all the way out of
+    run_poll_cycle and, via run_continuous_loop's "any exception is a
+    PERSISTENT FAILURE" handling, kill the entire live worker process over
+    a notification bug -- found in review; not reachable today (every
+    caller passes a fully-populated TriageReport), but a real gap between
+    what this function claimed and what was structurally enforced."""
+    try:
+        if not config.alert_enabled:
+            return
+        if config.alert_threshold not in _ALERT_VALID_THRESHOLDS:
+            print(
+                f"[worker] WARNING: SENTINEL_ALERT_THRESHOLD={config.alert_threshold!r} is "
+                "invalid (must be 'Deferred' or 'Malicious') -- skipping alert check.",
+                file=sys.stderr,
+            )
+            return
+        if not _verdict_meets_alert_threshold(report["verdict"], config.alert_threshold):
+            return
+
+        findings = [
+            _truncate(f"[{item['direction']}] {item['finding']}", _ALERT_FINDING_MAX_LEN)
+            for item in _sorted_directional_findings(report["evidence"])[:_ALERT_MAX_FINDINGS]
+        ]
+        payload = AlertPayload(
+            timestamp=report["timestamp"],
+            sender=sender,
+            subject=subject,
+            verdict=report["verdict"],
+            calibrated_confidence=report["calibrated_confidence"],
+            findings=findings,
+        )
+        send_alert(config, payload)
+    except Exception as e:
+        print(
+            f"[worker] WARNING: alert dispatch raised unexpectedly: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+
+
 def run_poll_cycle(
     config: Config, db_path: str, watchman: SentinelAgent, cipher: SentinelAgent
 ) -> None:
@@ -361,6 +464,7 @@ def run_poll_cycle(
                     file=sys.stderr,
                 )
                 sender = None
+                subject = None  # no email content was ever fetched on this path
                 # Deliberate, narrow exception to "message_hash is always a content
                 # hash" (Story 1.5's invariant) — we never got the content to hash,
                 # so we fall back to an ID-based hash. Named explicitly in the
@@ -385,6 +489,7 @@ def run_poll_cycle(
             else:
                 sender, content_hash = extract_sender_and_content_hash(raw_bytes)
                 email_content = extract_email_content(raw_bytes)
+                subject = _extract_subject_line(email_content)
                 report = process_message(
                     message_id, auth_results_header, email_content, watchman, cipher, config
                 )
@@ -416,6 +521,7 @@ def run_poll_cycle(
                 f"{message_id!r} (verdict={report['verdict']})",
                 file=sys.stderr,
             )
+            _maybe_dispatch_alert(config, report, sender, subject)
 
     # If any message failed above, it was never written to the store at all
     # (persist_evidence_record's atomic commit never happened) -- so do NOT
@@ -581,16 +687,25 @@ def _run_replay(message_hash: str, db_path: str, config: Config) -> None:
 _VIEW_FINDING_MAX_LEN = 50
 
 
+def _sorted_directional_findings(evidence: list[EvidenceItem]) -> list[EvidenceItem]:
+    """All directional (malicious/benign) findings, highest-weight first.
+    Neutral (coverage-gap/no-signal) items are excluded: they're never the
+    interesting part of a finding at a glance. Shared by --view's table
+    (Story 5.1, top-1, truncated) and the alert payload (Story 5.2,
+    top-2, untruncated) so the "what's the most notable finding" logic
+    exists in exactly one place."""
+    directional = [item for item in evidence if item["direction"] != "neutral"]
+    directional.sort(key=lambda item: item["weight"], reverse=True)
+    return directional
+
+
 def _format_finding_summary(evidence: list[EvidenceItem]) -> str:
     """Short summary of a record's most notable finding for the --view
-    table (AC3) -- the highest-weight directional (malicious/benign)
-    finding, truncated, with a "(+N more)" suffix if there are others.
-    Neutral (coverage-gap/no-signal) items are excluded: they're never the
-    interesting part of a row at a glance."""
-    directional = [item for item in evidence if item["direction"] != "neutral"]
+    table (AC3) -- the highest-weight directional finding, truncated,
+    with a "(+N more)" suffix if there are others."""
+    directional = _sorted_directional_findings(evidence)
     if not directional:
         return "(no directional findings)"
-    directional.sort(key=lambda item: item["weight"], reverse=True)
     top = directional[0]
     finding_text = top["finding"]
     if len(finding_text) > _VIEW_FINDING_MAX_LEN:

@@ -1405,6 +1405,394 @@ def test_handle_sigterm_raises_keyboard_interrupt() -> None:
         _handle_sigterm(15, None)
 
 
+# --- alert dispatch (Story 5.2) -----------------------------------------------
+
+
+def _setup_single_message_poll(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    message_id: str = "m1",
+    raw_content: bytes = b"From: alice@example.com\r\nSubject: Password reset\r\n\r\nbody",
+):  # type: ignore[no-untyped-def]
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": message_id}}]}]
+    }
+    encoded = base64.urlsafe_b64encode(raw_content).decode()
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {"payload": {"headers": []}},
+        {"raw": encoded},
+    ]
+    return service
+
+
+def _alert_config(store_config: Config, **overrides) -> Config:  # type: ignore[no-untyped-def]
+    config = _gmail_config(store_config)
+    return replace(config, alert_enabled=True, **overrides)
+
+
+@pytest.mark.parametrize("verdict", ["Deferred", "Malicious"])
+def test_alert_fires_at_or_above_default_threshold(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    verdict: str,
+) -> None:
+    config = _alert_config(store_config)  # default threshold: Deferred
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict=verdict),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_called_once()
+
+
+def test_alert_does_not_fire_below_default_threshold(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _alert_config(store_config)  # default threshold: Deferred
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Benign"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_not_called()
+
+
+def test_alert_does_not_fire_deferred_when_threshold_is_malicious(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _alert_config(store_config, alert_threshold="Malicious")
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Deferred"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_not_called()
+
+
+def test_alert_fires_malicious_when_threshold_is_malicious(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _alert_config(store_config, alert_threshold="Malicious")
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_called_once()
+
+
+def test_alert_disabled_suppresses_alert_regardless_of_verdict(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _gmail_config(store_config)  # alert_enabled defaults to False
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_not_called()
+
+
+def test_alert_fires_exactly_once_for_one_message(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _alert_config(store_config)
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert alert_spy.call_count == 1
+
+
+def test_alert_does_not_refire_on_a_later_poll_cycle_for_the_same_message(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """AC7: re-runs must not re-alert on old records -- structurally
+    guaranteed by the same is_message_processed check that already
+    prevents re-processing, not a new mechanism."""
+    config = _alert_config(store_config)
+    service = _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+    # Second cycle: same message reappears in history (e.g. a redelivery),
+    # but is now already processed.
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]
+    }
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    assert alert_spy.call_count == 1
+
+
+def test_alert_send_failure_does_not_break_processing_or_persistence(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _alert_config(store_config)
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    mocker.patch("sentinel.triage.worker.send_alert", side_effect=RuntimeError("smtp exploded"))
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise
+
+    from sentinel.triage.store import load_history_checkpoint
+
+    content_hash = hashlib.sha256(
+        b"From: alice@example.com\r\nSubject: Password reset\r\n\r\nbody"
+    ).hexdigest()
+    record = read_evidence_record(store_db_path, content_hash, config)
+    assert record is not None
+    assert load_history_checkpoint(store_db_path) == "1000"
+
+
+def test_invalid_alert_threshold_warns_and_does_not_fail_message_processing(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _alert_config(store_config, alert_threshold="bogus")
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise
+
+    alert_spy.assert_not_called()
+    content_hash = hashlib.sha256(
+        b"From: alice@example.com\r\nSubject: Password reset\r\n\r\nbody"
+    ).hexdigest()
+    record = read_evidence_record(store_db_path, content_hash, config)
+    assert record is not None
+    # [Review] capsys.readouterr() drains the buffer -- capture ONCE, not
+    # twice, or the second call always sees an empty string and the "or"
+    # branch becomes permanently-vacuous dead code.
+    err = capsys.readouterr().err.lower()
+    assert "bogus" in err
+    assert "invalid" in err
+
+
+def test_alert_threshold_benign_is_rejected_as_invalid(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Review] "Benign" is a real key in the verdict-severity ranking
+    dict (needed to rank verdicts at all) but is NOT a valid threshold
+    (AC2: only "Deferred" or "Malicious"). Before this fix, using the
+    same dict for both jobs meant this value passed validation and then,
+    since its rank (0) is <= every verdict's rank, silently alerted on
+    every single message -- including genuinely benign ones, defeating
+    the entire feature."""
+    config = _alert_config(store_config, alert_threshold="Benign")
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Benign"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    alert_spy.assert_not_called()
+    assert "invalid" in capsys.readouterr().err.lower()
+
+
+def test_alert_payload_findings_are_sorted_capped_and_truncated(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    make_evidence_item,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Review] The finding-construction path had zero test coverage --
+    every prior alert test used empty evidence. Covers real multi-finding
+    evidence: correct sort order (highest weight first), the top-2 cap,
+    and length truncation of an unbounded finding string (Watchman's LLM
+    output has no length constraint of its own)."""
+    config = _alert_config(store_config)
+    _setup_single_message_poll(mocker, store_db_path)
+    long_finding = "A" * 500
+    evidence = [
+        make_evidence_item(
+            name="low", finding="low weight finding", weight=0.1, direction="malicious"
+        ),
+        make_evidence_item(
+            name="high", finding=long_finding, weight=0.9, direction="malicious"
+        ),
+        make_evidence_item(
+            name="mid", finding="mid weight finding", weight=0.5, direction="benign"
+        ),
+        make_evidence_item(
+            name="neutral", finding="irrelevant coverage gap", weight=0.0, direction="neutral"
+        ),
+    ]
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious", evidence=evidence),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    payload = alert_spy.call_args.args[1]
+    assert len(payload["findings"]) == 2  # capped at _ALERT_MAX_FINDINGS, "neutral" excluded
+    assert payload["findings"][0].startswith("[malicious] " + "A" * 10)  # highest weight first
+    assert len(payload["findings"][0]) <= 200
+    assert payload["findings"][0].endswith("…")
+    assert payload["findings"][1].startswith("[benign] mid weight finding")
+
+
+def test_alert_dispatch_unexpected_exception_before_send_does_not_crash_processing(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Review] Before this fix, only the send_alert call itself was
+    wrapped in try/except -- an exception raised while building the
+    payload (which run_poll_cycle's else: clause reaches OUTSIDE its own
+    try/except, deliberately) would have propagated all the way out of
+    run_poll_cycle and, via run_continuous_loop's exception handling,
+    killed the entire live worker over a notification bug. Proven here by
+    making payload construction itself fail."""
+    config = _alert_config(store_config)
+    _setup_single_message_poll(mocker, store_db_path)
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    mocker.patch(
+        "sentinel.triage.worker._sorted_directional_findings",
+        side_effect=RuntimeError("boom before send_alert is ever reached"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)  # must not raise
+
+    alert_spy.assert_not_called()
+    content_hash = hashlib.sha256(
+        b"From: alice@example.com\r\nSubject: Password reset\r\n\r\nbody"
+    ).hexdigest()
+    record = read_evidence_record(store_db_path, content_hash, config)
+    assert record is not None
+
+
+def test_alert_payload_includes_subject_extracted_from_email_content(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    config = _alert_config(store_config)
+    _setup_single_message_poll(
+        mocker,
+        store_db_path,
+        raw_content=b"From: alice@example.com\r\nSubject: Urgent: verify your account\r\n\r\nbody",
+    )
+    mocker.patch(
+        "sentinel.triage.worker.process_message",
+        return_value=_make_report(verdict="Malicious"),
+    )
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    payload = alert_spy.call_args.args[1]
+    assert payload["subject"] == "Urgent: verify your account"
+    assert payload["sender"] == "alice@example.com"
+    assert payload["verdict"] == "Malicious"
+
+
+def test_alert_payload_subject_is_none_on_raw_fetch_failure_path(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _alert_config(store_config, alert_threshold="Deferred")
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m1"}}]}]
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {"payload": {"headers": []}},
+        Exception("raw fetch failed"),
+    ]
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    # The raw-fetch-failure path always persists a Deferred coverage-gap
+    # record, which meets the default Deferred threshold.
+    alert_spy.assert_called_once()
+    payload = alert_spy.call_args.args[1]
+    assert payload["subject"] is None
+    assert payload["sender"] is None
+
+
 # --- main() / _run() CLI dispatch -------------------------------------------------
 
 
