@@ -14,6 +14,11 @@ environment variable:
   testing, not production deployment. Covered in
   [Personal Gmail (OAuth)](#personal-gmail-oauth) below.
 
+This document covers acquiring Gmail credentials. For what to do with any
+secret once you have it — file permissions, the evidence encryption key's
+backup/rotation lifecycle, dependency vulnerability scanning, and other
+hardening — see [security.md](security.md).
+
 ## Google Workspace (service account)
 
 ### Legal boundary (customer responsibility)
@@ -187,6 +192,10 @@ WantedBy=multi-user.target
 `systemctl stop sentinel-triage` sends SIGTERM by default; Sentinel handles
 it explicitly (alongside Ctrl+C/SIGINT) to shut down cleanly rather than
 being killed mid-cycle.
+
+Before deploying to any Linux host this way, lock down `.env` and
+`secrets/*` to owner-only permissions — see
+[security.md's File permissions section](security.md#file-permissions-linux--raspberry-pi-deployment).
 
 With `Restart=on-failure` and `RestartSec=30`, a transient issue (e.g. a
 brief credential propagation delay) recovers automatically. `StartLimitBurst=5`

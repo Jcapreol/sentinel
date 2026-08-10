@@ -13,6 +13,16 @@ _bmad-output/implementation-artifacts/*
 !.env.example
 *.key
 secrets/
+# Story 5.3: named as a defense-in-depth backstop, not the primary guard --
+# both files are already covered by the secrets/ rule above at their
+# documented/default location (secrets/oauth-client.json,
+# secrets/oauth-token.json — see config.py's GMAIL_OAUTH_CLIENT_SECRET_PATH/
+# GMAIL_OAUTH_TOKEN_PATH defaults and harvest_own_inbox.py's identical
+# defaults). This also catches either file wherever it appears in the repo
+# tree, not just under secrets/, in case a future setup step or a manual
+# `git add` mistake ever places one elsewhere.
+oauth-client.json
+oauth-token.json
 
 # Evidence store — encrypted customer data, never committed
 data/

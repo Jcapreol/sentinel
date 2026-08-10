@@ -9,6 +9,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 from sentinel.config import Config, ConfigError
+from sentinel.triage import ingest
 from sentinel.triage.ingest import (
     FetchFailed,
     build_gmail_service,
@@ -66,6 +67,16 @@ def test_build_gmail_service_fails_fast_on_missing_mailbox() -> None:
     config = _gmail_config(mailbox=None)
     with pytest.raises(ConfigError, match="GMAIL_MONITORED_MAILBOX"):
         build_gmail_service(config)
+
+
+def test_service_account_requested_scope_is_exactly_gmail_readonly() -> None:
+    """[Story 5.3, AC4] Direct, minimal pin of the module constant against
+    a hardcoded literal (not derived from anything else in this file) --
+    the sibling test below already hardcodes this same literal against the
+    actual service-account credential call, so between the two, a future
+    change that broadens either the constant or what's actually requested
+    fails a test either way."""
+    assert ingest._GMAIL_READONLY_SCOPE == "https://www.googleapis.com/auth/gmail.readonly"
 
 
 def test_build_gmail_service_uses_readonly_scope_and_single_mailbox_subject(mocker) -> None:  # type: ignore[no-untyped-def]

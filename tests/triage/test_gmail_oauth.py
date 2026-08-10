@@ -4,7 +4,22 @@ from pathlib import Path
 import pytest
 from pytest_mock import MockerFixture
 
+from sentinel.triage import gmail_oauth
 from sentinel.triage.gmail_oauth import GMAIL_READONLY_SCOPE, get_credentials
+
+
+def test_requested_scope_is_exactly_gmail_readonly() -> None:
+    """[Story 5.3, AC4] Every other test in this file (and in
+    test_ingest.py's service-account equivalent) asserts against the
+    GMAIL_READONLY_SCOPE constant, not a hardcoded literal -- which means
+    a future change that silently broadens the constant's own value (e.g.
+    to gmail.modify) would pass every one of those tests unchanged, since
+    they'd just be comparing the broadened value to itself. This pins the
+    exact literal string and the list shape (exactly one scope) with no
+    reference to the constant, so a broadened scope fails here regardless
+    of what the constant is renamed or refactored to."""
+    assert gmail_oauth._SCOPES == ["https://www.googleapis.com/auth/gmail.readonly"]
+    assert GMAIL_READONLY_SCOPE == "https://www.googleapis.com/auth/gmail.readonly"
 
 
 def test_get_credentials_uses_cached_valid_token_without_flow(

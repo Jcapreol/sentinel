@@ -35,3 +35,27 @@ jobs:
 
       - name: Smoke test
         run: sentinel --help
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e . -r requirements-dev.txt
+
+      # Story 5.3, AC7: dependency vulnerability scanning, so a future CVE
+      # (like PYSEC-2026-3552, which this story fixed) surfaces automatically
+      # on every push/PR instead of only when someone happens to run
+      # pip-audit locally. Audits requirements.txt (the runtime dependency
+      # set actually shipped), not requirements-dev.txt -- a vulnerable dev
+      # tool is a lower-severity concern than a vulnerable runtime dependency
+      # and shouldn't block the same gate. Run pip-audit -r
+      # requirements-dev.txt locally if you also want dev tooling covered.
+      - name: Audit dependencies for known vulnerabilities
+        run: pip-audit -r requirements.txt
