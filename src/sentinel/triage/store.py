@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TypedDict, cast
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 from sentinel.config import Config, ConfigError
 from sentinel.triage.report import TriageReport
@@ -163,6 +163,78 @@ def read_evidence_record(
         return None
     plaintext = fernet.decrypt(row[0])
     return cast(EvidenceRecord, json.loads(plaintext))
+
+
+def _connect_read_only(db_path: str) -> sqlite3.Connection:
+    """Genuinely read-only connection, enforced by SQLite itself (mode=ro
+    URI) -- not merely "this caller happens not to call INSERT". Any write
+    attempt raises sqlite3.OperationalError unconditionally, and a missing
+    db file fails to open rather than silently creating an empty one
+    (verified empirically on Windows during Story 5.1). Deliberately does
+    NOT reuse _connect: that helper unconditionally runs CREATE TABLE IF
+    NOT EXISTS on every call, which a real mode=ro connection rejects even
+    when the table already exists and the statement would be a no-op."""
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+_REQUIRED_RECORD_KEYS = {"message_id", "sender", "report", "deferral_threshold_used"}
+_REQUIRED_REPORT_KEYS = {"verdict", "calibrated_confidence", "evidence", "timestamp"}
+
+
+def _is_well_formed_evidence_record(data: object) -> bool:
+    """[Review] A row can decrypt successfully under the correct key and
+    still not have the shape this codebase's EvidenceRecord/TriageReport
+    TypedDicts assume -- e.g. a legacy record predating a schema field
+    (real precedent: deferral_threshold_used was added in Story 1.6, per
+    _run_replay's own guard for exactly this). Both adversarial reviewers
+    independently reproduced a KeyError crash from an unguarded record
+    like this reaching the --view table renderer. Checked here, once, so
+    every caller of read_recent_evidence_records can trust the shape of
+    whatever it gets back, the same way read_evidence_record's existing
+    callers already implicitly do for well-formed data."""
+    if not isinstance(data, dict) or not _REQUIRED_RECORD_KEYS.issubset(data.keys()):
+        return False
+    report = data["report"]
+    return isinstance(report, dict) and _REQUIRED_REPORT_KEYS.issubset(report.keys())
+
+
+def read_recent_evidence_records(
+    db_path: str, config: Config
+) -> tuple[list[tuple[str, EvidenceRecord]], int]:
+    """Decrypts every row in evidence_records, most-recently-created first.
+    Verdict isn't a SQL column (it lives inside the encrypted blob), so
+    filtering by verdict and limiting the count are the caller's job, not
+    this function's -- this returns everything so the caller can apply
+    display policy on top. A row is skipped (never raised) for either of
+    two reasons, both counted together in the second return value: it
+    fails to decrypt under the current SENTINEL_EVIDENCE_KEY (e.g. a
+    record from before a key rotation), or it decrypts fine but isn't
+    valid JSON, or isn't shaped like a well-formed EvidenceRecord (see
+    _is_well_formed_evidence_record)."""
+    fernet = _require_fernet(config)
+    conn = _connect_read_only(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT message_hash, verdict_json FROM evidence_records ORDER BY created_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    records: list[tuple[str, EvidenceRecord]] = []
+    skipped = 0
+    for message_hash, verdict_json in rows:
+        try:
+            plaintext = fernet.decrypt(verdict_json)
+            parsed = json.loads(plaintext)
+        except (InvalidToken, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if not _is_well_formed_evidence_record(parsed):
+            skipped += 1
+            continue
+        records.append((message_hash, cast(EvidenceRecord, parsed)))
+    return records, skipped
 
 
 def purge_expired(db_path: str, config: Config) -> int:
