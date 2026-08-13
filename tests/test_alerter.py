@@ -200,6 +200,45 @@ def test_self_alert_marker_survives_send_to_parse_round_trip(
     assert extract_header_value(raw_bytes, SELF_ALERT_HEADER_NAME) == SELF_ALERT_HEADER_VALUE
 
 
+def test_email_alerter_renders_no_confidence_value_for_coverage_gap_payload(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Story 6.1] A CoverageGap verdict carries no confidence score at all
+    -- the alert body must render the state without a confidence value
+    rather than showing 0.500 or 0.000 (or crashing on ':.3f'-formatting
+    None). CoverageGap verdicts don't actually reach send_alert in
+    practice (they're absent from worker.py's alert-severity ranking), but
+    the payload construction/formatting path must stay type-safe and
+    correct regardless, as defense in depth."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = EmailAlerter(
+        host="smtp.gmail.com",
+        port=587,
+        username="me@gmail.com",
+        password="app-password",
+        recipient="alerts@example.com",
+    )
+    payload = AlertPayload(
+        timestamp="2026-08-13T12:00:00+00:00",
+        sender=None,
+        subject=None,
+        verdict="CoverageGap",
+        calibrated_confidence=None,
+        findings=[],
+    )
+
+    alerter.send(payload)
+
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    body = sent_message.get_content()
+    assert "CoverageGap" in body
+    assert "0.000" not in body
+    assert "0.500" not in body
+    assert "None" not in body
+    assert "N/A" in body
+
+
 def test_email_alerter_omits_subject_line_when_none(
     mocker,  # type: ignore[no-untyped-def]
 ) -> None:

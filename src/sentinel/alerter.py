@@ -47,7 +47,16 @@ class AlertPayload(TypedDict):
     sender: str | None
     subject: str | None
     verdict: str
-    calibrated_confidence: float
+    # [Story 6.1] None for a CoverageGap verdict (no analysis ran, so
+    # there is no confidence to report) -- see TriageReport's own
+    # calibrated_confidence docstring in triage/report.py. In practice a
+    # CoverageGap report never actually reaches send_alert (it has no
+    # entry in worker.py's _ALERT_VERDICT_SEVERITY ranking, so
+    # _verdict_meets_alert_threshold always returns False for it), but
+    # this field's type and _format_alert_body's rendering stay correct
+    # regardless, as defense in depth rather than relying on that one
+    # upstream gate alone.
+    calibrated_confidence: float | None
     findings: list[str]
 
 
@@ -56,9 +65,14 @@ class Alerter(Protocol):
 
 
 def _format_alert_body(payload: AlertPayload) -> str:
+    confidence_display = (
+        f"{payload['calibrated_confidence']:.3f}"
+        if payload["calibrated_confidence"] is not None
+        else "N/A"
+    )
     lines = [
         f"Sentinel triage alert: {payload['verdict']} "
-        f"(confidence={payload['calibrated_confidence']:.3f})",
+        f"(confidence={confidence_display})",
         "",
         f"Timestamp: {payload['timestamp']}",
         f"Sender: {payload['sender'] or '(unknown)'}",

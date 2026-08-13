@@ -157,20 +157,38 @@ def _default_corpus_path(config: Config) -> str:
     return config.eval_corpus_path or "benign_corpus_raw"
 
 
+class ScoreOutcome(TypedDict):
+    """[Story 6.1, AC7] Distinguishes WHY a file didn't produce a
+    calibrated_confidence, not just whether it did. is_coverage_gap=True
+    means the file itself could not be read at all -- this offline
+    harness's analog of a live Gmail fetch failure (there is no network
+    fetch here; a corpus file that cannot be read is the closest
+    equivalent to "the message could not be fetched," structurally the
+    same "nothing was analyzed" situation worker.py's CoverageGap verdict
+    represents). is_coverage_gap=False with calibrated_confidence=None
+    means the file WAS read but something else in the pipeline failed
+    (extraction, Watchman/Cipher, calibration) -- unchanged "skip"
+    behavior from before this story, still excluded from ECE/AUC-ROC
+    either way, but not conflated with a coverage gap in reporting."""
+    calibrated_confidence: float | None
+    is_coverage_gap: bool
+
+
 def _score_one_file(
     corpus_file: CorpusFile, watchman: SentinelAgent, cipher: SentinelAgent, deferral_band: float
-) -> float | None:
-    """Runs one file through the pipeline, returning its calibrated_confidence,
-    or None on any failure EXCEPT ApiCallBudgetExceededError, which
-    propagates uncaught to abort the whole run instead (Story 4.2, AC3 --
-    see the dedicated except clause below). [Review][Patch] This docstring
-    previously claimed "None on any failure" unconditionally, which was
-    stale even at the time it was written -- the ApiCallBudgetExceededError
-    carve-out already existed a few lines down (code review 2026-08-03).
-    Otherwise identical per-file failure-isolation discipline to
-    fit_real_calibration_model.py's (post-code-review) _score_one_file: both
-    extraction calls AND the pipeline call are guarded, not just the
-    pipeline call.
+) -> ScoreOutcome:
+    """Runs one file through the pipeline, returning its calibrated_confidence
+    (None on any failure EXCEPT ApiCallBudgetExceededError, which propagates
+    uncaught to abort the whole run instead -- Story 4.2, AC3, see the
+    dedicated except clause below) and whether that failure was specifically
+    a coverage gap (Story 6.1, AC7 -- see ScoreOutcome). [Review][Patch]
+    This docstring previously claimed "None on any failure" unconditionally,
+    which was stale even at the time it was written -- the
+    ApiCallBudgetExceededError carve-out already existed a few lines down
+    (code review 2026-08-03). Otherwise identical per-file failure-isolation
+    discipline to fit_real_calibration_model.py's (post-code-review)
+    _score_one_file: both extraction calls AND the pipeline call are
+    guarded, not just the pipeline call.
 
     [Fix] Now calls check_structural_deferral (src/sentinel/triage/worker.py)
     before apply_calibration, matching process_message's real order --
@@ -184,8 +202,12 @@ def _score_one_file(
     try:
         raw_bytes = Path(corpus_file["path"]).read_bytes()
     except OSError as e:
-        print(f"  WARNING: failed to read {corpus_file['path']}: {e} -- skipping", file=sys.stderr)
-        return None
+        print(
+            f"  WARNING: failed to read {corpus_file['path']}: {e} -- coverage gap "
+            "(file unavailable; nothing was analyzed) -- excluded from ECE/AUC-ROC",
+            file=sys.stderr,
+        )
+        return ScoreOutcome(calibrated_confidence=None, is_coverage_gap=True)
 
     try:
         auth_header = extract_auth_results_header_from_eml(raw_bytes)
@@ -194,12 +216,12 @@ def _score_one_file(
             auth_header, email_content, watchman, cipher
         )
         if check_structural_deferral(evidence, raw_score, deferral_band):
-            return 0.5
+            return ScoreOutcome(calibrated_confidence=0.5, is_coverage_gap=False)
         # [Review] apply_calibration is now inside this try too -- it only
         # raises for an unrecognized `method` (a hand-edited/corrupted
         # calibration_model_v1.json), but this function's own docstring
         # promises "None on any failure" unconditionally.
-        return apply_calibration(raw_score)
+        return ScoreOutcome(calibrated_confidence=apply_calibration(raw_score), is_coverage_gap=False)
     except ApiCallBudgetExceededError:
         # Story 4.2: must propagate uncaught, never treated as "this one
         # file failed, skip it and keep going" -- a budget-exceeded run
@@ -211,7 +233,7 @@ def _score_one_file(
             f"{type(e).__name__}: {e} -- skipping",
             file=sys.stderr,
         )
-        return None
+        return ScoreOutcome(calibrated_confidence=None, is_coverage_gap=False)
 
 
 class ScoredFile(TypedDict):
@@ -227,7 +249,7 @@ def collect_pairs(
     watchman: SentinelAgent,
     cipher: SentinelAgent,
     deferral_band: float = 0.0,
-) -> list[ScoredFile]:
+) -> tuple[list[ScoredFile], int]:
     """Runs the triage pipeline against each sampled file, pairing its
     calibrated_confidence with its class label (0.0 benign, 1.0 malicious)
     AND the file's own identity (content_hash, path). Only ever called with
@@ -241,6 +263,13 @@ def collect_pairs(
     `compute_deferral_rate` expect via a simple projection, so none of
     those three functions' own behavior changes.
 
+    [Story 6.1, AC7] Now returns (scored_files, coverage_gap_count) instead
+    of a bare list -- coverage-gap-equivalent files (unreadable, see
+    ScoreOutcome) were ALREADY excluded from scored_files before this story
+    (they always returned None, same bucket as any other failure); what's
+    new is tracking and reporting that subset distinctly, not a change to
+    what feeds ECE/AUC-ROC.
+
     [Fix] deferral_band defaults to 0.0 (only the all-neutral structural
     gate applies; the conflicting-but-uncertain gate never fires) rather
     than being required, so existing direct callers of this function that
@@ -251,6 +280,13 @@ def collect_pairs(
     ]
     total = len(targets)
     scored: list[ScoredFile] = []
+    coverage_gap_count = 0
+    # [Story 6.1 follow-up] Split per class purely for the zero-collected
+    # warning messages below -- coverage_gap_count itself (combined) is
+    # still the only count returned/reported elsewhere, matching AC7's
+    # single "analyzed N of N+M" metric.
+    benign_coverage_gaps = 0
+    malicious_coverage_gaps = 0
     benign_collected = 0
     malicious_collected = 0
     for index, (corpus_file, label) in enumerate(targets, start=1):
@@ -258,7 +294,15 @@ def collect_pairs(
             f"[{index}/{total}] processing {corpus_file['content_hash'][:12]}...",
             file=sys.stderr,
         )
-        calibrated_confidence = _score_one_file(corpus_file, watchman, cipher, deferral_band)
+        outcome = _score_one_file(corpus_file, watchman, cipher, deferral_band)
+        if outcome["is_coverage_gap"]:
+            coverage_gap_count += 1
+            if label == 0.0:
+                benign_coverage_gaps += 1
+            else:
+                malicious_coverage_gaps += 1
+            continue
+        calibrated_confidence = outcome["calibrated_confidence"]
         if calibrated_confidence is not None:
             scored.append(
                 ScoredFile(
@@ -272,7 +316,24 @@ def collect_pairs(
                 benign_collected += 1
             else:
                 malicious_collected += 1
-    print(f"Collected {len(scored)} pairs ({total - len(scored)} skipped)", file=sys.stderr)
+    other_failures = total - len(scored) - coverage_gap_count
+    print(
+        f"Collected {len(scored)} pairs ({other_failures} skipped for other reasons, "
+        f"{coverage_gap_count} coverage gap(s))",
+        file=sys.stderr,
+    )
+    # [Story 6.1, AC7] Exact "analyzed N of N+M" form, M = coverage_gap_count
+    # specifically -- distinct from the line above, which also folds in
+    # other-reason failures. "N+M" here means "how many files were even
+    # available to analyze," a different denominator than `total` (which
+    # also includes files whose content WAS available but failed for an
+    # unrelated pipeline reason).
+    analyzed = len(scored)
+    print(
+        f"Coverage: analyzed {analyzed} of {analyzed + coverage_gap_count} "
+        f"({coverage_gap_count} coverage gap(s) excluded from ECE/AUC-ROC)",
+        file=sys.stderr,
+    )
 
     # [Review] Without this, a total dropout of one class's samples (e.g. a
     # systemic extraction issue affecting only that class's file encoding)
@@ -280,20 +341,38 @@ def collect_pairs(
     # discrimination -- both just show a low/degenerate AUC-ROC with no
     # explanation of the actual root cause.
     if sampled_benign and benign_collected == 0:
+        # [Story 6.1 follow-up] benign_coverage_gaps is already in scope here
+        # -- if it accounts for the whole shortfall, say so; a maintainer
+        # reading "pipeline call failed" when the real cause is "the files
+        # were never readable" chases the wrong root cause.
+        cause = (
+            f"all {benign_coverage_gaps} were coverage gap(s) (files unreadable)"
+            if benign_coverage_gaps == len(sampled_benign)
+            else (
+                f"every sampled benign file's pipeline call failed or was a coverage gap "
+                f"({benign_coverage_gaps} of {len(sampled_benign)} were coverage gaps)"
+            )
+        )
         print(
-            "WARNING: zero benign pairs collected -- every sampled benign file's pipeline "
-            "call failed. AUC-ROC/ECE below reflect malicious-only data, not a real "
-            "discrimination measurement.",
+            f"WARNING: zero benign pairs collected -- {cause}. AUC-ROC/ECE below reflect "
+            "malicious-only data, not a real discrimination measurement.",
             file=sys.stderr,
         )
     if sampled_malicious and malicious_collected == 0:
+        cause = (
+            f"all {malicious_coverage_gaps} were coverage gap(s) (files unreadable)"
+            if malicious_coverage_gaps == len(sampled_malicious)
+            else (
+                f"every sampled malicious file's pipeline call failed or was a coverage gap "
+                f"({malicious_coverage_gaps} of {len(sampled_malicious)} were coverage gaps)"
+            )
+        )
         print(
-            "WARNING: zero malicious pairs collected -- every sampled malicious file's "
-            "pipeline call failed. AUC-ROC/ECE below reflect benign-only data, not a real "
-            "discrimination measurement.",
+            f"WARNING: zero malicious pairs collected -- {cause}. AUC-ROC/ECE below reflect "
+            "benign-only data, not a real discrimination measurement.",
             file=sys.stderr,
         )
-    return scored
+    return scored, coverage_gap_count
 
 
 def _bin_range_for_confidence(
@@ -361,6 +440,12 @@ class EvaluationReport(TypedDict):
     deferral_rate: float
     is_identity_placeholder: bool
     gate_met: bool | None  # None iff is_identity_placeholder (N/A, not a real verdict)
+    # [Story 6.1, AC7] Files that could not be read at all (this offline
+    # harness's analog of a live Gmail fetch failure) -- already excluded
+    # from sample_count/ece_result/auc_roc/deferral_rate (unchanged from
+    # before this story), exposed here as a first-class report field so a
+    # caller doesn't have to scrape stderr to know the coverage-gap count.
+    coverage_gap_count: int
 
 
 def run(
@@ -420,12 +505,25 @@ def run(
         file=sys.stderr,
     )
 
-    scored_files = collect_pairs(sampled_benign, sampled_malicious, watchman, cipher, deferral_band)
+    scored_files, coverage_gap_count = collect_pairs(
+        sampled_benign, sampled_malicious, watchman, cipher, deferral_band
+    )
     if not scored_files:
+        total_sampled = len(sampled_benign) + len(sampled_malicious)
+        # [Story 6.1 follow-up] Name coverage gaps explicitly when they
+        # explain the whole shortfall -- "every sampled file's pipeline call
+        # failed" is misleading when the real cause is "every file was
+        # unreadable and never reached the pipeline at all."
+        if total_sampled > 0 and coverage_gap_count == total_sampled:
+            raise ValueError(
+                f"Collected zero (confidence, label) pairs -- all {coverage_gap_count} "
+                "sampled file(s) were coverage gaps (unreadable); none reached the pipeline"
+            )
         raise ValueError(
             "Collected zero (confidence, label) pairs -- either zero files were sampled "
-            "(check --sample-size-per-class and the corpus's held_out split sizes) or every "
-            "sampled file's pipeline call failed"
+            "(check --sample-size-per-class and the corpus's held_out split sizes), every "
+            f"sampled file's pipeline call failed, or it was a coverage gap "
+            f"({coverage_gap_count} of {total_sampled} sampled file(s) were coverage gaps)"
         )
 
     # Plain (confidence, label) pairs, projected from scored_files --
@@ -478,6 +576,7 @@ def run(
         deferral_rate=deferral_rate,
         is_identity_placeholder=is_identity_placeholder,
         gate_met=gate_met,
+        coverage_gap_count=coverage_gap_count,
     )
 
 
@@ -485,6 +584,14 @@ def _print_report(report: EvaluationReport) -> None:
     print()
     print("=== Evaluation Harness Report ===")
     print(f"Sample count: {report['sample_count']}")
+    # [Story 6.1, AC7] Same "analyzed N of N+M" form collect_pairs already
+    # printed as it ran; repeated here in the final summary block so it
+    # isn't scrolled past in a long run's stderr output.
+    analyzed = report["sample_count"]
+    print(
+        f"Coverage: analyzed {analyzed} of {analyzed + report['coverage_gap_count']} "
+        f"({report['coverage_gap_count']} coverage gap(s) excluded from ECE/AUC-ROC)"
+    )
     print()
     print(f"ECE (10-bin): {report['ece_result']['ece']:.4f}")
     for b in report["ece_result"]["bins"]:

@@ -71,16 +71,25 @@ def _write_eml(path: Path, subject: str, body: str) -> None:
     path.write_bytes((headers + "\r\n" + body).encode())
 
 
-def _write_class(root: Path, cls: str, tuning_count: int, held_out_count: int) -> None:
+def _write_class(
+    root: Path, cls: str, tuning_count: int, held_out_count: int, phishing_adjacent_every: int = 10
+) -> None:
     """Deliberately different tuning/held_out counts (8 vs 35 -- the mirror
     image of fit_real_calibration_model.py's fixture) so an off-by-split-
     name bug is detectable -- if this script ever accidentally reads
     tuning, the resulting pair/call count would visibly not match what
-    sampling from held_out alone predicts."""
+    sampling from held_out alone predicts.
+
+    phishing_adjacent_every controls the 1-in-N ratio of files using
+    _PHISHING_ADJACENT_BODY (default 10, i.e. exactly validate_corpus's own
+    10% minimum -- sufficient for most tests, but only just, and any test
+    that also makes a file unreadable during validation, not just scoring,
+    needs a wider margin to avoid flaking depending on which specific file
+    that happens to be)."""
     (root / cls).mkdir(parents=True, exist_ok=True)
     (root / cls / "PROVENANCE.md").write_text(_PROVENANCE_TEXT, encoding="utf-8")
 
-    bodies = [_PHISHING_ADJACENT_BODY] + [_PLAIN_BODY] * 9
+    bodies = [_PHISHING_ADJACENT_BODY] + [_PLAIN_BODY] * (phishing_adjacent_every - 1)
 
     for i in range(tuning_count):
         body = f"{bodies[i % len(bodies)]} (unique marker {cls}-t{i})"
@@ -147,6 +156,65 @@ def test_run_produces_an_evaluation_report_from_sampled_pairs(valid_corpus) -> N
     assert 0.0 <= report["deferral_rate"] <= 1.0
     assert report["is_identity_placeholder"] is False
     assert report["gate_met"] in (True, False)
+    assert report["coverage_gap_count"] == 0
+
+
+def test_run_reports_coverage_gap_count_excluded_from_sample_count(  # type: ignore[no-untyped-def]
+    tmp_path: Path, mocker, capsys
+) -> None:
+    """[Story 6.1, AC7/AC8] End-to-end verification through run() itself
+    (not just collect_pairs in isolation): one genuinely unreadable file
+    among a small sample is counted in coverage_gap_count, excluded from
+    sample_count/ECE/AUC-ROC, and the "analyzed N of N+M" line appears in
+    stderr.
+
+    Uses a dedicated corpus (not the shared valid_corpus fixture) with a
+    comfortably large phishing-adjacent-content margin -- validate_corpus's
+    own benign-diversity check reads the same files this test's mock
+    targets (Path.read_bytes is patched globally, affecting every reader,
+    not just this script's scoring step), so a corpus sitting close to the
+    10% diversity minimum would make this test's pass/fail depend on
+    exactly which file the deterministic content-hash sampling happens to
+    pick -- flaky in a way unrelated to what this test actually verifies."""
+    from sentinel.triage.eval import load_corpus, sample_corpus_files
+
+    _write_class(tmp_path, "benign", tuning_count=8, held_out_count=35, phishing_adjacent_every=2)
+    _write_class(tmp_path, "malicious", tuning_count=8, held_out_count=35, phishing_adjacent_every=2)
+    corpus = load_corpus(str(tmp_path))
+
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+
+    # Determine exactly which file this run's sampling will pick first, so
+    # the mock targets that specific path -- not "the Nth Path.read_bytes
+    # call globally," which also fires during validate_corpus's own
+    # benign-diversity content check (an earlier, unrelated read).
+    sampled_benign = sample_corpus_files(corpus["benign_held_out"], 3)
+    unreadable_path = str(Path(sampled_benign[0]["path"]).resolve())
+
+    real_read_bytes = Path.read_bytes
+
+    def flaky_read_bytes(self: Path, *args: object, **kwargs: object) -> bytes:
+        if str(self.resolve()) == unreadable_path:
+            raise OSError("simulated: one file unavailable")
+        return real_read_bytes(self, *args, **kwargs)
+
+    mocker.patch("pathlib.Path.read_bytes", flaky_read_bytes)
+
+    report = script.run(
+        corpus,
+        _REAL_ISOTONIC_MODEL,
+        sample_size_per_class=3,
+        deferral_band=0.05,
+        watchman=watchman,
+        cipher=cipher,
+    )
+
+    assert report["coverage_gap_count"] == 1
+    assert report["sample_count"] == 5  # 6 sampled, 1 coverage gap excluded
+    err = capsys.readouterr().err
+    assert "Coverage: analyzed 5 of 6" in err
+    assert "1 coverage gap" in err
 
 
 def test_collect_pairs_assigns_correct_labels_to_each_class(valid_corpus) -> None:  # type: ignore[no-untyped-def]
@@ -160,7 +228,7 @@ def test_collect_pairs_assigns_correct_labels_to_each_class(valid_corpus) -> Non
     sampled_benign = valid_corpus["benign_held_out"][:2]
     sampled_malicious = valid_corpus["malicious_held_out"][:3]
 
-    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored, _coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
     labels = [sf["label"] for sf in scored]
     assert labels == [0.0, 0.0, 1.0, 1.0, 1.0]
@@ -177,7 +245,7 @@ def test_collect_pairs_records_correct_file_identity(valid_corpus) -> None:  # t
     sampled_benign = valid_corpus["benign_held_out"][:2]
     sampled_malicious = valid_corpus["malicious_held_out"][:2]
 
-    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored, _coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
     assert len(scored) == 4
     expected_by_hash = {f["content_hash"]: f for f in sampled_benign + sampled_malicious}
@@ -272,9 +340,65 @@ def test_collect_pairs_skips_unreadable_file_without_aborting(  # type: ignore[n
 
     mocker.patch("pathlib.Path.read_bytes", flaky_read_bytes)
 
-    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored, coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
     assert len(scored) == 3
+
+
+def test_collect_pairs_counts_unreadable_file_as_coverage_gap_not_generic_skip(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker
+) -> None:
+    """[Story 6.1, AC7] A file that cannot be read at all is the offline
+    harness's analog of a live Gmail fetch failure -- the content is
+    genuinely unavailable, there was nothing to analyze. This must be
+    counted and reported as a coverage gap, distinct from a generic
+    pipeline failure (content available, something else went wrong --
+    unchanged 'skip' behavior, still excluded from ECE/AUC-ROC either
+    way, but not conflated in the reporting)."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    sampled_benign = valid_corpus["benign_held_out"][:2]
+    sampled_malicious = valid_corpus["malicious_held_out"][:2]
+
+    real_read_bytes = Path.read_bytes
+    call_count = {"n": 0}
+
+    def flaky_read_bytes(self: Path, *args: object, **kwargs: object) -> bytes:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise OSError("simulated: file unavailable")
+        return real_read_bytes(self, *args, **kwargs)
+
+    mocker.patch("pathlib.Path.read_bytes", flaky_read_bytes)
+
+    scored, coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+
+    assert len(scored) == 3
+    assert coverage_gap_count == 1
+
+
+def test_collect_pairs_generic_pipeline_failure_is_not_counted_as_coverage_gap(  # type: ignore[no-untyped-def]
+    valid_corpus, mocker
+) -> None:
+    """[Story 6.1, AC7] A pipeline failure where the file WAS read
+    successfully (extraction/analysis crashed for some unrelated reason)
+    must NOT be counted as a coverage gap -- the content was available;
+    something else went wrong. Still excluded from `scored`/ECE/AUC-ROC,
+    same as before this story, but coverage_gap_count must stay 0."""
+    watchman = _mock_agent()
+    cipher = _mock_agent()
+    sampled_benign = valid_corpus["benign_held_out"][:2]
+    sampled_malicious = valid_corpus["malicious_held_out"][:2]
+
+    mocker.patch(
+        "run_evaluation_harness.extract_email_content",
+        side_effect=RuntimeError("simulated extraction failure"),
+    )
+
+    scored, coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+
+    assert scored == []
+    assert coverage_gap_count == 0
 
 
 def test_collect_pairs_warns_when_one_class_contributes_zero_pairs(  # type: ignore[no-untyped-def]
@@ -304,7 +428,7 @@ def test_collect_pairs_warns_when_one_class_contributes_zero_pairs(  # type: ign
 
     mocker.patch("run_evaluation_harness.gather_evidence_and_raw_score", side_effect=selective_gather)
 
-    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored, _coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
     assert len(scored) == 3  # only benign succeeded
     assert all(sf["label"] == 0.0 for sf in scored)
@@ -326,7 +450,7 @@ def test_collect_pairs_skips_file_when_content_extraction_raises(  # type: ignor
         side_effect=RuntimeError("simulated extraction failure"),
     )
 
-    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored, _coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
     assert scored == []
 
@@ -358,7 +482,7 @@ def test_collect_pairs_skips_file_when_apply_calibration_raises(  # type: ignore
         side_effect=RuntimeError("simulated: unrecognized calibration method"),
     )
 
-    scored = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
+    scored, _coverage_gap_count = script.collect_pairs(sampled_benign, sampled_malicious, watchman, cipher)
 
     assert scored == []
 
@@ -394,7 +518,7 @@ def test_collect_pairs_defers_structurally_for_all_neutral_evidence_even_if_cali
         "run_evaluation_harness.apply_calibration", return_value=1.0
     )
 
-    scored = script.collect_pairs(
+    scored, _coverage_gap_count = script.collect_pairs(
         sampled_benign, sampled_malicious, watchman, cipher, deferral_band=0.05
     )
 

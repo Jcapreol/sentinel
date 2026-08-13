@@ -34,6 +34,7 @@ def _make_report(
         schema_version=1,
         message_hash="idhash123",
         timestamp=timestamp,
+        coverage_gap_reason=None,
     )
 
 

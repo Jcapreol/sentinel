@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from sentinel.config import Config, ConfigError
 from sentinel.triage.evidence import EvidenceItem
@@ -276,6 +277,96 @@ def test_process_message_fetch_failed_defers_never_directional() -> None:
     assert report["verdict"] != "Benign"
 
 
+def _assert_never_confidence_half_with_empty_evidence(report: TriageReport) -> None:
+    """[Story 6.1, AC3] The core invariant this story exists to enforce:
+    confidence 0.500 must never co-occur with an empty evidence/findings
+    list. Before this story, EVERY ingest-layer fetch-failure path produced
+    exactly that combination (Deferred, calibrated_confidence=0.5,
+    evidence=[<one synthetic placeholder item>]) -- misrepresenting "no
+    analysis happened" as "analysis happened and was genuinely uncertain,"
+    which polluted calibration metrics with entries that were never real
+    predictions. After this story, the only path producing empty evidence
+    is CoverageGap, which never carries confidence 0.5 (it carries None) --
+    checked both directions here, not just one, since either direction
+    failing would reopen the bug this story closes."""
+    if report["evidence"] == []:
+        assert report["calibrated_confidence"] is None, (
+            f"report with empty evidence must have confidence=None, got "
+            f"{report['calibrated_confidence']!r} (verdict={report['verdict']!r})"
+        )
+    if report["calibrated_confidence"] == 0.5:
+        assert report["evidence"] != [], (
+            "report with confidence=0.5 must have real, non-empty evidence "
+            f"(verdict={report['verdict']!r})"
+        )
+
+
+def test_no_code_path_emits_confidence_half_with_empty_evidence(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Story 6.1, AC3] Exercises every currently-known TriageReport-
+    producing code path and asserts the invariant on each of their outputs.
+    Fails if a future change reintroduces the bug on any of these paths, or
+    adds a new path that violates it."""
+    config = store_config
+
+    # Path 1: process_message, header fetch failed (FetchFailed) -- stays
+    # Deferred by design (message content itself was available), not
+    # CoverageGap, but must still respect the invariant.
+    header_fetch_failed_report = process_message(
+        "m1", FetchFailed(), "", _neutral_agent, _neutral_agent, config
+    )
+    _assert_never_confidence_half_with_empty_evidence(header_fetch_failed_report)
+
+    # Path 2: process_message, structural deferral Gate 1 (all-neutral
+    # evidence) -- real evidence was gathered (header investigation always
+    # contributes at least one item per SPF/DKIM/DMARC mechanism), just
+    # entirely uninformative. Must have confidence 0.5 with NON-empty
+    # evidence (the normal, correct case this invariant protects).
+    structural_deferral_report = process_message(
+        "m2", None, "irrelevant content", _neutral_agent, _neutral_agent, config
+    )
+    assert structural_deferral_report["calibrated_confidence"] == 0.5
+    assert structural_deferral_report["evidence"] != []
+    _assert_never_confidence_half_with_empty_evidence(structural_deferral_report)
+
+    # Path 3: run_poll_cycle, raw-content-fetch failure (the real-world
+    # coverage-gap case -- Gmail 404, message unavailable). Must now be
+    # CoverageGap with empty evidence and confidence=None.
+    from sentinel.triage.store import read_evidence_record, save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    gmail_config = replace(
+        config,
+        gmail_monitored_mailbox="soc@example.com",
+        gmail_credentials_path="secrets/gmail-service-account.json",
+    )
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m3"}}]}]
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {"payload": {"headers": []}},
+        RuntimeError("boom"),
+        {"payload": {"headers": []}},  # Story 5.2.1 fallback marker/sender fetch
+    ]
+
+    run_poll_cycle(gmail_config, store_db_path, _neutral_agent, _neutral_agent)
+
+    coverage_gap_hash = hashlib.sha256(b"m3").hexdigest()
+    record = read_evidence_record(store_db_path, coverage_gap_hash, gmail_config)
+    assert record is not None
+    coverage_gap_report = record["report"]
+    assert coverage_gap_report["verdict"] == "CoverageGap"
+    _assert_never_confidence_half_with_empty_evidence(coverage_gap_report)
+
+
 def test_process_message_fetch_failed_never_calls_header_investigation(mocker) -> None:  # type: ignore[no-untyped-def]
     # FetchFailed must short-circuit before investigate_header_authentication is
     # ever called — a fetch failure carries no header data to investigate.
@@ -463,11 +554,12 @@ def test_bad_deferral_threshold_does_not_affect_cli_web_startup(
 
 def _make_report(
     verdict: str = "Malicious",
-    calibrated_confidence: float = 0.9,
+    calibrated_confidence: float | None = 0.9,
     evidence: list[EvidenceItem] | None = None,
     schema_version: int = 1,
     message_hash: str = "idhash123",
     timestamp: str = "2026-07-22T00:00:00+00:00",
+    coverage_gap_reason: str | None = None,
 ) -> TriageReport:
     return TriageReport(
         verdict=verdict,  # type: ignore[typeddict-item]
@@ -476,6 +568,7 @@ def _make_report(
         schema_version=schema_version,
         message_hash=message_hash,
         timestamp=timestamp,
+        coverage_gap_reason=coverage_gap_reason,
     )
 
 
@@ -682,6 +775,51 @@ def test_replay_recomputes_calibration_not_raw_score(
         main()
 
     assert exc.value.code == 0
+
+
+def test_replay_coverage_gap_record_refuses_with_clear_message(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Story 6.1] A CoverageGap record has no evidence and no
+    calibrated_confidence -- there is nothing to recompute and compare, so
+    replay must refuse explicitly with a clear message, not crash trying
+    to math.isclose(None, ...) or misleadingly "match" via
+    compute_raw_score([]) happening to equal something. A non-zero exit
+    code alone isn't proof of a clean refusal -- an unguarded crash caught
+    only by main()'s generic catch-all would also exit non-zero, so this
+    test also pins the exact, specific stderr message and rejects the
+    generic "unexpected error" wording that catch-all uses."""
+    report = _make_report(
+        verdict="CoverageGap",
+        calibrated_confidence=None,
+        evidence=[],
+        coverage_gap_reason="Failed to fetch raw message content: HttpError 404",
+    )
+    record = EvidenceRecord(
+        message_id="m1",
+        sender=None,
+        report=report,
+        deferral_threshold_used=store_config.deferral_threshold,
+    )
+    persist_evidence_record(store_db_path, "idhash123", record, store_config)
+
+    mocker.patch(
+        "sys.argv",
+        ["sentinel-triage", "--replay", "idhash123", "--db-path", store_db_path],
+    )
+    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code != 0
+    err = capsys.readouterr().err.lower()
+    assert "unexpected error" not in err
+    assert "coveragegap" in err
+    assert "nothing" in err or "no analysis" in err or "no evidence" in err
 
 
 def test_replay_legacy_record_missing_deferral_threshold_used_exits_nonzero_with_clear_message(
@@ -895,11 +1033,14 @@ def test_run_poll_cycle_calls_purge_expired(
     spy.assert_called_once_with(store_db_path, config)
 
 
-def test_run_poll_cycle_raw_fetch_failure_persists_deferred_coverage_gap(
+def test_run_poll_cycle_raw_fetch_failure_persists_coverage_gap(
     mocker,  # type: ignore[no-untyped-def]
     store_db_path: str,
     store_config: Config,
 ) -> None:
+    """[Story 6.1] A raw-content-fetch failure (the message is unavailable,
+    e.g. Gmail 404) is a CoverageGap, not a Deferred/0.5 -- no analysis ran,
+    so there is nothing to be uncertain about."""
     from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
@@ -924,8 +1065,159 @@ def test_run_poll_cycle_raw_fetch_failure_persists_deferred_coverage_gap(
     fallback_hash = hashlib.sha256(b"m1").hexdigest()
     record = read_evidence_record(store_db_path, fallback_hash, config)
     assert record is not None
-    assert record["report"]["verdict"] == "Deferred"
+    assert record["report"]["verdict"] == "CoverageGap"
+    assert record["report"]["calibrated_confidence"] is None
+    assert record["report"]["evidence"] == []
+    assert record["report"]["coverage_gap_reason"] is not None
+    assert "raw message content" in record["report"]["coverage_gap_reason"]
     assert record["sender"] is None
+
+
+# [Story 6.1, AC4] The 5 real coverage-gap message IDs from the live
+# 2026-08-13 production incident (cron.log-confirmed: both the header fetch
+# and the raw content fetch returned Gmail's real 404 "Requested entity was
+# not found" for each of these, meaning the message was deleted or moved
+# out of the mailbox between the list call and the fetch call). The exact
+# decrypted records aren't reachable from this repo (they live in the
+# deployed instance's own data/evidence.db, confirmed separately not to be
+# this repo's local dev database), so these fixtures reproduce the
+# confirmed real failure PATTERN against the real IDs via mocking, rather
+# than replaying literal stored bytes -- the same discipline this
+# codebase already uses for every other Gmail-API-failure fixture in this
+# file (see e.g. the RuntimeError("boom")-based tests above).
+_REAL_COVERAGE_GAP_MESSAGE_IDS = [
+    "19fedf6c147a8c64",
+    "19fedf27012de50e",
+    "19ff2718cf3ac070",
+    "19ff54db173d218b",
+    "19ff7e1b1d32d5ac",
+]
+_REAL_NEGATIVE_CONTROL_MESSAGE_ID = "19ff26dff54207bc"
+
+
+def _gmail_404_error() -> HttpError:
+    """Reproduces the real, exact Gmail API error shape observed in
+    cron.log for all 5 coverage-gap incidents: HttpError 404, message
+    "Requested entity was not found.", reason "notFound"."""
+    import unittest.mock
+
+    resp = unittest.mock.MagicMock(status=404, reason="Not Found")
+    content = (
+        b'{"error": {"code": 404, "message": "Requested entity was not found.", '
+        b'"errors": [{"reason": "notFound"}]}}'
+    )
+    return HttpError(resp, content)
+
+
+@pytest.mark.parametrize("message_id", _REAL_COVERAGE_GAP_MESSAGE_IDS)
+def test_real_coverage_gap_message_ids_resolve_to_coverage_gap(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    message_id: str,
+) -> None:
+    """[Story 6.1, AC4] Each of the 5 real message IDs confirmed against
+    cron.log to have failed BOTH the header fetch and the raw content
+    fetch with Gmail's real 404 -- matching the "Observed pattern" from
+    the live data: every real incident was a full fetch failure, never a
+    partial (header-only or raw-only) one. Each must resolve to
+    CoverageGap, not Deferred/0.500."""
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _gmail_config(store_config)
+
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": message_id}}]}]
+    }
+    # Both the header metadata fetch AND the raw content fetch 404 --
+    # matching the real observed pattern exactly (never just one).
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        _gmail_404_error(),  # Authentication-Results metadata fetch
+        _gmail_404_error(),  # raw content fetch
+        _gmail_404_error(),  # Story 5.2.1 fallback marker/sender fetch
+    ]
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    expected_hash = hashlib.sha256(message_id.encode()).hexdigest()
+    record = read_evidence_record(store_db_path, expected_hash, config)
+    assert record is not None
+    assert record["message_id"] == message_id
+    assert record["report"]["verdict"] == "CoverageGap"
+    assert record["report"]["calibrated_confidence"] is None
+    assert record["report"]["evidence"] == []
+    assert record["sender"] is None
+
+
+def test_real_negative_control_message_id_stays_genuinely_deferred(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Story 6.1, AC4] Regression guard: the negative-control message ID is
+    a REAL Deferred verdict from the live data with NO preceding ingest
+    failure (both fetches succeed; the deferral comes from genuine,
+    analyzed, conflicting/uncertain evidence). This must NOT be
+    reclassified as CoverageGap -- proving this story's fix is scoped to
+    actual fetch failures, not to the Deferred verdict generally."""
+    from sentinel.triage.store import save_history_checkpoint
+
+    save_history_checkpoint(store_db_path, "999")
+    config = _gmail_config(store_config)
+    message_id = _REAL_NEGATIVE_CONTROL_MESSAGE_ID
+
+    # Both fetches succeed (real content is read and analyzed) -- the
+    # Authentication-Results header is PRESENT but unparseable into any
+    # recognized SPF/DKIM/DMARC mechanism, and Watchman/Cipher (via
+    # _neutral_agent) contribute nothing directional either. This
+    # reliably triggers structural deferral Gate 1 (all-neutral evidence)
+    # regardless of exact per-mechanism weight arithmetic -- a real,
+    # genuine "nothing informative found" analysis, not a fetch failure.
+    raw_content = (
+        b"From: Your Local Chick-fil-A <noreply@email.chick-fil-a.com>\r\n"
+        b"Subject: Rewards update\r\n\r\n"
+        b"Check your account for updates."
+    )
+    encoded = base64.urlsafe_b64encode(raw_content).decode()
+
+    service = mocker.MagicMock()
+    mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": message_id}}]}]
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = [
+        {
+            "payload": {
+                "headers": [
+                    {
+                        "name": "Authentication-Results",
+                        "value": "mx.google.com; nothing=parseable",
+                    }
+                ]
+            }
+        },
+        {"raw": encoded},
+    ]
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    content_hash = hashlib.sha256(raw_content).hexdigest()
+    record = read_evidence_record(store_db_path, content_hash, config)
+    assert record is not None
+    assert record["message_id"] == message_id
+    assert record["report"]["verdict"] == "Deferred"
+    assert record["report"]["verdict"] != "CoverageGap"
+    assert record["report"]["calibrated_confidence"] is not None
+    assert record["report"]["evidence"] != []
 
 
 def test_run_poll_cycle_raw_fetch_failure_still_recognizes_self_alert_via_fallback_fetch(
@@ -982,8 +1274,9 @@ def test_run_poll_cycle_raw_fetch_failure_fallback_check_itself_failing_does_not
 ) -> None:
     """If the fallback metadata fetch ALSO fails (e.g. a sustained Gmail-side
     outage affecting both endpoints), this must not crash the message -- it
-    falls through to the existing, pre-5.2.1 coverage-gap behavior exactly
-    as before this story."""
+    falls through to the existing coverage-gap behavior (Story 6.1:
+    verdict="CoverageGap") exactly as when only the raw-content fetch fails
+    and the fallback isn't needed at all."""
     from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
@@ -1008,7 +1301,7 @@ def test_run_poll_cycle_raw_fetch_failure_fallback_check_itself_failing_does_not
     fallback_hash = hashlib.sha256(b"m1").hexdigest()
     record = read_evidence_record(store_db_path, fallback_hash, config)
     assert record is not None
-    assert record["report"]["verdict"] == "Deferred"
+    assert record["report"]["verdict"] == "CoverageGap"
 
 
 def test_run_poll_cycle_raw_fetch_failure_does_not_stop_remaining_messages(
@@ -1846,15 +2139,25 @@ def test_alert_payload_includes_subject_extracted_from_email_content(
     assert payload["verdict"] == "Malicious"
 
 
-def test_alert_payload_subject_is_none_on_raw_fetch_failure_path(
+@pytest.mark.parametrize("alert_threshold", ["Deferred", "Malicious"])
+def test_coverage_gap_never_fires_an_alert_regardless_of_threshold(
     mocker,  # type: ignore[no-untyped-def]
     store_db_path: str,
     store_config: Config,
+    alert_threshold: str,
 ) -> None:
+    """[Story 6.1] Before this story, a raw-fetch failure ALWAYS persisted a
+    Deferred/0.5 record, which met the default "Deferred" alert threshold
+    and fired an alert on EVERY message-unavailable event -- an
+    operationally noisy false positive with no real signal behind it (the
+    message doesn't exist; there is nothing to alert about). CoverageGap
+    has no entry in _ALERT_VERDICT_SEVERITY, so _verdict_meets_alert_
+    threshold structurally can never return True for it -- proven here at
+    BOTH configured thresholds, not just the default."""
     from sentinel.triage.store import save_history_checkpoint
 
     save_history_checkpoint(store_db_path, "999")
-    config = _alert_config(store_config, alert_threshold="Deferred")
+    config = _alert_config(store_config, alert_threshold=alert_threshold)
     service = mocker.MagicMock()
     mocker.patch("sentinel.triage.worker.build_gmail_service", return_value=service)
     service.users.return_value.getProfile.return_value.execute.return_value = {
@@ -1872,12 +2175,7 @@ def test_alert_payload_subject_is_none_on_raw_fetch_failure_path(
 
     run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
 
-    # The raw-fetch-failure path always persists a Deferred coverage-gap
-    # record, which meets the default Deferred threshold.
-    alert_spy.assert_called_once()
-    payload = alert_spy.call_args.args[1]
-    assert payload["subject"] is None
-    assert payload["sender"] is None
+    alert_spy.assert_not_called()
 
 
 # --- self-alert feedback-loop prevention (Story 5.2.1) -----------------------
@@ -2508,8 +2806,16 @@ def _persist(
     sender: str | None = "alice@example.com",
     evidence: list[EvidenceItem] | None = None,
     timestamp: str = "2026-08-09T00:00:00+00:00",
+    calibrated_confidence: float | None = 0.9,
+    coverage_gap_reason: str | None = None,
 ) -> None:
-    report = _make_report(verdict=verdict, evidence=evidence, timestamp=timestamp)
+    report = _make_report(
+        verdict=verdict,
+        evidence=evidence,
+        timestamp=timestamp,
+        calibrated_confidence=calibrated_confidence,
+        coverage_gap_reason=coverage_gap_reason,
+    )
     record = EvidenceRecord(
         message_id=message_hash,
         sender=sender,
@@ -2550,6 +2856,140 @@ def test_run_view_renders_table_with_required_columns(
     assert "phisher@evil.example" in err
     assert "Malicious" in err
     assert "Suspicious login URL" in err
+    assert "1 shown, 0 skipped" in err
+
+
+def test_run_view_renders_coverage_gap_without_confidence_value(
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Story 6.1, AC5] A CoverageGap record has calibrated_confidence=None
+    -- the CONF column must render a placeholder (not crash trying to
+    format None as ':.3f', and not show 0.000 or 0.500, either of which
+    would misleadingly look like a real measured value)."""
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(
+        store_db_path,
+        config,
+        "hash1",
+        verdict="CoverageGap",
+        sender=None,
+        evidence=[],
+        calibrated_confidence=None,
+        coverage_gap_reason="Failed to fetch raw message content: HttpError 404",
+        timestamp="2026-08-13T09:00:00+00:00",
+    )
+
+    run_view(config, store_db_path, 20, None)
+
+    err = capsys.readouterr().err
+    assert "CoverageGap" in err
+    assert "0.000" not in err
+    assert "0.500" not in err
+    assert "N/A" in err
+    assert "Failed to fetch raw message content" in err
+    assert "1 shown, 0 skipped" in err
+
+
+def test_run_view_verdict_filter_matches_coverage_gap(
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Story 6.1] --verdict CoverageGap must be a valid filter value,
+    isolating coverage-gap records from everything else."""
+    config = replace(store_config, evidence_db_path=store_db_path)
+    _persist(store_db_path, config, "hash1", verdict="Malicious")
+    _persist(
+        store_db_path,
+        config,
+        "hash2",
+        verdict="CoverageGap",
+        sender=None,
+        evidence=[],
+        calibrated_confidence=None,
+        coverage_gap_reason="Failed to fetch raw message content: HttpError 404",
+        timestamp="2026-08-13T09:05:00+00:00",
+    )
+
+    run_view(config, store_db_path, 20, "CoverageGap")
+
+    err = capsys.readouterr().err
+    assert "1 shown, 0 skipped" in err  # hash1's Malicious record correctly filtered out
+    assert "CoverageGap" in err
+
+
+def test_run_view_renders_genuinely_legacy_record_missing_coverage_gap_reason_key(
+    store_db_path: str,
+    store_config: Config,
+    make_evidence_item,  # type: ignore[no-untyped-def]
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Story 6.1 follow-up, Edge Case Hunter] Every existing coverage-gap
+    test builds its report via _make_report/_persist, which always passes
+    coverage_gap_reason explicitly (None or a string) -- the KEY is always
+    present. A genuine pre-Story-6.1 record never had this key AT ALL, which
+    is a different shape than {"coverage_gap_reason": None}: dict.get()
+    handles both, but report["coverage_gap_reason"] only survives the first.
+    This constructs a record with the key genuinely absent (bypassing the
+    TypedDict constructor via a raw encrypted insert, mirroring test_store.py's
+    test_read_recent_skips_malformed_but_decryptable_record_and_counts_it) and
+    round-trips it through the real store.py encrypt/decrypt path and the
+    real run_view/_format_view_table renderer -- so a future accidental
+    change from .get() to [...] at worker.py's report.get("coverage_gap_reason")
+    call site would fail this test with a KeyError, not silently pass."""
+    import json
+    import sqlite3
+
+    from cryptography.fernet import Fernet
+
+    config = replace(store_config, evidence_db_path=store_db_path)
+    legacy_report = {
+        "verdict": "Deferred",
+        "calibrated_confidence": 0.5,
+        "evidence": [
+            make_evidence_item(
+                name="spf", finding="borderline signal", weight=0.3, direction="malicious"
+            )
+        ],
+        "schema_version": 1,
+        "message_hash": "legacy-hash",
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        # coverage_gap_reason deliberately absent -- not set to None, absent.
+    }
+    legacy_record = {
+        "message_id": "legacy-m1",
+        "sender": "legacy@example.com",
+        "report": legacy_report,
+        "deferral_threshold_used": 0.05,
+    }
+    fernet = Fernet(config.evidence_encryption_key.encode())  # type: ignore[union-attr]
+    encrypted = fernet.encrypt(json.dumps(legacy_record).encode())
+    conn = sqlite3.connect(store_db_path)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS evidence_records ("
+        "message_hash TEXT PRIMARY KEY, verdict_json BLOB NOT NULL, "
+        "created_at TEXT NOT NULL, expires_at TEXT NOT NULL, schema_version INTEGER NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO evidence_records "
+        "(message_hash, verdict_json, created_at, expires_at, schema_version) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("legacy-hash", encrypted, "2026-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00", 1),
+    )
+    conn.commit()
+    conn.close()
+
+    record = read_evidence_record(store_db_path, "legacy-hash", config)
+    assert record is not None
+    assert "coverage_gap_reason" not in record["report"]
+
+    run_view(config, store_db_path, 20, None)
+
+    err = capsys.readouterr().err
+    assert "Deferred" in err
+    assert "borderline signal" in err
     assert "1 shown, 0 skipped" in err
 
 

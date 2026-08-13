@@ -241,11 +241,23 @@ def process_message(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     if isinstance(auth_results_header, FetchFailed):
-        # A fetch failure carries no header data — never evidence, always a
-        # deferred/coverage-gap outcome, the same way InconclusiveScoreError is
-        # routed. Short-circuits before investigate_header_authentication /
-        # compute_raw_score / determine_verdict — and now the Watchman/Cipher
-        # calls below, too — are ever reached.
+        # [Story 6.1] Deliberately stays "Deferred", NOT "CoverageGap" --
+        # this branch fires only when the HEADER fetch failed but the RAW
+        # CONTENT fetch (this function's own email_content parameter) still
+        # succeeded, meaning the message genuinely exists and was read; only
+        # one specific input signal (Authentication-Results) is missing.
+        # That is a real, if reduced, analytical situation -- not the "the
+        # message no longer exists" condition CoverageGap represents (see
+        # run_poll_cycle's raw-fetch-failure branch, which is the one that
+        # actually matches every real observed coverage-gap incident: in
+        # every case, BOTH the header fetch and the raw content fetch
+        # returned 404 together). This branch IS independently reachable in
+        # practice (the header metadata call and the raw content call are
+        # two separate Gmail API requests, each independently subject to a
+        # transient failure) -- deliberately not reclassified or given
+        # CoverageGap fixtures, since "message exists, one signal missing"
+        # and "message doesn't exist" are genuinely different situations an
+        # operator should be able to tell apart.
         return TriageReport(
             verdict="Deferred",
             calibrated_confidence=0.5,
@@ -261,6 +273,7 @@ def process_message(
             schema_version=1,
             message_hash=message_hash,
             timestamp=timestamp,
+            coverage_gap_reason=None,
         )
 
     evidence, raw_score = gather_evidence_and_raw_score(
@@ -283,6 +296,7 @@ def process_message(
             schema_version=1,
             message_hash=message_hash,
             timestamp=timestamp,
+            coverage_gap_reason=None,
         )
 
     calibrated_confidence = apply_calibration(raw_score)
@@ -300,6 +314,7 @@ def process_message(
         schema_version=1,
         message_hash=message_hash,
         timestamp=timestamp,
+        coverage_gap_reason=None,
     )
 
 
@@ -524,9 +539,16 @@ def run_poll_cycle(
             try:
                 raw_bytes = fetch_raw_message_bytes(service, mailbox, message_id)
             except Exception as e:
+                # [Story 6.1] coverage_gap_reason (stored on the persisted
+                # report) is deliberately message_id-free -- the record
+                # already carries its own identity separately (EvidenceRecord.
+                # message_id) -- but the stderr log line keeps "for message
+                # {message_id!r}" for operator log-scanning, matching every
+                # other log line in this file.
+                coverage_gap_reason = f"Failed to fetch raw message content: {type(e).__name__}: {e}"
                 print(
                     f"[worker] Failed to fetch raw content for message {message_id!r}: "
-                    f"{type(e).__name__}: {e} — persisting a Deferred coverage-gap "
+                    f"{type(e).__name__}: {e} — persisting a CoverageGap "
                     "record; tamper-evidence hash unavailable for this one record",
                     file=sys.stderr,
                 )
@@ -561,26 +583,23 @@ def run_poll_cycle(
                     )
                     continue
 
-                # Deliberate, narrow exception to "message_hash is always a content
-                # hash" (Story 1.5's invariant) — we never got the content to hash,
-                # so we fall back to an ID-based hash. Named explicitly in the
-                # persisted evidence item below, not silently substituted.
+                # [Story 6.1] Deliberate, narrow exception to "message_hash is
+                # always a content hash" (Story 1.5's invariant) — we never
+                # got the content to hash, so we fall back to an ID-based
+                # hash instead. This is an explicit, expected property of a
+                # CoverageGap record (see TriageReport.message_hash's own
+                # docstring), not a degraded/error condition being silently
+                # papered over: verdict == "CoverageGap" already says,
+                # unambiguously, which kind of hash this is.
                 content_hash = hashlib.sha256(message_id.encode()).hexdigest()
                 report = TriageReport(
-                    verdict="Deferred",
-                    calibrated_confidence=0.5,
-                    evidence=[
-                        EvidenceItem(
-                            name="raw_content_fetch",
-                            finding="Failed to fetch raw message content — coverage "
-                            "gap, tamper-evidence hash unavailable for this record",
-                            weight=0.0,
-                            direction="neutral",
-                        )
-                    ],
+                    verdict="CoverageGap",
+                    calibrated_confidence=None,
+                    evidence=[],
                     schema_version=1,
                     message_hash=content_hash,
                     timestamp=datetime.now(timezone.utc).isoformat(),
+                    coverage_gap_reason=coverage_gap_reason,
                 )
             else:
                 sender, content_hash = extract_sender_and_content_hash(raw_bytes)
@@ -760,6 +779,33 @@ def _run_replay(message_hash: str, db_path: str, config: Config) -> None:
         )
         sys.exit(1)
 
+    # [Story 6.1] A CoverageGap record has no evidence (no analysis ever
+    # ran -- the message itself could not be fetched) and no
+    # calibrated_confidence to recompute and compare against. Checked
+    # before any of the recompute logic below, which would otherwise
+    # either crash (math.isclose against None) or silently "match" via
+    # compute_raw_score([]) happening to equal something meaningless.
+    # Old records predating this story can never have this verdict value
+    # (it didn't exist yet when they were written), so this check is safe
+    # regardless of a record's age.
+    if original_report["verdict"] == "CoverageGap":
+        print(
+            f"sentinel-triage: stored record for {message_hash!r} is a "
+            "CoverageGap record (the source message could not be fetched at "
+            "ingest time) — no analysis was ever performed, so there is "
+            "nothing to recompute. Refusing to replay.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # [Story 6.1] TriageReport's own invariant (see its calibrated_confidence
+    # docstring, report.py) guarantees calibrated_confidence is never None
+    # for any verdict other than "CoverageGap" -- already excluded above.
+    # mypy can't infer that cross-field relationship on its own (verdict and
+    # calibrated_confidence are independent TypedDict keys, not a
+    # discriminated union), so this narrows explicitly rather than silently
+    # accepting `float | None` past this point.
+    assert original_report["calibrated_confidence"] is not None
+
     # Story 3.2 resolves the pre-Epic-3 landmine tracked in deferred-work.md
     # (option (b) of the two documented there): replay now recomputes
     # calibration too and compares calibrated-to-calibrated, not
@@ -814,10 +860,22 @@ def _sorted_directional_findings(evidence: list[EvidenceItem]) -> list[EvidenceI
     return directional
 
 
-def _format_finding_summary(evidence: list[EvidenceItem]) -> str:
+def _format_finding_summary(evidence: list[EvidenceItem], coverage_gap_reason: str | None = None) -> str:
     """Short summary of a record's most notable finding for the --view
     table (AC3) -- the highest-weight directional finding, truncated,
-    with a "(+N more)" suffix if there are others."""
+    with a "(+N more)" suffix if there are others.
+
+    [Story 6.1] coverage_gap_reason, when given, takes priority over the
+    generic "(no directional findings)" fallback -- a CoverageGap record's
+    evidence is always genuinely empty (nothing was ever analyzed), so
+    that fallback would otherwise fire for every single CoverageGap row,
+    telling the operator nothing about WHY. Truncated the same way a real
+    finding would be, for column-width consistency."""
+    if coverage_gap_reason is not None:
+        reason = coverage_gap_reason
+        if len(reason) > _VIEW_FINDING_MAX_LEN:
+            reason = reason[: _VIEW_FINDING_MAX_LEN - 1] + "…"
+        return f"[coverage gap] {reason}"
     directional = _sorted_directional_findings(evidence)
     if not directional:
         return "(no directional findings)"
@@ -839,8 +897,18 @@ def _format_view_table(records: list[tuple[str, EvidenceRecord]]) -> str:
         sender = (record["sender"] or "(unknown sender)")[:30]
         timestamp = report["timestamp"][:25]
         verdict = report["verdict"]
-        confidence = f"{report['calibrated_confidence']:.3f}"
-        finding_summary = _format_finding_summary(report["evidence"])
+        # [Story 6.1] "N/A" for CoverageGap (calibrated_confidence is None
+        # -- no analysis ran, so there is no score to show; rendering 0.000
+        # or 0.500 here would misleadingly look like a real measurement).
+        confidence_value = report["calibrated_confidence"]
+        confidence = f"{confidence_value:.3f}" if confidence_value is not None else "N/A"
+        # .get(), not report["coverage_gap_reason"]: `report` here is a
+        # LOADED record, which could predate this story's schema change
+        # and lack the key entirely -- see TriageReport.coverage_gap_reason's
+        # own docstring in report.py for why direct indexing isn't safe.
+        finding_summary = _format_finding_summary(
+            report["evidence"], report.get("coverage_gap_reason")
+        )
         lines.append(
             f"{timestamp:<26} {sender:<30} {verdict:<10} {confidence:>6}  {finding_summary}"
         )
@@ -964,7 +1032,7 @@ def _run() -> None:
     parser.add_argument(
         "--verdict",
         default=None,
-        choices=["Malicious", "Benign", "Deferred"],
+        choices=["Malicious", "Benign", "Deferred", "CoverageGap"],
         help="With --view, show only records matching this verdict",
     )
     args = parser.parse_args()
