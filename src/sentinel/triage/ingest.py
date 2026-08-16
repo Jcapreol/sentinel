@@ -37,6 +37,8 @@ from googleapiclient.errors import HttpError
 
 from sentinel.config import Config, ConfigError
 from sentinel.triage.gmail_oauth import get_credentials
+from sentinel.triage.mail_source import FetchFailed as FetchFailed
+from sentinel.triage.mail_source import MessageUnavailable
 
 _GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 _VALID_AUTH_MODES = {"service_account", "oauth"}
@@ -49,18 +51,6 @@ _TRUSTED_AUTHSERV_ID = "mx.google.com"
 
 _MAX_RETRY_ATTEMPTS = 3
 _INITIAL_BACKOFF_SECONDS = 1.0
-
-
-class FetchFailed:
-    """Sentinel: a header fetch failed for a message.
-
-    Structurally distinct from ``None`` (a genuinely absent Authentication-Results
-    header) — headers.py treats a missing header as real evidence with a non-zero
-    presence weight. Conflating a fetch error with "no header" would score a
-    transient failure as if it were data actually collected. Callers must route
-    this to a deferred/coverage-gap outcome, never treat it as evidence (see
-    triage/worker.py's process_message).
-    """
 
 
 def build_gmail_service(config: Config) -> Any:
@@ -385,6 +375,76 @@ def fetch_raw_message_bytes(service: Any, mailbox: str, message_id: str) -> byte
     raw = response["raw"]
     raw += "=" * (-len(raw) % 4)  # Gmail's base64url payload can arrive unpadded
     return base64.urlsafe_b64decode(raw)
+
+
+def _is_not_found(error: HttpError) -> bool:
+    return getattr(getattr(error, "resp", None), "status", None) == 404
+
+
+class GmailMailSource:
+    """[Story 7.1] The Gmail implementation of mail_source.MailSource --
+    everything above this point in this module (build_gmail_service,
+    poll_new_messages, get_authentication_results_header,
+    fetch_headers_for_messages, fetch_headers_by_name,
+    fetch_raw_message_bytes, and their retry/error-handling helpers) is
+    UNCHANGED by this story, byte-for-byte, precisely so every existing
+    direct unit test of those functions (tests/triage/test_ingest.py) keeps
+    passing without modification. This class is a thin, additive wrapper:
+    each method delegates straight to the corresponding pre-existing
+    function, injecting the service/mailbox this instance was constructed
+    with instead of threading them through every call site.
+
+    Deliberately holds an already-built `service` (from build_gmail_service),
+    not a Config -- run_poll_cycle still calls build_gmail_service(config)
+    itself, unchanged, so every existing test that patches
+    "sentinel.triage.worker.build_gmail_service" and configures the returned
+    mock's .users()... call chain keeps working with zero modification.
+
+    Only fetch_raw_message translates HttpError 404 into the
+    provider-agnostic MessageUnavailable (AC3). fetch_auth_results_header
+    deliberately does NOT: it delegates to fetch_headers_for_messages, which
+    already collapses EVERY failure (404 or otherwise) into the same
+    FetchFailed() sentinel -- there is no observable distinction to
+    translate on that path, and touching fetch_headers_for_messages' own
+    already-tested internals for zero behavioral gain is exactly the kind of
+    change this story's "do not improve anything while refactoring" note
+    warns against.
+    """
+
+    def __init__(self, service: Any, mailbox: str) -> None:
+        self._service = service
+        self._mailbox = mailbox
+
+    def list_new_messages(self, checkpoint: str | None) -> tuple[list[str], str]:
+        messages, new_checkpoint = poll_new_messages(self._service, self._mailbox, checkpoint)
+        return [str(message["id"]) for message in messages], new_checkpoint
+
+    def fetch_raw_message(self, message_id: str) -> bytes:
+        try:
+            return fetch_raw_message_bytes(self._service, self._mailbox, message_id)
+        except HttpError as e:
+            if _is_not_found(e):
+                raise MessageUnavailable(
+                    f"Message {message_id!r} not found (HttpError 404): {e}"
+                ) from e
+            raise
+
+    def fetch_auth_results_header(self, message_id: str) -> str | None | FetchFailed:
+        results = fetch_headers_for_messages(self._service, self._mailbox, [{"id": message_id}])
+        return results[message_id]
+
+    def fetch_headers_by_name(
+        self, message_id: str, header_names: list[str]
+    ) -> dict[str, str | None]:
+        # [Review] Calls the MODULE-LEVEL fetch_headers_by_name (defined
+        # earlier in this file), not this method itself -- an unqualified
+        # name inside a method body resolves via the module namespace, never
+        # the class namespace, so this is NOT self-recursion. Do not "clean
+        # this up" to `self.fetch_headers_by_name(...)` -- that really would
+        # recurse infinitely, and neither mypy nor ruff would catch it
+        # (identical signature). Flagged by adversarial review as a
+        # maintenance landmine even though it's correct today.
+        return fetch_headers_by_name(self._service, self._mailbox, message_id, header_names)
 
 
 def extract_sender_and_content_hash(raw_bytes: bytes) -> tuple[str | None, str]:

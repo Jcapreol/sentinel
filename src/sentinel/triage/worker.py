@@ -34,16 +34,13 @@ from sentinel.config import load as load_config
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.headers import investigate_header_authentication
 from sentinel.triage.ingest import (
-    FetchFailed,
+    GmailMailSource,
     build_gmail_service,
     extract_email_content,
     extract_header_value,
     extract_sender_and_content_hash,
-    fetch_headers_by_name,
-    fetch_headers_for_messages,
-    fetch_raw_message_bytes,
-    poll_new_messages,
 )
+from sentinel.triage.mail_source import FetchFailed, MailSource
 from sentinel.triage.report import TriageReport
 from sentinel.triage.script_guard import ApiCallBudgetExceededError
 from sentinel.triage.scoring import (
@@ -499,13 +496,18 @@ def run_poll_cycle(
             "config.gmail_monitored_mailbox is None after build_gmail_service "
             "succeeded — this should be unreachable"
         )
+    # [Story 7.1] Everything below this line talks to `mail_source`, never
+    # `service`/`mailbox` directly -- the only Gmail-specific knowledge left
+    # in this function is the two lines above that build the concrete
+    # implementation. A second provider would only ever change this
+    # construction site.
+    mail_source: MailSource = GmailMailSource(service, mailbox)
 
     since_history_id = load_history_checkpoint(db_path)
-    messages, new_history_id = poll_new_messages(service, mailbox, since_history_id)
+    message_ids, new_history_id = mail_source.list_new_messages(since_history_id)
 
     any_failures = False
-    for message in messages:
-        message_id = message["id"]
+    for message_id in message_ids:
 
         # is_message_processed is deliberately INSIDE this try (not checked
         # before it): if the read itself raises (e.g. a transient sqlite
@@ -533,12 +535,22 @@ def run_poll_cycle(
                 )
                 continue
 
-            header_results = fetch_headers_for_messages(service, mailbox, [message])
-            auth_results_header = header_results[message_id]
+            auth_results_header = mail_source.fetch_auth_results_header(message_id)
 
             try:
-                raw_bytes = fetch_raw_message_bytes(service, mailbox, message_id)
+                raw_bytes = mail_source.fetch_raw_message(message_id)
             except Exception as e:
+                # [Story 7.1] Deliberately still a broad `except Exception`,
+                # not narrowed to MessageUnavailable -- ANY raw-fetch failure
+                # (a definitive not-found, a transient timeout, a 5xx after
+                # retries are exhausted, anything else) means the same thing
+                # here: there is no content to analyze. Narrowing this would
+                # be a real behavior change (a transient failure would then
+                # fall through to the generic per-message retry path instead
+                # of persisting a CoverageGap record), not just a test-
+                # compatibility concession -- see mail_source.MessageUnavailable's
+                # own docstring.
+                #
                 # [Story 6.1] coverage_gap_reason (stored on the persisted
                 # report) is deliberately message_id-free -- the record
                 # already carries its own identity separately (EvidenceRecord.
@@ -566,8 +578,8 @@ def run_poll_cycle(
                 # _is_self_alert correctly falls through to the existing
                 # coverage-gap behavior below, unchanged from before this
                 # story.
-                fallback_headers = fetch_headers_by_name(
-                    service, mailbox, message_id, [SELF_ALERT_HEADER_NAME, "From"]
+                fallback_headers = mail_source.fetch_headers_by_name(
+                    message_id, [SELF_ALERT_HEADER_NAME, "From"]
                 )
                 if _is_self_alert(
                     fallback_headers[SELF_ALERT_HEADER_NAME],

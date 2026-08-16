@@ -3138,6 +3138,48 @@ def test_triage_imports_no_remediation_capable_library() -> None:
                 )
 
 
+def _imports_googleapiclient(module_name: str | None) -> bool:
+    """True for "googleapiclient" itself or any of its submodules
+    ("googleapiclient.discovery", "googleapiclient.errors", ...) -- an
+    exact-match-only check would miss the real import shape this codebase
+    actually uses (`from googleapiclient.errors import HttpError`, where
+    ast.ImportFrom.module is "googleapiclient.errors", not
+    "googleapiclient"), making the guard below vacuous against the one
+    import it exists to catch."""
+    return module_name == "googleapiclient" or (
+        module_name is not None and module_name.startswith("googleapiclient.")
+    )
+
+
+def test_triage_modules_downstream_of_provider_boundary_do_not_import_googleapiclient() -> None:
+    """[Story 7.1, AC4] Mirrors test_triage_imports_no_remediation_capable_
+    library's structure (same triage_dir.glob("*.py") scan, same
+    ast.Import/ImportFrom walk), banning googleapiclient instead of
+    smtplib/subprocess/os. The one deliberate difference: ingest.py is
+    EXCLUDED here, not scanned -- it IS the provider boundary (home of
+    GmailMailSource), not downstream of it; a real second provider
+    implementation would earn the same exclusion for its own file, whatever
+    provider-specific library it needs to import. Every other file in
+    triage/, including worker.py, mail_source.py, and gmail_oauth.py (Gmail
+    OAuth credential handling, a different package -- google.oauth2/
+    google_auth_oauthlib, not googleapiclient), must never import it."""
+    triage_dir = Path(__file__).resolve().parents[2] / "src" / "sentinel" / "triage"
+    for source_path in triage_dir.glob("*.py"):
+        if source_path.name == "ingest.py":
+            continue
+        tree = ast.parse(source_path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not _imports_googleapiclient(alias.name), (
+                        f"{source_path.name} imports {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom):
+                assert not _imports_googleapiclient(node.module), (
+                    f"{source_path.name} imports from {node.module}"
+                )
+
+
 _LIVE_TRIAGE_AGENT_FORBIDDEN_KWARGS = {"temperature", "cache", "budget"}
 
 
