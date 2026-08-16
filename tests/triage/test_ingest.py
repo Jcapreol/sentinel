@@ -12,6 +12,7 @@ from sentinel.config import Config, ConfigError
 from sentinel.triage import ingest
 from sentinel.triage.ingest import (
     FetchFailed,
+    GmailMailSource,
     build_gmail_service,
     extract_auth_results_header_from_eml,
     extract_email_content,
@@ -21,6 +22,7 @@ from sentinel.triage.ingest import (
     get_authentication_results_header,
     poll_new_messages,
 )
+from sentinel.triage.mail_source import MessageUnavailable
 
 
 def _gmail_config(
@@ -742,6 +744,152 @@ def test_fetch_raw_message_bytes_does_not_retry_on_403(mocker) -> None:  # type:
         fetch_raw_message_bytes(service, "soc@example.com", "m1")
 
     sleep.assert_not_called()
+
+
+# --- GmailMailSource (Story 7.1) -----------------------------------------------
+
+
+def test_gmail_mail_source_list_new_messages_returns_bare_ids(mocker) -> None:  # type: ignore[no-untyped-def]
+    # [Story 7.1] poll_new_messages itself is untouched (still returns
+    # list[dict]) -- GmailMailSource.list_new_messages is where the dict-to-
+    # bare-id simplification happens, since worker.py never needed anything
+    # from each message dict besides "id".
+    service = mocker.MagicMock()
+    service.users.return_value.getProfile.return_value.execute.return_value = {
+        "historyId": "1000"
+    }
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "history": [{"messagesAdded": [{"message": {"id": "m1"}}, {"message": {"id": "m2"}}]}]
+    }
+    source = GmailMailSource(service, "soc@example.com")
+
+    message_ids, new_checkpoint = source.list_new_messages("500")
+
+    assert message_ids == ["m1", "m2"]
+    assert new_checkpoint == "1000"
+
+
+def test_gmail_mail_source_fetch_raw_message_translates_404_to_message_unavailable(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    # [Story 7.1, AC3] The one genuinely new piece of behavior this story
+    # introduces: a Gmail HttpError 404 on the raw-content fetch becomes the
+    # provider-agnostic MessageUnavailable, not a raw HttpError -- so a
+    # future second provider's own "message gone" error can be caught the
+    # same way without worker.py ever knowing it's Gmail-specific.
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=404)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        HttpError(resp, b'{"error": {"code": 404, "message": "Requested entity was not found."}}')
+    )
+    source = GmailMailSource(service, "soc@example.com")
+
+    with pytest.raises(MessageUnavailable, match="m1"):
+        source.fetch_raw_message("m1")
+
+
+def test_gmail_mail_source_fetch_raw_message_other_http_errors_propagate_unchanged(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    # [Story 7.1] Only a definitive 404 becomes MessageUnavailable -- a 403,
+    # 5xx (after retries exhaust), or any other HttpError is a different
+    # situation (the message likely still exists) and must propagate as its
+    # real, original type, not be misrepresented as "message gone."
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=403)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        HttpError(resp, b"forbidden")
+    )
+    source = GmailMailSource(service, "soc@example.com")
+
+    with pytest.raises(HttpError):
+        source.fetch_raw_message("m1")
+
+
+def test_gmail_mail_source_fetch_raw_message_non_http_errors_propagate_unchanged(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    # A network-level failure (not even an HttpError) must also stay
+    # exactly what it is -- MessageUnavailable is specifically for a
+    # confirmed-gone message, not a catch-all for "the fetch failed."
+    service = mocker.MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        RuntimeError("connection reset")
+    )
+    source = GmailMailSource(service, "soc@example.com")
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        source.fetch_raw_message("m1")
+
+
+def test_gmail_mail_source_fetch_raw_message_succeeds_returns_bytes(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    raw_content = b"From: alice@example.com\r\n\r\nbody"
+    encoded = base64.urlsafe_b64encode(raw_content).decode()
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "raw": encoded
+    }
+    source = GmailMailSource(service, "soc@example.com")
+
+    assert source.fetch_raw_message("m1") == raw_content
+
+
+def test_gmail_mail_source_fetch_auth_results_header_delegates_and_returns_fetchfailed_on_error(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    # [Story 7.1] Deliberately delegates to the existing, unchanged
+    # fetch_headers_for_messages (not a fresh reimplementation) -- proven
+    # here by confirming its exact FetchFailed-on-any-error contract
+    # survives through the wrapper, including a 404.
+    service = mocker.MagicMock()
+    resp = mocker.MagicMock(status=404)
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        HttpError(resp, b'{"error": {"code": 404}}')
+    )
+    source = GmailMailSource(service, "soc@example.com")
+
+    result = source.fetch_auth_results_header("m1")
+
+    assert isinstance(result, FetchFailed)
+
+
+def test_gmail_mail_source_fetch_auth_results_header_returns_real_value(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "payload": {
+            "headers": [{"name": "Authentication-Results", "value": "mx.google.com; spf=pass"}]
+        }
+    }
+    source = GmailMailSource(service, "soc@example.com")
+
+    assert source.fetch_auth_results_header("m1") == "mx.google.com; spf=pass"
+
+
+def test_gmail_mail_source_fetch_headers_by_name_delegates(mocker) -> None:  # type: ignore[no-untyped-def]
+    service = mocker.MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = {
+        "payload": {"headers": [{"name": "From", "value": "alice@example.com"}]}
+    }
+    source = GmailMailSource(service, "soc@example.com")
+
+    result = source.fetch_headers_by_name("m1", ["From", "X-Sentinel-Alert"])
+
+    assert result == {"From": "alice@example.com", "X-Sentinel-Alert": None}
+
+
+def test_gmail_mail_source_fetch_headers_by_name_never_raises(mocker) -> None:  # type: ignore[no-untyped-def]
+    # Preserves fetch_headers_by_name's own "never raises" contract --
+    # relied on by worker.py's self-alert fallback check, which must
+    # gracefully degrade (marker/sender stay None) rather than crash.
+    service = mocker.MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.side_effect = (
+        RuntimeError("boom")
+    )
+    source = GmailMailSource(service, "soc@example.com")
+
+    result = source.fetch_headers_by_name("m1", ["From"])
+
+    assert result == {"From": None}
 
 
 def test_extract_sender_and_content_hash_returns_sender_and_hash() -> None:
