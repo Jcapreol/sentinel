@@ -11,6 +11,7 @@ from sentinel.triage.health import (
     record_poll_failure,
     record_poll_success,
     save_health_state,
+    try_load_health_state,
 )
 
 # [Story 8.1, AC6] Verbatim from the story spec's live data -- use as-is,
@@ -63,6 +64,60 @@ def test_load_health_state_malformed_shape_returns_default(store_db_path: str, r
     state = load_health_state(store_db_path)
 
     assert state == {"last_success_utc": None, "alert_active": False}
+
+
+# --- try_load_health_state (Story 10.3): distinguishes read failure from ----
+# --- a genuine, successfully-read default -----------------------------------
+
+
+def test_try_load_health_state_missing_file_returns_none(store_db_path: str) -> None:
+    assert try_load_health_state(store_db_path) is None
+
+
+def test_try_load_health_state_corrupt_json_returns_none(store_db_path: str) -> None:
+    _health_state_path(store_db_path).parent.mkdir(parents=True, exist_ok=True)
+    _health_state_path(store_db_path).write_text("{not valid json")
+
+    assert try_load_health_state(store_db_path) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"last_success_utc": 12345, "alert_active": false}',
+        '{"last_success_utc": null, "alert_active": "yes"}',
+        "[]",
+        '"just a string"',
+    ],
+)
+def test_try_load_health_state_malformed_shape_returns_none(store_db_path: str, raw: str) -> None:
+    _health_state_path(store_db_path).parent.mkdir(parents=True, exist_ok=True)
+    _health_state_path(store_db_path).write_text(raw)
+
+    assert try_load_health_state(store_db_path) is None
+
+
+def test_try_load_health_state_genuine_fresh_default_is_not_none(store_db_path: str) -> None:
+    """The key property try_load_health_state exists for: a genuinely
+    successful read of a file that happens to hold the exact same values
+    load_health_state's failure path also returns must NOT be
+    indistinguishable from a read failure -- that's the whole point."""
+    save_health_state(store_db_path, {"last_success_utc": None, "alert_active": False})
+
+    state = try_load_health_state(store_db_path)
+
+    assert state is not None
+    assert state == {"last_success_utc": None, "alert_active": False}
+
+
+def test_try_load_health_state_successful_read_matches_load_health_state(
+    store_db_path: str,
+) -> None:
+    save_health_state(
+        store_db_path, {"last_success_utc": "2026-08-20T12:00:00+00:00", "alert_active": True}
+    )
+
+    assert try_load_health_state(store_db_path) == load_health_state(store_db_path)
 
 
 def test_record_poll_failure_never_crashes_on_unparseable_last_success_utc(
