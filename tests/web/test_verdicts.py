@@ -209,7 +209,8 @@ def test_verdict_list_shows_timestamp_sender_verdict_confidence(
 
     assert response.status_code == 200
     body = response.text
-    assert "2026-08-20T12:00:00" in body
+    # [Story 10.2, AC1] 12:00 UTC in August (EDT, UTC-4) -> 8:00 AM Eastern.
+    assert "Aug 20, 2026 8:00 AM" in body
     assert "phisher@evil.example" in body
     assert "Malicious" in body
     assert "0.870" in body
@@ -300,6 +301,86 @@ def test_verdict_list_server_not_configured_renders_clean_message() -> None:
             response = client.get("/verdicts")
     assert response.status_code == 200
     assert "not configured" in response.text.lower()
+
+
+# --- Story 10.2, AC1/AC2/AC3: Eastern-time timestamp display ---------------
+
+
+def test_display_timezone_is_a_module_constant_set_to_america_new_york() -> None:
+    """AC3: confirms _DISPLAY_TIMEZONE is exactly zoneinfo's
+    "America/New_York" (AC2), not some other Eastern-adjacent
+    representation. That it's a bare module attribute rather than a
+    Config field is a source-level fact (see verdicts.py's own AC3
+    comment) -- Config itself has no timezone-related field at all,
+    confirmed by fake_config's fixture construction not needing one."""
+    from zoneinfo import ZoneInfo
+
+    assert verdicts_mod._DISPLAY_TIMEZONE == ZoneInfo("America/New_York")
+
+
+@pytest.mark.parametrize(
+    "iso_timestamp,expected",
+    [
+        # AC2: EDT (UTC-4) in August -- summer.
+        ("2026-08-20T19:10:00+00:00", "Aug 20, 2026 3:10 PM"),
+        # AC2: EST (UTC-5) in January -- winter. Same wall-clock UTC hour
+        # (19:10) as the summer case above, but a DIFFERENT local result
+        # (2:10 PM, not 3:10 PM) -- a fixed offset would get one of these
+        # two wrong; zoneinfo gets both right.
+        ("2026-01-20T19:10:00+00:00", "Jan 20, 2026 2:10 PM"),
+        # Midnight UTC crosses to the previous Eastern calendar day.
+        ("2026-08-20T02:00:00+00:00", "Aug 19, 2026 10:00 PM"),
+        # Noon -> 12-hour clock boundary (not "0:00 PM").
+        ("2026-08-20T16:00:00+00:00", "Aug 20, 2026 12:00 PM"),
+        # Midnight Eastern -> 12-hour clock boundary (not "0:00 AM").
+        ("2026-08-20T04:00:00+00:00", "Aug 20, 2026 12:00 AM"),
+        # Naive (no tzinfo) timestamp treated as UTC, not local-naive.
+        ("2026-08-20T19:10:00", "Aug 20, 2026 3:10 PM"),
+    ],
+)
+def test_format_display_timestamp_dst_and_boundary_cases(
+    iso_timestamp: str, expected: str
+) -> None:
+    assert verdicts_mod._format_display_timestamp(iso_timestamp) == expected
+
+
+def test_format_display_timestamp_malformed_value_falls_back_not_crash() -> None:
+    """Same well-formedness gap as calibrated_confidence/evidence items:
+    read_recent_evidence_records only guarantees "timestamp" is present,
+    never that it's parseable. Falls back to the raw value, never raises."""
+    assert verdicts_mod._format_display_timestamp("not-a-timestamp") == "not-a-timestamp"
+    assert verdicts_mod._format_display_timestamp(None) == "None"
+    assert verdicts_mod._format_display_timestamp(12345) == "12345"
+
+
+def test_format_display_timestamp_extreme_past_falls_back_not_crash() -> None:
+    """[Review, Blind Hunter] A UTC timestamp near datetime.min in winter
+    converts to a negative-year Eastern local time, which
+    datetime.astimezone() cannot represent -- it raises OverflowError,
+    not ValueError/TypeError. Confirmed reproducible before this was
+    caught: both call sites would 500 on a record carrying a timestamp
+    this old. Falls back to the raw value like every other malformed
+    case, never raises."""
+    assert verdicts_mod._format_display_timestamp("0001-01-01T00:00:00") == "0001-01-01T00:00:00"
+    assert verdicts_mod._format_display_timestamp("0001-01-01T04:00:00") == "0001-01-01T04:00:00"
+
+
+def test_verdict_list_renders_eastern_time_not_raw_utc(verdicts_env: VerdictsEnv) -> None:
+    _persist(verdicts_env, "hash1", verdict="Benign", timestamp="2026-08-20T19:10:00+00:00")
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert "Aug 20, 2026 3:10 PM" in response.text
+    assert "2026-08-20T19:10:00" not in response.text
+
+
+def test_verdict_detail_renders_eastern_time_not_raw_utc(verdicts_env: VerdictsEnv) -> None:
+    _persist(verdicts_env, "hash1", verdict="Benign", timestamp="2026-01-20T19:10:00+00:00")
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+
+    assert "Jan 20, 2026 2:10 PM" in response.text  # EST, UTC-5
+    assert "2026-01-20T19:10:00" not in response.text
 
 
 # --- AC3: detail view --------------------------------------------------------
@@ -446,6 +527,152 @@ def test_verdict_detail_malformed_evidence_item_skipped_not_crash(
     body = response.text
     assert "A real finding" in body
     assert "1 evidence item(s) could not be rendered" in body
+
+
+def test_malformed_verdict_value_with_injection_payload_is_escaped_in_badge(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """[Story 10.2, AC6] The new _badge() helper builds a CSS class slug
+    from the same value used for display text (verdict/direction). Same
+    well-formedness gap as calibrated_confidence/timestamp: only the KEY
+    is guaranteed present, never that the VALUE is one of the four real
+    Verdict literals. A malformed value must stay inert in both the
+    visible badge text and the class attribute it's used to build --
+    checked on both the list route (verdict badge) and detail route
+    (verdict badge + evidence-item direction badge, a distinct code
+    path since _is_well_formed_evidence_item never validates direction's
+    value, only weight's type)."""
+    payload = '"><script>alert(1)</script>'
+    report = _make_report(verdict="Malicious", evidence=[])
+    report["verdict"] = payload  # type: ignore[typeddict-item]
+    bad_direction_item = {
+        "name": "watchman_finding",
+        "finding": "some finding",
+        "weight": 0.5,
+        "direction": payload,
+    }
+    report["evidence"] = [bad_direction_item]  # type: ignore[list-item]
+    _persist_raw(
+        verdicts_env,
+        "hash-bad-verdict",
+        {
+            "message_id": "hash-bad-verdict",
+            "sender": "alice@example.com",
+            "report": report,
+            "deferral_threshold_used": verdicts_env.config.deferral_threshold,
+        },
+    )
+
+    list_response = verdicts_env.client.get("/verdicts")
+    detail_response = verdicts_env.client.get("/verdicts/hash-bad-verdict")
+
+    for response in (list_response, detail_response):
+        assert response.status_code == 200
+        assert "<script>alert" not in response.text
+        assert "&lt;script&gt;" in response.text
+
+
+def test_badge_with_embedded_whitespace_does_not_spoof_a_real_css_class() -> None:
+    """[Review, Edge Case Hunter] A malformed value containing whitespace
+    (e.g. "malicious x") would otherwise produce class="badge
+    badge-malicious x" -- HTML splits on whitespace, so badge-malicious
+    (a real, defined rule) would spuriously match and color the badge as
+    Malicious for a value that isn't. Not an escaping test (no injection
+    possible either way) -- this is a display-correctness regression
+    guard on _badge()'s own slug construction."""
+    rendered = verdicts_mod._badge("malicious x")
+    assert 'class="badge badge-maliciousx"' in rendered
+    assert "badge-malicious x" not in rendered
+    assert ">malicious x<" in rendered  # text stays fully intact and correct
+
+
+def test_verdict_list_timestamp_with_script_tag_is_escaped(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """[Review, Edge Case Hunter] Mutation-test finding: _format_display_
+    timestamp's malformed-value fallback path echoes the raw value with
+    no escaping of its own -- correctness today relies entirely on the
+    call-site _esc() wrapper in both routes, and that specific point had
+    no dedicated regression test (unlike sender/finding/coverage_gap_
+    reason/verdict, which all do). Pins it directly: an unparseable
+    timestamp carrying a script tag must still render inert."""
+    payload = '<script>alert("ts")</script>'
+    report = _make_report(verdict="Malicious")
+    report["timestamp"] = payload  # type: ignore[typeddict-item]
+    _persist_raw(
+        verdicts_env,
+        "hash-bad-ts",
+        {
+            "message_id": "hash-bad-ts",
+            "sender": "alice@example.com",
+            "report": report,
+            "deferral_threshold_used": verdicts_env.config.deferral_threshold,
+        },
+    )
+
+    list_response = verdicts_env.client.get("/verdicts")
+    detail_response = verdicts_env.client.get("/verdicts/hash-bad-ts")
+
+    for response in (list_response, detail_response):
+        assert response.status_code == 200
+        assert "<script>alert" not in response.text
+        assert "&lt;script&gt;" in response.text
+
+
+# --- Story 10.2, AC4/AC5: presentation structure ----------------------------
+
+
+def test_page_includes_inline_style_no_cdn_no_script(verdicts_env: VerdictsEnv) -> None:
+    """AC5: styling is inline/served only -- no CSS framework, no CDN link,
+    no build step, no JavaScript of any kind (Out of scope)."""
+    response = verdicts_env.client.get("/verdicts")
+    body = response.text
+    assert "<style>" in body
+    assert "<link" not in body
+    assert "<script" not in body
+    assert "cdn." not in body.lower()
+
+
+def test_verdict_badge_carries_both_color_class_and_text(verdicts_env: VerdictsEnv) -> None:
+    """AC4: verdict must be visually distinguishable AND never rely on
+    color alone -- the escaped text stays present alongside the CSS class."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert 'class="badge badge-malicious"' in response.text
+    assert ">Malicious<" in response.text
+
+
+def test_evidence_items_render_as_grouped_blocks_not_table_rows(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC4: each finding's name/weight/direction/text grouped per item
+    (a bordered block with a header line) rather than running together
+    in table cells."""
+    _persist(
+        verdicts_env,
+        "hash1",
+        verdict="Malicious",
+        evidence=[
+            EvidenceItem(
+                name="watchman_finding",
+                finding="Suspicious login URL",
+                weight=0.7,
+                direction="malicious",
+            )
+        ],
+    )
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+    body = response.text
+
+    assert '<ul class="evidence-list">' in body
+    assert '<li class="evidence-item">' in body
+    assert '<div class="evidence-header">' in body
+    assert '<span class="evidence-name">watchman_finding</span>' in body
+    assert 'class="evidence-weight"' in body
+    assert '<p class="evidence-finding">Suspicious login URL</p>' in body
 
 
 # --- AC5: demo route and /quota unaffected ----------------------------------
