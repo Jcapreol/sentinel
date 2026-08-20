@@ -196,3 +196,35 @@ def send_test_alert(config: Config) -> tuple[bool, str]:
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
     return True, f"Test alert sent successfully to {recipient}."
+
+
+def send_health_alert(config: Config, status: str, detail: str) -> None:
+    """[Story 8.1] A heartbeat/liveness alert -- also does not originate
+    from a triage verdict, exactly like send_test_alert above, and reuses
+    the identical technique: repurpose AlertPayload's fields rather than
+    add a parallel alerting path. `verdict` becomes a short status label
+    ("Unhealthy"/"Recovered"), not a real triage verdict; `findings` carries
+    the descriptive detail (the failure cause for an Unhealthy alert, or a
+    recovery summary); `sender` is a fixed descriptive string (there is no
+    real email sender to report); `calibrated_confidence` is None (no
+    numeric score applies).
+
+    Deliberately does NOT check config.alert_enabled -- that flag gates
+    VERDICT alerts specifically (worker.py's _maybe_dispatch_alert checks
+    it before ever calling send_alert). Heartbeat alerts have their own,
+    independent gate (config.alert_heartbeat_enabled, checked by the caller
+    in triage/health.py before this function is ever reached) -- see this
+    story's AC7 answer for why they must not share the same flag.
+
+    Fire-and-forget like send_alert itself: never raises, since a failure
+    to SEND a health alert must not become a new crash inside the health-
+    check machinery that exists specifically to catch failures."""
+    payload = AlertPayload(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        sender="sentinel-triage (heartbeat monitor)",
+        subject=None,
+        verdict=status,
+        calibrated_confidence=None,
+        findings=[detail],
+    )
+    send_alert(config, payload)

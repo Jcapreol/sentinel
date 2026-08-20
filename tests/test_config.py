@@ -529,3 +529,79 @@ def test_load_succeeds_without_any_alert_config(monkeypatch: pytest.MonkeyPatch)
     config = load()  # must not raise
 
     assert config.anthropic_api_key == "ak-test"
+
+
+# --- alert_heartbeat_enabled / alert_heartbeat_threshold_minutes (Story 8.1) ----
+
+
+def test_alert_heartbeat_enabled_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """[Story 8.1, AC7] Opposite default from alert_enabled -- a health
+    alert must be able to tell the operator the pipeline is dead even if
+    they never explicitly opted into verdict alerting at all."""
+    _base_env(monkeypatch)
+    monkeypatch.delenv("SENTINEL_ALERT_HEARTBEAT_ENABLED", raising=False)
+
+    config = load()
+
+    assert config.alert_heartbeat_enabled is True
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no", "off"])
+def test_alert_heartbeat_enabled_parses_falsy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_HEARTBEAT_ENABLED", value)
+
+    config = load()
+
+    assert config.alert_heartbeat_enabled is False
+
+
+@pytest.mark.parametrize("value", ["true", "True", "TRUE", "1", "yes", "on"])
+def test_alert_heartbeat_enabled_parses_truthy_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_HEARTBEAT_ENABLED", value)
+
+    config = load()
+
+    assert config.alert_heartbeat_enabled is True
+
+
+def test_alert_heartbeat_threshold_minutes_defaults_to_30(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.delenv("SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES", raising=False)
+
+    config = load()
+
+    assert config.alert_heartbeat_threshold_minutes == 30.0
+
+
+def test_alert_heartbeat_threshold_minutes_parsed_when_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES", "45")
+
+    config = load()
+
+    assert config.alert_heartbeat_threshold_minutes == 45.0
+
+
+def test_load_does_not_raise_on_malformed_alert_heartbeat_threshold_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors test_load_does_not_raise_on_malformed_alert_smtp_port -- a
+    typo'd threshold must not break load() for every mode, and falls back
+    to the default rather than raising here (range/positivity validated
+    lazily at point of use in worker.py, matching deferral_threshold)."""
+    _base_env(monkeypatch)
+    monkeypatch.setenv("SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES", "not-a-number")
+
+    config = load()  # must not raise
+
+    assert config.alert_heartbeat_threshold_minutes == 30.0

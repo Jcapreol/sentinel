@@ -5,9 +5,11 @@ import pytest
 from sentinel.alerter import (
     SELF_ALERT_HEADER_NAME,
     SELF_ALERT_HEADER_VALUE,
+    SELF_ALERT_SUBJECT_PREFIX,
     AlertPayload,
     EmailAlerter,
     send_alert,
+    send_health_alert,
     send_test_alert,
 )
 from sentinel.config import Config
@@ -200,6 +202,34 @@ def test_self_alert_marker_survives_send_to_parse_round_trip(
     assert extract_header_value(raw_bytes, SELF_ALERT_HEADER_NAME) == SELF_ALERT_HEADER_VALUE
 
 
+def test_health_alert_marker_survives_send_to_parse_round_trip(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    """[Story 8.1, Notes for dev] "Confirm the existing X-Sentinel-Alert
+    header plus sender-match logic covers [health alerts] too." Sibling of
+    test_self_alert_marker_survives_send_to_parse_round_trip above, same
+    real-MIME-round-trip technique, but going through send_health_alert's
+    actual construction path (not a hand-built AlertPayload) -- confirms
+    the marker isn't somehow lost by health alerts' different payload
+    shape (verdict repurposed as a status label, sender a fixed
+    descriptive string, no real subject)."""
+    config = _configured(fake_config)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+
+    send_health_alert(config, status="Unhealthy", detail="No successful poll for 35 minutes.")
+
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    raw_bytes = sent_message.as_bytes()
+    assert extract_header_value(raw_bytes, SELF_ALERT_HEADER_NAME) == SELF_ALERT_HEADER_VALUE
+    # The secondary (sender+subject) guard's two conditions, both real
+    # values a genuine inbound copy of this email would carry:
+    assert extract_header_value(raw_bytes, "From") == config.alert_smtp_username
+    subject = extract_header_value(raw_bytes, "Subject")
+    assert subject is not None and subject.startswith(SELF_ALERT_SUBJECT_PREFIX)
+
+
 def test_email_alerter_renders_no_confidence_value_for_coverage_gap_payload(
     mocker,  # type: ignore[no-untyped-def]
 ) -> None:
@@ -359,3 +389,72 @@ def test_send_test_alert_does_not_print_to_stderr_itself(
     send_test_alert(config)
 
     assert capsys.readouterr().err == ""
+
+
+# --- send_health_alert (Story 8.1) ----------------------------------------------
+
+
+def test_send_health_alert_unhealthy_carries_status_and_failure_detail(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    config = _configured(fake_config)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+
+    send_health_alert(
+        config,
+        status="Unhealthy",
+        detail="No successful poll for 35 minutes. Last failure: ConfigError: "
+        "Failed to load Gmail OAuth credentials from PosixPath('secrets/oauth-token.json'): "
+        "('invalid_grant: Token has been expired or revoked.', {'error': 'invalid_grant', "
+        "'error_description': 'Token has been expired or revoked.'})",
+    )
+
+    smtp_instance.send_message.assert_called_once()
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    assert sent_message["Subject"] == f"{SELF_ALERT_SUBJECT_PREFIX} Unhealthy"
+    assert sent_message[SELF_ALERT_HEADER_NAME] == SELF_ALERT_HEADER_VALUE
+    body = sent_message.get_content()
+    assert "invalid_grant" in body
+    assert "Token has been expired or revoked" in body
+
+
+def test_send_health_alert_recovered_uses_recovered_status(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    config = _configured(fake_config)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+
+    send_health_alert(config, status="Recovered", detail="Healthy again after 35 minutes.")
+
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    assert sent_message["Subject"] == f"{SELF_ALERT_SUBJECT_PREFIX} Recovered"
+    body = sent_message.get_content()
+    assert "Healthy again" in body
+
+
+def test_send_health_alert_never_raises_when_smtp_not_configured(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    # [Story 8.1] Reuses send_alert's own "not configured -> warn and
+    # return" behavior -- confirms this path doesn't require anything
+    # health-alert-specific to stay safe.
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+
+    send_health_alert(fake_config, status="Unhealthy", detail="anything")
+
+    smtp_cls.assert_not_called()
+
+
+def test_send_health_alert_never_raises_on_smtp_send_failure(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    config = _configured(fake_config)
+    mocker.patch("sentinel.alerter.smtplib.SMTP", side_effect=OSError("connection refused"))
+
+    send_health_alert(config, status="Unhealthy", detail="anything")  # must not raise
