@@ -33,6 +33,7 @@ from sentinel.config import Config, ConfigError
 from sentinel.config import load as load_config
 from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.headers import investigate_header_authentication
+from sentinel.triage.health import record_poll_failure, record_poll_success
 from sentinel.triage.ingest import (
     GmailMailSource,
     build_gmail_service,
@@ -82,6 +83,31 @@ def _require_valid_poll_interval(config: Config) -> None:
         raise ConfigError(
             f"SENTINEL_POLL_INTERVAL must be a positive integer, got "
             f"{config.poll_interval_seconds!r}"
+        )
+
+
+def _require_valid_heartbeat_threshold(config: Config) -> None:
+    """[Story 8.1] Validated lazily at first actual use
+    (run_poll_cycle_with_heartbeat), mirroring deferral_threshold/
+    poll_interval_seconds -- config.load() is shared by paths that never
+    read this field. A non-positive threshold would make every failure
+    (even the very first) count as "past threshold" trivially, which is not
+    a meaningful configuration -- distinct from a genuinely unconfigured
+    (default 30.0) value.
+
+    [Review] `not math.isfinite(...)` catches NaN and +/-inf, neither of
+    which `<= 0` rejects (both float('nan') <= 0 and float('inf') <= 0 are
+    False) -- SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES=nan parses
+    successfully via float() and, left unvalidated, makes every
+    "elapsed > threshold" comparison in health.py False forever (NaN
+    compares unequal/false against everything), silently disabling
+    heartbeat alerting for any deployment that has ever succeeded once,
+    with no error anywhere to reveal why."""
+    threshold = config.alert_heartbeat_threshold_minutes
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ConfigError(
+            f"SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES must be a positive, finite "
+            f"number, got {threshold!r}"
         )
 
 
@@ -692,6 +718,38 @@ def run_poll_cycle(
     purge_expired(db_path, config)
 
 
+def run_poll_cycle_with_heartbeat(
+    config: Config, db_path: str, watchman: SentinelAgent, cipher: SentinelAgent
+) -> None:
+    """[Story 8.1] Wraps run_poll_cycle with the heartbeat/liveness signal
+    (AC1/AC2) -- both --once (_run) and the continuous loop
+    (run_continuous_loop) call this instead of run_poll_cycle directly, so
+    the health-tracking logic exists in exactly one place and applies
+    identically to both invocation modes.
+
+    Re-raises whatever run_poll_cycle raised, completely unchanged --
+    callers' existing exception-handling contracts (main()'s catch-all for
+    --once, run_continuous_loop's own "PERSISTENT FAILURE" logging +
+    re-raise) are untouched by this wrapper; it only adds non-raising side
+    effects (recording state, possibly sending an alert) around the call.
+
+    KeyboardInterrupt is deliberately NOT treated as a poll failure: it is
+    an operator-initiated shutdown, not evidence the pipeline is unhealthy.
+    `except Exception` (not `except BaseException`) already lets it pass
+    through unrecorded, exactly matching run_continuous_loop's own
+    KeyboardInterrupt/Exception split.
+    """
+    _require_valid_heartbeat_threshold(config)
+    now = datetime.now(timezone.utc)
+    try:
+        run_poll_cycle(config, db_path, watchman, cipher)
+    except Exception as e:
+        record_poll_failure(db_path, config, e, now)
+        raise
+    else:
+        record_poll_success(db_path, config, now)
+
+
 def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
     """SIGTERM -- what `systemctl stop` actually sends -- has no default
     Python handler, unlike SIGINT/Ctrl+C, which Python already turns into
@@ -723,7 +781,7 @@ def run_continuous_loop(config: Config, db_path: str) -> None:
     cipher = CipherAgent(config)
     while True:
         try:
-            run_poll_cycle(config, db_path, watchman, cipher)
+            run_poll_cycle_with_heartbeat(config, db_path, watchman, cipher)
         except KeyboardInterrupt:
             # Ignore further SIGTERM immediately: a second SIGTERM landing
             # while this block is still running (e.g. mid-print) would
@@ -1089,7 +1147,7 @@ def _run() -> None:
         return  # unreachable in practice; kept for explicit control flow
 
     if args.once:
-        run_poll_cycle(config, db_path, WatchmanAgent(config), CipherAgent(config))
+        run_poll_cycle_with_heartbeat(config, db_path, WatchmanAgent(config), CipherAgent(config))
         sys.exit(0)
 
     if args.view:

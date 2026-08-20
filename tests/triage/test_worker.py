@@ -26,6 +26,7 @@ from sentinel.triage.worker import (
     process_message,
     run_continuous_loop,
     run_poll_cycle,
+    run_poll_cycle_with_heartbeat,
     run_test_alert,
     run_view,
 )
@@ -1534,6 +1535,107 @@ def test_run_poll_cycle_persist_failure_for_one_message_does_not_stop_remaining_
     assert record_m2["message_id"] == "m2"
 
 
+# --- run_poll_cycle_with_heartbeat (Story 8.1) -----------------------------------
+
+
+def test_run_poll_cycle_with_heartbeat_success_records_success(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    success_spy = mocker.patch("sentinel.triage.worker.record_poll_success")
+    failure_spy = mocker.patch("sentinel.triage.worker.record_poll_failure")
+
+    run_poll_cycle_with_heartbeat(store_config, store_db_path, _neutral_agent, _neutral_agent)
+
+    success_spy.assert_called_once()
+    assert success_spy.call_args.args[0] == store_db_path
+    assert success_spy.call_args.args[1] == store_config
+    failure_spy.assert_not_called()
+
+
+def test_run_poll_cycle_with_heartbeat_failure_records_failure_and_reraises(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    original_error = RuntimeError("simulated persistent failure")
+    mocker.patch("sentinel.triage.worker.run_poll_cycle", side_effect=original_error)
+    success_spy = mocker.patch("sentinel.triage.worker.record_poll_success")
+    failure_spy = mocker.patch("sentinel.triage.worker.record_poll_failure")
+
+    with pytest.raises(RuntimeError, match="simulated persistent failure"):
+        run_poll_cycle_with_heartbeat(store_config, store_db_path, _neutral_agent, _neutral_agent)
+
+    failure_spy.assert_called_once()
+    assert failure_spy.call_args.args[0] == store_db_path
+    assert failure_spy.call_args.args[1] == store_config
+    assert failure_spy.call_args.args[2] is original_error
+    success_spy.assert_not_called()
+
+
+def test_run_poll_cycle_with_heartbeat_keyboard_interrupt_not_recorded_as_failure(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    # [Story 8.1] An operator-initiated Ctrl+C/SIGTERM is not evidence the
+    # pipeline is unhealthy -- must propagate unrecorded, matching
+    # run_continuous_loop's own KeyboardInterrupt/Exception split.
+    mocker.patch("sentinel.triage.worker.run_poll_cycle", side_effect=KeyboardInterrupt)
+    success_spy = mocker.patch("sentinel.triage.worker.record_poll_success")
+    failure_spy = mocker.patch("sentinel.triage.worker.record_poll_failure")
+
+    with pytest.raises(KeyboardInterrupt):
+        run_poll_cycle_with_heartbeat(store_config, store_db_path, _neutral_agent, _neutral_agent)
+
+    success_spy.assert_not_called()
+    failure_spy.assert_not_called()
+
+
+def test_run_poll_cycle_with_heartbeat_raises_config_error_on_nonpositive_threshold(
+    store_db_path: str, store_config: Config
+) -> None:
+    config = replace(store_config, alert_heartbeat_threshold_minutes=0.0)
+
+    with pytest.raises(ConfigError, match="SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES"):
+        run_poll_cycle_with_heartbeat(config, store_db_path, _neutral_agent, _neutral_agent)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_run_poll_cycle_with_heartbeat_raises_config_error_on_non_finite_threshold(
+    store_db_path: str, store_config: Config, value: float
+) -> None:
+    """[Review] `<= 0` alone doesn't reject NaN or +/-inf (both compare
+    False against 0 either way) -- a NaN threshold, left unvalidated, would
+    make every "elapsed > threshold" comparison False forever, silently
+    disabling heartbeat alerting with no error to reveal why."""
+    config = replace(store_config, alert_heartbeat_threshold_minutes=value)
+
+    with pytest.raises(ConfigError, match="SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES"):
+        run_poll_cycle_with_heartbeat(config, store_db_path, _neutral_agent, _neutral_agent)
+
+
+def test_run_poll_cycle_with_heartbeat_end_to_end_writes_real_health_state(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """No mocking of health.py itself -- confirms the wiring reaches the
+    real load/save round trip, not just that the spy functions were
+    called."""
+    from sentinel.triage.health import load_health_state
+
+    mocker.patch("sentinel.triage.worker.run_poll_cycle")
+
+    run_poll_cycle_with_heartbeat(store_config, store_db_path, _neutral_agent, _neutral_agent)
+
+    state = load_health_state(store_db_path)
+    assert state["last_success_utc"] is not None
+    assert state["alert_active"] is False
+
+
 # --- run_continuous_loop ----------------------------------------------------------
 
 
@@ -1686,6 +1788,24 @@ def test_run_continuous_loop_sleeps_for_configured_poll_interval(
     run_continuous_loop(config, store_db_path)
 
     sleep_spy.assert_called_once_with(42)
+
+
+def test_run_continuous_loop_goes_through_run_poll_cycle_with_heartbeat(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Story 8.1] The continuous loop must dispatch through the
+    heartbeat-wrapping function too, not call run_poll_cycle directly --
+    the same wiring proof as --once's dispatch test, for this mode."""
+    spy = mocker.patch(
+        "sentinel.triage.worker.run_poll_cycle_with_heartbeat", side_effect=KeyboardInterrupt
+    )
+    mocker.patch("sentinel.triage.worker.signal.signal")
+
+    run_continuous_loop(store_config, store_db_path)
+
+    spy.assert_called_once()
 
 
 def test_run_continuous_loop_instantiates_agents_once_not_per_cycle(
@@ -2209,6 +2329,38 @@ def test_self_alert_marker_header_skips_triage_persistence_and_alert(
     assert "skip" in capsys.readouterr().err.lower()
 
 
+def test_self_alert_marker_header_skips_a_health_alert_shaped_message_too(
+    mocker,  # type: ignore[no-untyped-def]
+    store_db_path: str,
+    store_config: Config,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """[Story 8.1, Notes for dev] "Confirm the existing X-Sentinel-Alert
+    header plus sender-match logic covers [health alerts]." Exact sibling
+    of test_self_alert_marker_header_skips_triage_persistence_and_alert
+    above, with the one thing that actually differs for a health alert
+    (the Subject line and body text -- a status label, not a verdict) --
+    proving the skip logic doesn't secretly depend on the Subject/body
+    looking like a real triage verdict."""
+    config = _alert_config(store_config, alert_smtp_username="me@gmail.com")
+    raw_content = (
+        b"From: me@gmail.com\r\nSubject: Sentinel alert: Unhealthy\r\n"
+        b"X-Sentinel-Alert: 1\r\n\r\n"
+        b"Sentinel triage alert: Unhealthy (confidence=N/A)\n\n"
+        b"Findings:\n  No successful poll for 35 minutes."
+    )
+    _setup_single_message_poll(mocker, store_db_path, raw_content=raw_content)
+    process_spy = mocker.patch("sentinel.triage.worker.process_message")
+    alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
+
+    run_poll_cycle(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    process_spy.assert_not_called()
+    alert_spy.assert_not_called()
+    assert is_message_processed(store_db_path, "m1") is False
+    assert "skip" in capsys.readouterr().err.lower()
+
+
 def test_self_alert_skip_is_not_a_failure_and_checkpoint_still_advances(
     mocker,  # type: ignore[no-untyped-def]
     store_db_path: str,
@@ -2408,11 +2560,40 @@ def test_default_mode_calls_run_continuous_loop(
 
 def test_once_calls_run_poll_cycle_and_exits_zero(
     mocker,  # type: ignore[no-untyped-def]
+    tmp_path: Path,
     store_config: Config,
 ) -> None:
+    # [Review] evidence_db_path pinned to tmp_path, not left at store_config's
+    # real repo-default path -- run_poll_cycle_with_heartbeat's health-state
+    # write is NOT mocked here (only the inner run_poll_cycle is), so
+    # leaving the real default path would write a real health_state.json
+    # into this checkout's actual data/ directory, alongside a real
+    # operator's real evidence.db. Confirmed as a genuine, reproducible
+    # side effect during Story 8.1's adversarial review, not a theoretical
+    # concern.
+    config = replace(store_config, evidence_db_path=str(tmp_path / "evidence.db"))
+    mocker.patch("sys.argv", ["sentinel-triage", "--once"])
+    mocker.patch("sentinel.triage.worker.load_config", return_value=config)
+    spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    spy.assert_called_once()
+    assert exc.value.code == 0
+
+
+def test_once_goes_through_run_poll_cycle_with_heartbeat(
+    mocker,  # type: ignore[no-untyped-def]
+    store_config: Config,
+) -> None:
+    """[Story 8.1] --once must dispatch through the heartbeat-wrapping
+    function, not call run_poll_cycle directly -- a more direct proof of
+    the actual wiring than test_once_calls_run_poll_cycle_and_exits_zero's
+    transitive confirmation above."""
     mocker.patch("sys.argv", ["sentinel-triage", "--once"])
     mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
-    spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
+    spy = mocker.patch("sentinel.triage.worker.run_poll_cycle_with_heartbeat")
 
     with pytest.raises(SystemExit) as exc:
         main()
@@ -2423,6 +2604,7 @@ def test_once_calls_run_poll_cycle_and_exits_zero(
 
 def test_once_without_db_path_falls_back_to_config_evidence_db_path(
     mocker,  # type: ignore[no-untyped-def]
+    tmp_path: Path,
     store_config: Config,
 ) -> None:
     """[Review] --db-path previously defaulted to a separate CWD-relative
@@ -2431,15 +2613,23 @@ def test_once_without_db_path_falls_back_to_config_evidence_db_path(
     this as the same silent-path-divergence bug class AC2 exists to
     prevent, just reintroduced between --view and every other mode.
     Fixed: all modes now share the same absolute, config-resolved
-    fallback when --db-path is omitted."""
+    fallback when --db-path is omitted.
+
+    [Story 8.1 review] evidence_db_path pinned to tmp_path -- the
+    assertion below checks against config.evidence_db_path itself
+    (whatever it's set to), so this doesn't weaken what the test proves;
+    it only stops a real health_state.json write from landing in this
+    checkout's actual data/ directory (see the sibling fix on
+    test_once_calls_run_poll_cycle_and_exits_zero above)."""
+    config = replace(store_config, evidence_db_path=str(tmp_path / "evidence.db"))
     mocker.patch("sys.argv", ["sentinel-triage", "--once"])
-    mocker.patch("sentinel.triage.worker.load_config", return_value=store_config)
+    mocker.patch("sentinel.triage.worker.load_config", return_value=config)
     spy = mocker.patch("sentinel.triage.worker.run_poll_cycle")
 
     with pytest.raises(SystemExit):
         main()
 
-    assert spy.call_args.args[1] == store_config.evidence_db_path
+    assert spy.call_args.args[1] == config.evidence_db_path
 
 
 def test_default_continuous_mode_without_db_path_falls_back_to_config_evidence_db_path(

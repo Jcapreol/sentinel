@@ -74,6 +74,26 @@ class Config:
     alert_smtp_username: str | None = None
     alert_smtp_password: str | None = None
     alert_smtp_recipient: str | None = None
+    # Story 8.1: heartbeat/liveness alerting -- an INDEPENDENT flag from
+    # alert_enabled above, and defaulting the OPPOSITE way (enabled, not
+    # disabled). alert_enabled gates verdict alerts, which a cautious
+    # operator may deliberately leave off during initial setup or after
+    # muting a known issue (e.g. Story 5.2.1's feedback-loop incident) --
+    # but the whole point of this signal is telling the operator the
+    # pipeline is dead even when they never explicitly turned any alerting
+    # on. Since send_alert (the shared SMTP path both alert kinds use)
+    # already no-ops safely when SMTP itself isn't configured, defaulting
+    # this to enabled carries no risk of an accidental email for anyone who
+    # hasn't set up SMTP at all. See the Story 8.1 story file's AC7 answer
+    # for the full reasoning.
+    alert_heartbeat_enabled: bool = True
+    # ~30 minutes at the default 5-minute cron interval (6 missed cycles).
+    # Deliberately expressed as a duration, not a cycle count -- the app has
+    # no reliable way to know how often it's actually being invoked (cron's
+    # schedule lives in crontab, entirely outside this config), so a
+    # cycle-count threshold would silently assume a specific external
+    # interval this file can't see or verify.
+    alert_heartbeat_threshold_minutes: float = 30.0
 
 
 def load() -> Config:
@@ -131,6 +151,32 @@ def load() -> Config:
         # "checked lazily where used, not here" design.
         alert_smtp_port = 587
 
+    # [Story 8.1] Defaults to enabled (unlike alert_enabled's default-off) --
+    # "true" is the fallback literal handed to .get() itself, not a bare
+    # empty string, so an ABSENT env var lands in _TRUTHY_STRINGS and only an
+    # EXPLICIT falsy value (e.g. SENTINEL_ALERT_HEARTBEAT_ENABLED=false)
+    # turns it off.
+    alert_heartbeat_enabled = (
+        os.environ.get("SENTINEL_ALERT_HEARTBEAT_ENABLED", "true").strip().lower()
+        in _TRUTHY_STRINGS
+    )
+
+    alert_heartbeat_threshold_minutes_raw = os.environ.get(
+        "SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES"
+    )
+    try:
+        alert_heartbeat_threshold_minutes = (
+            float(alert_heartbeat_threshold_minutes_raw)
+            if alert_heartbeat_threshold_minutes_raw
+            else 30.0
+        )
+    except ValueError:
+        # Mirrors alert_smtp_port's exact fallback-on-malformed-value
+        # pattern above -- a typo'd threshold must not break load() for
+        # every mode; range/positivity validated lazily at point of use
+        # instead (worker.py), matching deferral_threshold/retention_days.
+        alert_heartbeat_threshold_minutes = 30.0
+
     return Config(
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
         virustotal_api_key=os.environ["VIRUSTOTAL_API_KEY"],
@@ -161,4 +207,6 @@ def load() -> Config:
         alert_smtp_username=os.environ.get("SENTINEL_ALERT_SMTP_USERNAME"),
         alert_smtp_password=os.environ.get("SENTINEL_ALERT_SMTP_PASSWORD"),
         alert_smtp_recipient=os.environ.get("SENTINEL_ALERT_SMTP_RECIPIENT"),
+        alert_heartbeat_enabled=alert_heartbeat_enabled,
+        alert_heartbeat_threshold_minutes=alert_heartbeat_threshold_minutes,
     )
