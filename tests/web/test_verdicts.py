@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 
 from sentinel.config import Config, ConfigError
 from sentinel.triage.evidence import EvidenceItem
+from sentinel.triage.health import save_health_state
 from sentinel.triage.report import TriageReport
 from sentinel.triage.store import EvidenceRecord, persist_evidence_record
 from sentinel.triage.store import _connect as _store_connect
@@ -213,7 +214,10 @@ def test_verdict_list_shows_timestamp_sender_verdict_confidence(
     assert "Aug 20, 2026 8:00 AM" in body
     assert "phisher@evil.example" in body
     assert "Malicious" in body
-    assert "0.870" in body
+    # [Story 10.3, AC4] Confidence folds into the verdict badge, 2 decimals
+    # (matching the AC's own "Malicious 1.00" example) -- not the 3-decimal
+    # format used elsewhere (e.g. the detail route's dedicated line).
+    assert "Malicious 0.87" in body
 
 
 def test_verdict_list_filters_by_verdict(verdicts_env: VerdictsEnv) -> None:
@@ -236,9 +240,12 @@ def test_verdict_list_rejects_invalid_verdict_filter(verdicts_env: VerdictsEnv) 
 def test_verdict_list_renders_coverage_gap_without_confidence_and_without_crashing(
     verdicts_env: VerdictsEnv,
 ) -> None:
-    """[Story 6.1 model, AC2] CoverageGap has sender: null and
-    calibrated_confidence: None -- must render "N/A", never crash, and
-    never show 0.000/0.500 (either would look like a real measurement)."""
+    """[Story 6.1 model; Story 10.3, AC4] CoverageGap has sender: null and
+    calibrated_confidence: None -- must render, never crash, never show
+    0.000/0.500 (either would look like a real measurement). Per AC4, the
+    badge shows the verdict with NO number at all (not "N/A" inside the
+    badge -- that would read as clutter next to a chip that already means
+    "no analysis ran"); sender gets the AC5 placeholder."""
     _persist(
         verdicts_env,
         "hash-gap",
@@ -253,8 +260,8 @@ def test_verdict_list_renders_coverage_gap_without_confidence_and_without_crashi
 
     assert response.status_code == 200
     body = response.text
-    assert "CoverageGap" in body
-    assert "N/A" in body
+    assert '<span class="badge badge-coveragegap">CoverageGap</span>' in body
+    assert "Message unavailable" in body
     assert "0.000" not in body
     assert "0.500" not in body
 
@@ -457,9 +464,13 @@ def test_verdict_detail_unknown_hash_returns_404(verdicts_env: VerdictsEnv) -> N
 # reproduce the two confirmed crash paths and confirm the fix.
 
 
-def test_verdict_list_malformed_confidence_value_renders_na_not_crash(
+def test_verdict_list_malformed_confidence_value_renders_no_number_not_crash(
     verdicts_env: VerdictsEnv,
 ) -> None:
+    """[Story 10.3, AC4] The list route's badge shows the verdict with no
+    number for an unusable confidence -- not "N/A" (that display moved
+    into the badge's own convention, distinct from the detail route's
+    dedicated "Confidence: N/A" line, which is unchanged)."""
     report = _make_report(verdict="Malicious", calibrated_confidence=0.9)
     report["calibrated_confidence"] = "not-a-number"  # type: ignore[typeddict-item]
     _persist_raw(
@@ -476,7 +487,7 @@ def test_verdict_list_malformed_confidence_value_renders_na_not_crash(
     response = verdicts_env.client.get("/verdicts")
 
     assert response.status_code == 200
-    assert "N/A" in response.text
+    assert '<span class="badge badge-malicious">Malicious</span>' in response.text
 
 
 def test_verdict_detail_malformed_confidence_value_renders_na_not_crash(
@@ -796,3 +807,240 @@ def test_verdict_list_concurrent_requests_do_not_serialize_on_event_loop(
     # (dispatched to a thread pool): close to one delay. 0.6s is a
     # comfortable line between the two, not a tight timing assertion.
     assert elapsed < 0.6, f"requests appear serialized on the event loop ({elapsed:.3f}s)"
+
+
+# --- Story 10.3: header bar, live status, summary strip ---------------------
+
+
+def _write_raw_health_state(env: VerdictsEnv, raw: str) -> None:
+    Path(env.db_path).with_name("health_state.json").write_text(raw)
+
+
+def test_header_shows_product_name_on_both_pages(verdicts_env: VerdictsEnv) -> None:
+    """AC1: a header bar with the product name on both the list and
+    detail pages."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    list_response = verdicts_env.client.get("/verdicts")
+    detail_response = verdicts_env.client.get("/verdicts/hash1")
+
+    for response in (list_response, detail_response):
+        assert '<header class="app-header">' in response.text
+        assert ">Sentinel<" in response.text
+
+
+def test_header_status_healthy_shows_text_and_last_poll_time(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC1/AC2: alert_active=False -> Healthy, with the last successful
+    poll time formatted in Eastern (same convention as Story 10.2)."""
+    save_health_state(
+        verdicts_env.db_path,
+        {"last_success_utc": "2026-08-20T19:10:00+00:00", "alert_active": False},
+    )
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert response.status_code == 200
+    assert '<span class="badge badge-healthy">Healthy' in response.text
+    assert "Aug 20, 2026 3:10 PM" in response.text  # EDT
+
+
+def test_header_status_unhealthy_uses_alert_active(verdicts_env: VerdictsEnv) -> None:
+    """AC2: alert_active is the sole discriminator between healthy and
+    unhealthy."""
+    save_health_state(
+        verdicts_env.db_path,
+        {"last_success_utc": "2026-08-20T19:10:00+00:00", "alert_active": True},
+    )
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert '<span class="badge badge-unhealthy">Unhealthy' in response.text
+    assert '<span class="badge badge-healthy">' not in response.text
+
+
+def test_header_status_unhealthy_with_no_successful_poll_ever(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC2: alert_active=True can co-occur with last_success_utc=None (the
+    poll has never once succeeded -- health.py's own _threshold_exceeded
+    fires immediately in that case). Must still show Unhealthy, not
+    Unknown -- the operator has already been alerted about exactly this;
+    the dashboard must not soften that signal."""
+    save_health_state(verdicts_env.db_path, {"last_success_utc": None, "alert_active": True})
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert (
+        '<span class="badge badge-unhealthy">Unhealthy — no successful poll recorded</span>'
+        in response.text
+    )
+
+
+def test_header_status_unknown_when_health_file_missing(verdicts_env: VerdictsEnv) -> None:
+    """AC6: the health state file may be missing -- must render as
+    Unknown, not error, not silently render Healthy."""
+    response = verdicts_env.client.get("/verdicts")
+
+    assert response.status_code == 200
+    assert '<span class="badge badge-unknown">Unknown</span>' in response.text
+
+
+def test_header_status_unknown_when_health_file_corrupt(verdicts_env: VerdictsEnv) -> None:
+    """AC6: the health state file may be unreadable/corrupt (Notes for
+    dev: "possibly mid-write") -- same Unknown outcome as missing, not a
+    crash and not a silent Healthy default."""
+    _write_raw_health_state(verdicts_env, "{not valid json, mid-write")
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert response.status_code == 200
+    assert '<span class="badge badge-unknown">Unknown</span>' in response.text
+
+
+def test_header_status_unknown_when_server_not_configured() -> None:
+    """AC6: no config at all (state._config is None) means there is no
+    evidence_db_path to even locate the health file from -- also Unknown,
+    not a crash."""
+    with patch(
+        "sentinel.web.main.load_config",
+        side_effect=ConfigError("Missing required environment variable: ANTHROPIC_API_KEY"),
+    ):
+        with TestClient(app) as client:
+            response = client.get("/verdicts")
+    assert response.status_code == 200
+    assert '<span class="badge badge-unknown">Unknown</span>' in response.text
+
+
+def test_header_status_with_injected_timestamp_is_escaped(verdicts_env: VerdictsEnv) -> None:
+    """AC8: health_state.json is written by a separate cron process --
+    treated as untrusted the same way record fields are. A hand-tampered
+    last_success_utc must still render inert."""
+    import json as _json
+
+    payload = '<script>alert("health")</script>'
+    raw = _json.dumps({"last_success_utc": payload, "alert_active": False})
+    _write_raw_health_state(verdicts_env, raw)
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert response.status_code == 200
+    assert "<script>alert" not in response.text
+    assert "&lt;script&gt;" in response.text
+
+
+def test_summary_strip_shows_total_and_per_verdict_counts(verdicts_env: VerdictsEnv) -> None:
+    """AC3: total and per-verdict counts, computed from the store, not
+    hardcoded -- verified against a specific, known distribution."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+    _persist(verdicts_env, "hash2", verdict="Malicious")
+    _persist(verdicts_env, "hash3", verdict="Benign")
+    _persist(
+        verdicts_env,
+        "hash4",
+        verdict="CoverageGap",
+        sender=None,
+        evidence=[],
+        calibrated_confidence=None,
+        coverage_gap_reason="gap",
+    )
+
+    response = verdicts_env.client.get("/verdicts")
+    body = response.text
+
+    assert '<span class="summary-total">4 total</span>' in body
+    assert '<span class="badge badge-malicious">Malicious 2</span>' in body
+    assert '<span class="badge badge-benign">Benign 1</span>' in body
+    assert '<span class="badge badge-deferred">Deferred 0</span>' in body
+    assert '<span class="badge badge-coveragegap">CoverageGap 1</span>' in body
+
+
+def test_summary_strip_unhashable_verdict_value_does_not_crash(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """[Review, Blind Hunter] Well-formedness only guarantees "verdict" is
+    a present key, never that its value is a string -- a corrupted record
+    could have it decrypt to a list or dict. `verdict in counts` on an
+    unhashable value raised an uncaught TypeError, crashing the ENTIRE
+    list route for every visitor (this runs unconditionally over the full
+    list, not per-filtered-request). Must render cleanly instead: the
+    malformed record still counts toward the total, just not toward any
+    per-verdict bucket."""
+    _persist(verdicts_env, "hash-good", verdict="Malicious")
+    report = _make_report(verdict="Malicious")
+    report["verdict"] = ["Malicious"]  # type: ignore[typeddict-item]
+    _persist_raw(
+        verdicts_env,
+        "hash-bad-verdict-list",
+        {
+            "message_id": "hash-bad-verdict-list",
+            "sender": "alice@example.com",
+            "report": report,
+            "deferral_threshold_used": verdicts_env.config.deferral_threshold,
+        },
+    )
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert response.status_code == 200
+    assert '<span class="summary-total">2 total</span>' in response.text
+    assert '<span class="badge badge-malicious">Malicious 1</span>' in response.text
+
+
+def test_summary_strip_reflects_full_store_not_the_active_filter(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC3: the strip is a stable overview of the whole store -- it must
+    not change to reflect only the currently-filtered subset."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+    _persist(verdicts_env, "hash2", verdict="Benign")
+
+    response = verdicts_env.client.get("/verdicts", params={"verdict": "Benign"})
+    body = response.text
+
+    assert '<span class="summary-total">2 total</span>' in body
+    assert '<span class="badge badge-malicious">Malicious 1</span>' in body
+
+
+def test_summary_strip_not_present_on_detail_page(verdicts_env: VerdictsEnv) -> None:
+    """AC3 places the strip "above the filter links", which exist only on
+    the list page -- the detail page must not render it. Checks for the
+    actual element, not the bare class-name substring, which also appears
+    in every page's shared <style> block (the CSS rule itself)."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+
+    assert '<div class="summary-strip">' not in response.text
+
+
+def test_sender_placeholder_exact_wording_in_list_and_detail(verdicts_env: VerdictsEnv) -> None:
+    """AC5: a specific, clear placeholder -- not an empty cell -- for a
+    CoverageGap record's null sender, on both routes."""
+    _persist(
+        verdicts_env,
+        "hash-gap",
+        verdict="CoverageGap",
+        sender=None,
+        evidence=[],
+        calibrated_confidence=None,
+        coverage_gap_reason="gap",
+    )
+
+    list_response = verdicts_env.client.get("/verdicts")
+    detail_response = verdicts_env.client.get("/verdicts/hash-gap")
+
+    for response in (list_response, detail_response):
+        assert "Message unavailable" in response.text
+        assert "<td></td>" not in response.text
+
+
+def test_verdict_badge_folds_in_confidence_for_real_records(verdicts_env: VerdictsEnv) -> None:
+    """AC4: a positive case matching the AC's own worked example exactly
+    ("Malicious 1.00")."""
+    _persist(verdicts_env, "hash1", verdict="Malicious", calibrated_confidence=1.0)
+
+    response = verdicts_env.client.get("/verdicts")
+
+    assert '<span class="badge badge-malicious">Malicious 1.00</span>' in response.text

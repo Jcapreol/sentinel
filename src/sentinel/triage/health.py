@@ -60,6 +60,37 @@ def _health_state_path(db_path: str) -> Path:
     return Path(db_path).with_name("health_state.json")
 
 
+def try_load_health_state(db_path: str) -> HealthState | None:
+    """[Story 10.3] The one parse+validate implementation for the health
+    state file. Returns None specifically when the file is missing,
+    unreadable, corrupt JSON, or shaped wrong -- distinct from a
+    successfully-read file that happens to hold the same values a failed
+    read would produce (a genuinely fresh deployment's
+    {"last_success_utc": None, "alert_active": False}). That distinction
+    doesn't matter to this module's own callers (record_poll_success/
+    record_poll_failure, via load_health_state below, which collapses
+    both cases to the same safe default -- see its own docstring for why).
+    It does matter to a caller that needs to tell a human "we don't know
+    the status" apart from "the status is healthy" -- the web dashboard's
+    AC6 ("missing or unreadable" must show as unknown, not silently
+    healthy), which is why this is a separate, public function rather
+    than an inline private helper."""
+    path = _health_state_path(db_path)
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    last_success_utc = raw.get("last_success_utc")
+    alert_active = raw.get("alert_active")
+    if last_success_utc is not None and not isinstance(last_success_utc, str):
+        return None
+    if not isinstance(alert_active, bool):
+        return None
+    return {"last_success_utc": last_success_utc, "alert_active": alert_active}
+
+
 def load_health_state(db_path: str) -> HealthState:
     """Never raises. A missing, corrupt, or unreadable state file degrades
     to the default (never-succeeded, no active alert) rather than crashing
@@ -67,20 +98,10 @@ def load_health_state(db_path: str) -> HealthState:
     same one a genuinely fresh deployment starts with, so a transient read
     glitch is at worst indistinguishable from "first run ever," not a new
     failure mode of its own."""
-    path = _health_state_path(db_path)
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    state = try_load_health_state(db_path)
+    if state is None:
         return HealthState(last_success_utc=None, alert_active=False)
-    if not isinstance(raw, dict):
-        return HealthState(last_success_utc=None, alert_active=False)
-    last_success_utc = raw.get("last_success_utc")
-    alert_active = raw.get("alert_active")
-    if last_success_utc is not None and not isinstance(last_success_utc, str):
-        return HealthState(last_success_utc=None, alert_active=False)
-    if not isinstance(alert_active, bool):
-        return HealthState(last_success_utc=None, alert_active=False)
-    return {"last_success_utc": last_success_utc, "alert_active": alert_active}
+    return state
 
 
 def save_health_state(db_path: str, state: HealthState) -> None:
