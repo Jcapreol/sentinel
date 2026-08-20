@@ -156,6 +156,19 @@ not a silent continue. If you hit this: delete the cached token file and
 re-run to re-authorize, and confirm the Cloud project's OAuth consent
 screen includes the `gmail.readonly` scope.
 
+**Re-running to re-authorize must happen from an interactive session** —
+`sentinel-triage` opens a browser and waits for you to complete consent, so
+it needs an actual terminal to run in. If a scheduled/cron invocation is
+still active while the cached token is missing or unusable, pause it first
+(comment out the cron entry, or stop the systemd unit) before deleting the
+token and re-running by hand; otherwise the *next* unattended run will hit
+the same "no cached token" condition. That's expected and safe, not a new
+problem: it now fails immediately with a clear error explaining that no
+interactive terminal is available, rather than hanging. Re-enable the
+scheduled invocation once you've completed consent and confirmed
+`secrets/oauth-token.json` (or your configured `GMAIL_OAUTH_TOKEN_PATH`) has
+been written.
+
 ## Running continuously
 
 Running `sentinel-triage` with no flags is the default mode: it polls every

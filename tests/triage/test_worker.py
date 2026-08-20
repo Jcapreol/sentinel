@@ -1636,6 +1636,54 @@ def test_run_poll_cycle_with_heartbeat_end_to_end_writes_real_health_state(
     assert state["alert_active"] is False
 
 
+def test_run_poll_cycle_with_heartbeat_non_interactive_oauth_failure_triggers_record_poll_failure(
+    mocker,  # type: ignore[no-untyped-def]
+    tmp_path: Path,
+    store_db_path: str,
+    store_config: Config,
+) -> None:
+    """[Story 8.2, AC5 -- the most important AC] Confirms end to end, not
+    just by tracing the code, that Story 8.2's new "no TTY, no cached
+    token" failure reaches Story 8.1's record_poll_failure exactly like
+    the original invalid_grant ConfigError already did -- this is the
+    whole point of fixing the hang: the failure must be observable to the
+    heartbeat mechanism, not just fast. Mocks get_credentials to raise the
+    real RuntimeError gmail_oauth.py now raises for this case (not a
+    generic stand-in), going through the real build_gmail_service ->
+    run_poll_cycle -> run_poll_cycle_with_heartbeat chain unmodified."""
+    client_secret = tmp_path / "oauth-client.json"
+    client_secret.write_text("{}")
+    token_path = tmp_path / "oauth-token.json"
+    config = replace(
+        store_config,
+        gmail_auth_mode="oauth",
+        gmail_oauth_client_secret_path=str(client_secret),
+        gmail_oauth_token_path=str(token_path),
+        gmail_monitored_mailbox="me",
+    )
+    mocker.patch(
+        "sentinel.triage.ingest.get_credentials",
+        side_effect=RuntimeError(
+            "No interactive terminal available to complete OAuth consent, and no "
+            f"valid cached token exists at {token_path!r}. This cannot be completed "
+            "unattended (e.g. under cron). Remedy: run this OAuth consent flow "
+            "interactively on a machine with a browser, then copy the resulting "
+            "token file to this machine's configured GMAIL_OAUTH_TOKEN_PATH."
+        ),
+    )
+    failure_spy = mocker.patch("sentinel.triage.worker.record_poll_failure")
+    success_spy = mocker.patch("sentinel.triage.worker.record_poll_success")
+
+    with pytest.raises(ConfigError, match="No interactive terminal available"):
+        run_poll_cycle_with_heartbeat(config, store_db_path, _neutral_agent, _neutral_agent)
+
+    failure_spy.assert_called_once()
+    recorded_error = failure_spy.call_args.args[2]
+    assert isinstance(recorded_error, ConfigError)
+    assert "No interactive terminal available" in str(recorded_error)
+    success_spy.assert_not_called()
+
+
 # --- run_continuous_loop ----------------------------------------------------------
 
 
