@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generator
 from unittest.mock import patch
+from urllib.parse import quote
 
 import pytest
 from cryptography.fernet import Fernet
@@ -737,7 +738,7 @@ def test_evidence_items_render_as_grouped_blocks_not_table_rows(
     body = response.text
 
     assert '<ul class="evidence-list">' in body
-    assert '<li class="evidence-item">' in body
+    assert '<li class="evidence-item evidence-item-malicious">' in body
     assert '<div class="evidence-header">' in body
     assert '<span class="evidence-name">watchman_finding</span>' in body
     assert 'class="evidence-weight"' in body
@@ -1007,11 +1008,23 @@ def test_summary_strip_shows_total_and_per_verdict_counts(verdicts_env: Verdicts
     response = verdicts_env.client.get("/verdicts")
     body = response.text
 
-    assert '<span class="summary-total">4 total</span>' in body
-    assert '<span class="badge badge-malicious">Malicious 2</span>' in body
-    assert '<span class="badge badge-benign">Benign 1</span>' in body
-    assert '<span class="badge badge-deferred">Deferred 0</span>' in body
-    assert '<span class="badge badge-coveragegap">CoverageGap 1</span>' in body
+    assert '<span class="metric-label">Total</span><span class="metric-value">4</span>' in body
+    assert (
+        '<span class="metric-label">Malicious</span>'
+        '<span class="metric-value metric-value-malicious">2</span>' in body
+    )
+    assert (
+        '<span class="metric-label">Benign</span>'
+        '<span class="metric-value metric-value-benign">1</span>' in body
+    )
+    assert (
+        '<span class="metric-label">Deferred</span>'
+        '<span class="metric-value metric-value-deferred">0</span>' in body
+    )
+    assert (
+        '<span class="metric-label">CoverageGap</span>'
+        '<span class="metric-value metric-value-coveragegap">1</span>' in body
+    )
 
 
 def test_summary_strip_unhashable_verdict_value_does_not_crash(
@@ -1042,8 +1055,11 @@ def test_summary_strip_unhashable_verdict_value_does_not_crash(
     response = verdicts_env.client.get("/verdicts")
 
     assert response.status_code == 200
-    assert '<span class="summary-total">2 total</span>' in response.text
-    assert '<span class="badge badge-malicious">Malicious 1</span>' in response.text
+    assert '<span class="metric-label">Total</span><span class="metric-value">2</span>' in response.text
+    assert (
+        '<span class="metric-label">Malicious</span>'
+        '<span class="metric-value metric-value-malicious">1</span>' in response.text
+    )
 
 
 def test_summary_strip_reflects_full_store_not_the_active_filter(
@@ -1057,8 +1073,11 @@ def test_summary_strip_reflects_full_store_not_the_active_filter(
     response = verdicts_env.client.get("/verdicts", params={"verdict": "Benign"})
     body = response.text
 
-    assert '<span class="summary-total">2 total</span>' in body
-    assert '<span class="badge badge-malicious">Malicious 1</span>' in body
+    assert '<span class="metric-label">Total</span><span class="metric-value">2</span>' in body
+    assert (
+        '<span class="metric-label">Malicious</span>'
+        '<span class="metric-value metric-value-malicious">1</span>' in body
+    )
 
 
 def test_summary_strip_not_present_on_detail_page(verdicts_env: VerdictsEnv) -> None:
@@ -1070,7 +1089,7 @@ def test_summary_strip_not_present_on_detail_page(verdicts_env: VerdictsEnv) -> 
 
     response = verdicts_env.client.get("/verdicts/hash1")
 
-    assert '<div class="summary-strip">' not in response.text
+    assert '<div class="metrics">' not in response.text
 
 
 def test_sender_placeholder_exact_wording_in_list_and_detail(verdicts_env: VerdictsEnv) -> None:
@@ -1232,6 +1251,41 @@ def test_set_label_non_utf8_body_rejected_cleanly_not_a_raw_500(
     assert "Nothing was saved" in response.text
 
 
+def test_set_label_success_redirect_quotes_special_characters_in_message_hash(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """[Review, Edge Case Hunter] set_verdict_label does not validate
+    message_hash against the evidence store by design (see the route's own
+    docstring) -- an orphan label for a hash that isn't a real record is
+    harmless. But every OTHER href/redirect built from message_hash in this
+    file (record_href in this same route, detail_href in the list route,
+    the label form's own action) re-encodes it via
+    quote(message_hash, safe=""); the success-path redirect previously did
+    not. For a hash containing "?" or "#", the un-quoted redirect
+    ("/verdicts/hash1?evil=1?saved=1") is either parsed by a browser as a
+    single query key holding a literal "?" (silently dropping the AC2
+    "saved" flash and the AC1 back-filter context) or, worse
+    ("/verdicts/hash1#foo?saved=1"), turns everything after "#" into a
+    client-side-only fragment the server never sees again. Reproduced
+    directly via TestClient(..., follow_redirects=False) and the raw
+    Location header -- not just an assertion on the final page."""
+    for raw_hash in ("hash1?evil=1", "hash1#foo"):
+        encoded_hash = quote(raw_hash, safe="")
+
+        response = verdicts_env.client.post(
+            f"/verdicts/{encoded_hash}/label",
+            data={"label": "unclear", "note": "x"},
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        location = response.headers["location"]
+        assert location == f"/verdicts/{encoded_hash}?saved=1"
+        # the "?" that starts the real query string must be the ONE
+        # inserted by this route, not one smuggled in from the hash itself
+        assert location.count("?") == 1
+
+
 def test_set_label_server_not_configured_renders_clean_error() -> None:
     with patch(
         "sentinel.web.main.load_config",
@@ -1384,3 +1438,93 @@ def test_crosstab_not_present_on_detail_page(verdicts_env: VerdictsEnv) -> None:
     response = verdicts_env.client.get("/verdicts/hash1")
 
     assert '<table class="crosstab">' not in response.text
+
+
+# --- Story 11.2: back-link navigation, save flash, dark theme --------------
+
+
+def test_back_link_round_trip_preserves_active_filters(verdicts_env: VerdictsEnv) -> None:
+    """[Review, Blind Hunter] AC1's own point -- reaching a record from a
+    filtered list and returning must land on the SAME filtered URL, not an
+    unfiltered one. No test previously verified the module docstring's own
+    claim about this. Checks the full round trip: the list route's real
+    rendered Detail href for an active verdict+label filter, then the
+    detail route's real rendered back-link href built from it."""
+    _persist(verdicts_env, "hash1", verdict="Deferred")
+    verdicts_env.client.post("/verdicts/hash1/label", data={"label": "unclear", "note": ""})
+
+    list_response = verdicts_env.client.get(
+        "/verdicts", params={"verdict": "Deferred", "label": "unclear"}
+    )
+    expected_back_param = quote("verdict=Deferred&label=unclear", safe="")
+    assert f'href="/verdicts/hash1?back={expected_back_param}"' in list_response.text
+
+    detail_response = verdicts_env.client.get(f"/verdicts/hash1?back={expected_back_param}")
+
+    assert 'href="/verdicts?verdict=Deferred&amp;label=unclear"' in detail_response.text
+
+
+def test_back_link_href_escapes_malicious_back_value(verdicts_env: VerdictsEnv) -> None:
+    """[Review, Blind Hunter] `back` is a raw, attacker-influenced query
+    string (not a stored record field), and the module's own docstring
+    claims it is "escaped wherever it reaches an href, never trusted to be
+    well-formed" -- but nothing pinned that claim with a test. An
+    attribute-breakout attempt must render as inert text, not attach a new
+    attribute or escape the href."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+    payload = '"><script>alert(1)</script>'
+
+    response = verdicts_env.client.get("/verdicts/hash1", params={"back": payload})
+
+    assert response.status_code == 200
+    assert "<script>alert(1)</script>" not in response.text
+    assert "&lt;script&gt;" in response.text
+
+
+def test_back_link_href_cannot_redirect_off_origin(verdicts_env: VerdictsEnv) -> None:
+    """[Review, Blind Hunter] `_back_link_href` always builds
+    `/verdicts?{back}` -- `back`'s content can only ever become the query
+    STRING of that fixed path, never the scheme/host. Confirms an
+    absolute-URL-shaped `back` value does not produce an off-origin link."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.get(
+        "/verdicts/hash1", params={"back": "http://evil.example/steal"}
+    )
+
+    assert 'href="http://evil.example' not in response.text
+    assert 'href="/verdicts?http://evil.example' in response.text
+
+
+def test_save_confirmation_banner_shown_after_successful_save(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC2: after a successful save the user must see that it saved --
+    fixed by a `?saved=1` flash rendered as a distinct banner on the
+    redirect target, since the pre-existing gap was that a resubmission of
+    an unchanged label left the re-rendered page pixel-identical to
+    before."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "unclear", "note": "x"}
+    )
+
+    assert response.status_code == 200  # TestClient follows the 303 redirect
+    assert '<p class="flash flash-success">Label saved.</p>' in response.text
+
+
+def test_save_confirmation_banner_absent_without_saved_param(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """The flash is a one-time signal tied to the redirect, not a
+    persistent state -- a normal reload (no ?saved=1) must not show it.
+    Checks for the actual rendered element, not the bare class-name
+    substring, which also appears in every page's shared <style> block
+    (matching test_summary_strip_not_present_on_detail_page's own
+    precedent for this exact gotcha)."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+
+    assert '<p class="flash flash-success">Label saved.</p>' not in response.text

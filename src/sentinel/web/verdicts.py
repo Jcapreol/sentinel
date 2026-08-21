@@ -1,5 +1,7 @@
 """Read-only live verdict list and detail views (Story 10.1, styled and
-timezone-aware per Story 10.2, chrome/summary/health status per Story 10.3).
+timezone-aware per Story 10.2, chrome/summary/health status per Story 10.3,
+labelling per Story 11.1, navigation/save-affordance/dark theme per Story
+11.2).
 
 Reads exclusively through sentinel.triage.store's existing, validated,
 read-only functions -- no direct sqlite3 or Fernet usage anywhere in this
@@ -23,7 +25,11 @@ the same escaped values (verdict, direction) for exactly the same reason:
 a malformed-but-decryptable record's verdict/direction is only guaranteed
 to be a present key, never a value drawn from the expected Literal (see
 _format_confidence's docstring below for the identical gap already found
-in calibrated_confidence during Story 10.1's review).
+in calibrated_confidence during Story 10.1's review). Story 11.2's `back`
+query param (AC1, navigation) is the same kind of attacker-adjacent input
+by a different route -- a query string, not a stored record -- and gets
+the identical treatment: escaped wherever it reaches an href, never
+trusted to be well-formed.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ import html
 import sys
 from datetime import datetime, timezone
 from typing import Literal
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
@@ -60,28 +66,42 @@ _VALID_VERDICTS: tuple[Verdict, ...] = ("Malicious", "Benign", "Deferred", "Cove
 # used by someone outside Eastern time -- no such mechanism exists yet.
 _DISPLAY_TIMEZONE = ZoneInfo("America/New_York")
 
-# [Story 10.2, AC4/AC5] Inline, not served: keeps the whole feature -- every
-# escape point, every style rule -- auditable in this one module, and needs
-# no new route/static-file surface (AC1's "reads only through store.py"
-# structural test has nothing new to consider). No CDN, no build step, no
-# framework -- plain CSS custom properties and flexbox. Deliberately a
-# single light theme (Notes for dev: "clean and legible beats designed";
-# dark mode is explicitly out of scope).
+# [Story 11.2, AC4] Dark theme, one theme, not a toggle (Notes for dev: "the
+# audience is a CS instructor and eventually a small business owner -- clean
+# and legible beats designed"). Every color is a custom property here, none
+# scattered as a literal elsewhere in this file (Notes for dev: "grep for
+# them rather than assuming the theme swap is complete" -- the light-theme
+# version of this file had exactly two literal hex values outside :root,
+# `background: #ffffff` on body and `color: #ffffff` on the label-form
+# button, both invisible to a palette swap until they were found and moved
+# in here too). Inline, not served: keeps the whole feature -- every escape
+# point, every style rule -- auditable in this one module, and needs no new
+# route/static-file surface. No CDN, no build step, no framework -- plain
+# CSS custom properties, flexbox, and grid.
 _STYLE = """
 :root {
-  --fg: #1f2933; --muted: #6b7280; --border: #e5e7eb; --row-alt: #f9fafb;
-  --link: #1d4ed8;
-  --malicious-bg: #fee2e2; --malicious-fg: #991b1b;
-  --benign-bg: #dcfce7; --benign-fg: #166534;
-  --deferred-bg: #fef3c7; --deferred-fg: #92400e;
-  --coveragegap-bg: #e5e7eb; --coveragegap-fg: #374151;
-  --neutral-bg: #e5e7eb; --neutral-fg: #374151;
+  --bg: #14161f;
+  --surface: #1c1f2b;
+  --row-alt: #1f2331;
+  --border: #2d3142;
+  --fg: #e8eaf2;
+  --muted: #8b90a8;
+  --dim: #6d7290;
+  --accent: #f0b429;
+  --link: #f0b429;
+  --button-text: #14161f;
+
+  --malicious-fg: #ff6b6b; --malicious-bg: rgba(255, 107, 107, 0.13);
+  --deferred-fg: #f0b429; --deferred-bg: rgba(240, 180, 41, 0.13);
+  --benign-fg: #4ecdc4; --benign-bg: rgba(78, 205, 196, 0.13);
+  --coveragegap-fg: #8b90a8; --coveragegap-bg: #262a38;
+  --neutral-fg: #8b90a8; --neutral-bg: #262a38;
 }
 * { box-sizing: border-box; }
 body {
   max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem 4rem;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  font-size: 16px; line-height: 1.5; color: var(--fg); background: #ffffff;
+  font-size: 16px; line-height: 1.5; color: var(--fg); background: var(--bg);
 }
 h1 { font-size: 1.5rem; margin: 0 0 1rem; }
 a { color: var(--link); }
@@ -90,24 +110,48 @@ a { color: var(--link); }
   flex-wrap: wrap; gap: 0.5rem;
   padding-bottom: 1rem; margin-bottom: 1.5rem; border-bottom: 2px solid var(--border);
 }
-.app-name { font-weight: 700; font-size: 1.1rem; color: var(--fg); text-decoration: none; }
-.summary-strip {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem;
-  margin-bottom: 1rem;
+.app-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-transform: uppercase; letter-spacing: 0.14em;
+  font-weight: 700; font-size: 1.1rem; color: var(--accent); text-decoration: none;
 }
-.summary-strip .summary-total { font-weight: 600; margin-right: 0.4rem; }
+.back-link { display: inline-block; margin-bottom: 1rem; }
+.flash {
+  border-radius: 6px; padding: 0.6rem 1rem; margin-bottom: 1rem; font-weight: 600;
+}
+.flash-success { background: var(--benign-bg); color: var(--benign-fg); }
+.flash-error { background: var(--malicious-bg); color: var(--malicious-fg); }
+.metrics { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1.25rem; }
+.metric-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.7rem 1rem; min-width: 96px;
+}
+.metric-value {
+  display: block; font-size: 1.5rem; font-weight: 700; color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.metric-value-malicious { color: var(--malicious-fg); }
+.metric-value-benign { color: var(--benign-fg); }
+.metric-value-deferred { color: var(--deferred-fg); }
+.metric-value-coveragegap { color: var(--coveragegap-fg); }
 .filters { margin-bottom: 1.5rem; }
 .filters a { margin-right: 0.9rem; text-decoration: none; }
 .filters strong { color: var(--fg); }
+.table-surface {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  overflow-x: auto; margin-bottom: 1rem;
+}
 table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
 th, td {
   text-align: left; padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border);
   overflow-wrap: break-word;
 }
-th {
+th, .metric-label {
   font-weight: 600; color: var(--muted); text-transform: uppercase;
-  font-size: 0.75rem; letter-spacing: 0.03em;
+  font-size: 11px; letter-spacing: 0.06em;
 }
+.metric-label { display: block; margin-bottom: 0.25rem; }
+.ts-cell { white-space: nowrap; }
 tbody tr:nth-child(even) { background: var(--row-alt); }
 .summary { margin-top: 1rem; color: var(--muted); font-size: 0.9rem; }
 .badge {
@@ -125,29 +169,36 @@ tbody tr:nth-child(even) { background: var(--row-alt); }
 .badge-confirmed-phishing { background: var(--malicious-bg); color: var(--malicious-fg); }
 .badge-confirmed-benign { background: var(--benign-bg); color: var(--benign-fg); }
 .badge-unclear { background: var(--deferred-bg); color: var(--deferred-fg); }
-.unlabelled { color: var(--muted); }
+.unlabelled { color: var(--dim); }
 .meta { color: var(--muted); margin: 0.3rem 0; }
-.crosstab { margin: 1.5rem 0; font-size: 0.9rem; }
-.crosstab caption { text-align: left; font-weight: 600; margin-bottom: 0.4rem; color: var(--fg); }
+.crosstab { margin: 0; font-size: 0.9rem; }
+.crosstab caption {
+  text-align: left; font-weight: 600; padding: 0.75rem 0.75rem 0.4rem; color: var(--fg);
+}
 .label-form {
-  border: 1px solid var(--border); border-radius: 6px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface);
   padding: 0.9rem 1rem; margin: 1rem 0; max-width: 480px;
 }
 .label-form label { display: block; font-weight: 600; margin-bottom: 0.3rem; font-size: 0.85rem; }
 .label-form select, .label-form textarea {
   width: 100%; font: inherit; padding: 0.4rem; margin-bottom: 0.75rem;
   border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg); color: var(--fg);
 }
 .label-form textarea { min-height: 4rem; resize: vertical; }
 .label-form button {
-  font: inherit; padding: 0.4rem 1rem; border-radius: 4px; border: 1px solid var(--link);
-  background: var(--link); color: #ffffff; cursor: pointer;
+  font: inherit; font-weight: 600; padding: 0.4rem 1rem; border-radius: 4px;
+  border: 1px solid var(--accent); background: var(--accent); color: var(--button-text);
+  cursor: pointer;
 }
 .evidence-list { list-style: none; margin: 1rem 0 0; padding: 0; }
 .evidence-item {
-  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface); border-left: 3px solid var(--border); border-radius: 0;
   padding: 0.9rem 1rem; margin-bottom: 0.75rem;
 }
+.evidence-item-malicious { border-left-color: var(--malicious-fg); }
+.evidence-item-benign { border-left-color: var(--benign-fg); }
+.evidence-item-neutral { border-left-color: var(--neutral-fg); }
 .evidence-header {
   display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
   margin-bottom: 0.5rem;
@@ -156,8 +207,12 @@ tbody tr:nth-child(even) { background: var(--row-alt); }
   font-weight: 600; font-size: 0.9rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.evidence-weight { color: var(--muted); font-size: 0.85rem; margin-left: auto; }
-.evidence-finding { margin: 0; overflow-wrap: break-word; }
+.evidence-weight {
+  color: var(--muted); font-size: 0.85rem; margin-left: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.evidence-finding { margin: 0; overflow-wrap: break-word; color: var(--fg); }
 """
 
 
@@ -226,7 +281,13 @@ def _format_display_timestamp(timestamp: object) -> str:
     [Story 10.3] Also used for health_state.json's last_success_utc (AC1)
     -- that value is written by save_health_state as datetime.isoformat()
     (health.py), the same shape report["timestamp"] uses, so this function
-    is shared rather than duplicated for the two callers."""
+    is shared rather than duplicated for the two callers.
+
+    [Story 11.2, AC5] The list route's Timestamp column got a `white-space:
+    nowrap` CSS treatment (`.ts-cell`) rather than a shorter format here --
+    this function is already DST-verified and shared with the header's
+    health-status line; changing its output format would mean re-verifying
+    both callers instead of adding one CSS rule."""
     try:
         dt = datetime.fromisoformat(str(timestamp))
     except (ValueError, TypeError):
@@ -398,6 +459,20 @@ def _is_well_formed_evidence_item(item: object) -> bool:
     )
 
 
+def _evidence_item_class(direction: object) -> str:
+    """[Story 11.2, AC4] "Evidence cards ... left border 3px in the
+    finding's direction colour". Mirrors _badge's own defensive slugging
+    (escape, lowercase, strip whitespace) for the identical reason:
+    _is_well_formed_evidence_item validates that "direction" is a present
+    key with the right structural shape, never that its VALUE is one of
+    the three real directions -- a malformed item could carry an
+    unrecognized string here. An unrecognized slug just matches no
+    .evidence-item-{slug} rule, leaving the base .evidence-item's default
+    border-left color -- never a crash, never an unescaped class name."""
+    slug = _esc("".join(str(direction).lower().split()))
+    return f"evidence-item evidence-item-{slug}"
+
+
 def _sender_display(sender: str | None) -> str:
     """[Story 10.3, AC5] CoverageGap records have sender: null by design
     (Story 6.1 -- the message itself could never be fetched, so there was
@@ -419,6 +494,36 @@ def _filter_query(verdict: str | None, label: str | None) -> str:
     if label is not None:
         params.append(f"label={label}")
     return "?" + "&".join(params) if params else ""
+
+
+def _back_value(verdict: str | None, label: str | None) -> str:
+    """[Story 11.2, AC1] The raw (unencoded) query string representing the
+    list view's currently active filters, e.g. "verdict=Deferred" or
+    "verdict=Deferred&label=unclear" or "" for no filter -- reuses
+    _filter_query's exact same construction (stripping its leading "?")
+    rather than a second, parallel implementation. This is the value
+    embedded as the `back` query PARAM on every detail-page link, so the
+    detail view can reconstruct "return to the list exactly as the reader
+    left it" (AC1's own example: arriving via ?verdict=Deferred must not
+    return to an unfiltered list). Callers embedding this as another URL's
+    query VALUE must percent-encode it (urllib.parse.quote(..., safe=""))
+    -- it contains "&"/"=" characters that are only safe as the FINAL
+    query string of a URL, not as one param's value within another."""
+    return _filter_query(verdict, label).removeprefix("?")
+
+
+def _back_link_href(back: str | None) -> str:
+    """[Story 11.2, AC1] The inverse of _back_value: given the (already
+    URL-decoded, by FastAPI's own query-param parsing) `back` value a
+    detail-page route received, builds the href that returns to the list
+    with that exact filter state. No validation beyond escaping -- an
+    unexpected/malformed `back` can only ever become the query STRING of
+    the hardcoded /verdicts path (never the scheme/host/path themselves),
+    so there is no open-redirect surface regardless of its content; at
+    worst a malformed `back` produces a /verdicts?<garbage> link that
+    FastAPI's own query validation on that route already rejects
+    cleanly (422) or ignores (unrecognized param names)."""
+    return f"/verdicts?{back}" if back else "/verdicts"
 
 
 def _filter_links(active_verdict: str | None, active_label: str | None) -> str:
@@ -473,7 +578,16 @@ def _summary_strip(records: list[tuple[str, EvidenceRecord]]) -> str:
     numbers. Always computed from the FULL, unfiltered list (called
     before any ?verdict= filtering in verdict_list) so the strip is a
     stable overview, not a number that changes confusingly as the filter
-    changes."""
+    changes.
+
+    [Story 11.2, AC5] Rendered as metric cards (small uppercase label,
+    larger number below) rather than inline badge pills -- the previous
+    pill rendering read as the same kind of element as the filter links
+    directly beneath it, with no visual separation between "here is a
+    count" and "here is a link." Each card's number is colored per
+    verdict (reusing the same semantic palette as the badges) except
+    Total, which stays neutral -- it isn't one of the four verdict
+    buckets."""
     counts: dict[str, int] = {v: 0 for v in _VALID_VERDICTS}
     for _message_hash, record in records:
         verdict = record["report"]["verdict"]
@@ -492,9 +606,19 @@ def _summary_strip(records: list[tuple[str, EvidenceRecord]]) -> str:
         # else: malformed verdict value (see module docstring) -- still
         # counted in the total below, just not attributable to any known
         # per-verdict bucket.
-    parts = [f'<span class="summary-total">{len(records)} total</span>']
-    parts += [_badge(v, str(counts[v])) for v in _VALID_VERDICTS]
-    return '<div class="summary-strip">' + "".join(parts) + "</div>"
+    cards = [
+        '<div class="metric-card"><span class="metric-label">Total</span>'
+        f'<span class="metric-value">{len(records)}</span></div>'
+    ]
+    for v in _VALID_VERDICTS:
+        slug = _esc("".join(v.lower().split()))
+        cards.append(
+            '<div class="metric-card">'
+            f'<span class="metric-label">{_esc(v)}</span>'
+            f'<span class="metric-value metric-value-{slug}">{counts[v]}</span>'
+            "</div>"
+        )
+    return '<div class="metrics">' + "".join(cards) + "</div>"
 
 
 def _label_display(entry: LabelEntry | None) -> str:
@@ -556,7 +680,7 @@ def _label_verdict_crosstab(
     )
 
 
-def _render_label_form(message_hash: str, current: LabelEntry | None) -> str:
+def _render_label_form(message_hash: str, current: LabelEntry | None, back: str | None) -> str:
     """[Story 11.1, AC3] Plain HTML form, no JavaScript -- consistent with
     every other page in this dashboard. The POST body is
     application/x-www-form-urlencoded (the <form> default; no enctype
@@ -567,15 +691,27 @@ def _render_label_form(message_hash: str, current: LabelEntry | None) -> str:
 
     Pre-selects the current label and pre-fills the current note (if any)
     so "set OR change a label" (AC3) is the same form either way -- the
-    button text is the only thing that differs."""
+    button text is the only thing that differs.
+
+    [Story 11.2, AC1] `back` (the current list-filter state, if any) is
+    embedded in the form's action URL as a query param -- a <form method=
+    "post"> does not otherwise forward the page's own query string to its
+    action, so without this, submitting the form would silently drop the
+    filter context the reader arrived with, even though the redirect
+    target is the same page. Percent-encoded here (it becomes a query
+    VALUE on the action URL) and read back via FastAPI's own query-param
+    parsing in the POST route, not via the hand-rolled body parser."""
     options = []
     for value in VALID_LABELS:
         selected = " selected" if current is not None and current["label"] == value else ""
         options.append(f'<option value="{_esc(value)}"{selected}>{_esc(value)}</option>')
     note_value = _esc(current["note"]) if current is not None else ""
     button_text = "Change label" if current is not None else "Set label"
+    action = f"/verdicts/{quote(message_hash, safe='')}/label"
+    if back:
+        action += f"?back={quote(back, safe='')}"
     return (
-        f'<form class="label-form" method="post" action="/verdicts/{_esc(message_hash)}/label">'
+        f'<form class="label-form" method="post" action="{_esc(action)}">'
         '<label for="label-select">Label</label>'
         f'<select name="label" id="label-select">{"".join(options)}</select>'
         '<label for="label-note">Note</label>'
@@ -603,17 +739,24 @@ async def verdict_list(verdict: Verdict | None = None, label: LabelFilter | None
     values plus "unlabelled" -- filters and combines with `verdict` (see
     _filter_query). Records are matched by joining the already-decrypted
     `records` list against the separately-loaded `labels` dict on
-    message_hash, in memory -- no additional store read."""
+    message_hash, in memory -- no additional store read.
+
+    [Story 11.2, AC1] Every row's Detail link carries the current filter
+    state as `?back=` (see _back_value/_back_link_href) so the detail
+    view's own "back to list" link returns here exactly as filtered,
+    computed once per request and reused for every row rather than
+    recomputed per row."""
     loop = asyncio.get_running_loop()
     records, error = await loop.run_in_executor(None, _load_records)
     health = await loop.run_in_executor(None, _load_health_status)
     labels = await loop.run_in_executor(None, _load_labels_safe)
     header = _render_header(health)
     if error is not None or records is None:
-        return _page("Verdicts", f"{header}<p>{_esc(error)}</p>")
+        return _page("Verdicts", f'{header}<p class="flash flash-error">{_esc(error)}</p>')
 
     summary = _summary_strip(records)
     crosstab = _label_verdict_crosstab(records, labels)
+    back_param = quote(_back_value(verdict, label), safe="")
 
     if verdict is not None:
         records = [r for r in records if r[1]["report"]["verdict"] == verdict]
@@ -632,33 +775,38 @@ async def verdict_list(verdict: Verdict | None = None, label: LabelFilter | None
         sender_display = _sender_display(record["sender"])
         confidence_short = _format_confidence(report["calibrated_confidence"], decimals=2)
         confidence_suffix = None if confidence_short == "N/A" else confidence_short
+        detail_href = f"/verdicts/{quote(message_hash, safe='')}"
+        if back_param:
+            detail_href += f"?back={back_param}"
         rows.append(
             "<tr>"
-            f"<td>{_esc(_format_display_timestamp(report['timestamp']))}</td>"
+            f"<td class=\"ts-cell\">{_esc(_format_display_timestamp(report['timestamp']))}</td>"
             f"<td>{_esc(sender_display)}</td>"
             f"<td>{_badge(report['verdict'], confidence_suffix)}</td>"
             f"<td>{_label_display(labels.get(message_hash))}</td>"
-            f'<td><a href="/verdicts/{_esc(message_hash)}">Detail</a></td>'
+            f'<td><a href="{_esc(detail_href)}">Detail</a></td>'
             "</tr>"
         )
 
     body = (
         f"{header}<h1>Verdicts</h1>"
         f"{summary}"
-        f"{crosstab}"
+        f'<div class="table-surface">{crosstab}</div>'
         f"{_filter_links(verdict, label)}"
         f"{_label_filter_links(verdict, label)}"
-        "<table><thead><tr><th>Timestamp</th><th>Sender</th><th>Verdict</th>"
-        "<th>Label</th><th></th></tr></thead><tbody>"
+        '<div class="table-surface"><table><thead><tr><th>Timestamp</th><th>Sender</th>'
+        "<th>Verdict</th><th>Label</th><th></th></tr></thead><tbody>"
         + "".join(rows)
-        + "</tbody></table>"
+        + "</tbody></table></div>"
         f'<p class="summary">{len(records)} record(s) shown.</p>'
     )
     return _page("Verdicts", body)
 
 
 @router.get("/verdicts/{message_hash}", response_class=HTMLResponse)
-async def verdict_detail(message_hash: str) -> HTMLResponse:
+async def verdict_detail(
+    message_hash: str, back: str | None = None, saved: bool = False
+) -> HTMLResponse:
     """AC3 (Story 10.1): full evidence list for one record -- every
     finding's name, text, weight, and direction, nothing truncated. Looked
     up from the same validated read_recent_evidence_records() list the
@@ -684,20 +832,38 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
     product that warns about phishing). Setting a label never touches
     `match`/`report`/anything from the evidence store -- it only ever
     calls sentinel.web.labels.save_label, a completely separate file
-    (AC4)."""
+    (AC4).
+
+    [Story 11.2, AC1] `back`, when present, is the raw query string the
+    list view was showing when the reader clicked into this record (see
+    _back_value/_back_link_href) -- used to build the "back to list" link
+    so it returns exactly as filtered, not to an unfiltered list. Not
+    validated beyond escaping; see _back_link_href's own docstring for why
+    that's sufficient.
+
+    [Story 11.2, AC2] `saved`, when true, renders a visible confirmation
+    banner. The label-set POST route redirects here with ?saved=1 on
+    success -- AC2's own finding was that a successful save previously had
+    no distinct signal beyond the (sometimes unchanged-looking) page
+    re-rendering; this makes "it worked" independent of whether the saved
+    values happened to differ from what was already stored."""
     loop = asyncio.get_running_loop()
     records, error = await loop.run_in_executor(None, _load_records)
     health = await loop.run_in_executor(None, _load_health_status)
     labels = await loop.run_in_executor(None, _load_labels_safe)
     header = _render_header(health)
+    back_link = f'<a class="back-link" href="{_esc(_back_link_href(back))}">&larr; Back to list</a>'
     if error is not None or records is None:
-        return _page("Verdict Detail", f"{header}<p>{_esc(error)}</p>")
+        return _page(
+            "Verdict Detail", f'{header}{back_link}<p class="flash flash-error">{_esc(error)}</p>'
+        )
 
     match = next((record for h, record in records if h == message_hash), None)
     if match is None:
         return _page(
             "Verdict Detail",
-            f"{header}<p>No record found for {_esc(message_hash)}.</p>",
+            f'{header}{back_link}<p class="flash flash-error">No record found for '
+            f"{_esc(message_hash)}.</p>",
             status_code=404,
         )
 
@@ -706,9 +872,10 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
     confidence_display = _format_confidence(report["calibrated_confidence"])
     current_label = labels.get(message_hash)
 
-    lines = [
-        header,
-        "<h1>Verdict Detail</h1>",
+    lines = [header, back_link, "<h1>Verdict Detail</h1>"]
+    if saved:
+        lines.append('<p class="flash flash-success">Label saved.</p>')
+    lines += [
         f'<p class="meta">Timestamp: {_esc(_format_display_timestamp(report["timestamp"]))}</p>',
         f'<p class="meta">Sender: {_esc(sender_display)}</p>',
         f'<p class="meta">Verdict: {_badge(report["verdict"])}</p>',
@@ -720,7 +887,7 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
             f'<p class="meta">Note ({_esc(_format_display_timestamp(current_label["timestamp"]))}): '
             f'{_esc(current_label["note"])}</p>'
         )
-    lines.append(_render_label_form(message_hash, current_label))
+    lines.append(_render_label_form(message_hash, current_label, back))
     # .get(): a loaded record can predate coverage_gap_reason's schema
     # addition (Story 6.1) and lack the key entirely -- see
     # TriageReport.coverage_gap_reason's own docstring in report.py.
@@ -739,7 +906,7 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
                 skipped_items += 1
                 continue
             item_blocks.append(
-                '<li class="evidence-item">'
+                f'<li class="{_evidence_item_class(item["direction"])}">'
                 '<div class="evidence-header">'
                 f'<span class="evidence-name">{_esc(item["name"])}</span>'
                 f'{_badge(item["direction"])}'
@@ -758,7 +925,9 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
 
 
 @router.post("/verdicts/{message_hash}/label", response_model=None)
-async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse | RedirectResponse:
+async def set_verdict_label(
+    message_hash: str, request: Request, back: str | None = None
+) -> HTMLResponse | RedirectResponse:
     """[Story 11.1, AC3] Sets or changes a label. Never touches the
     evidence record or stored verdict -- structurally guaranteed by only
     ever calling sentinel.web.labels.save_label, a module with no
@@ -770,6 +939,11 @@ async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse
     AC9 forbids adding one for this. The <form> in _render_label_form
     has no enctype set, so the browser sends
     application/x-www-form-urlencoded -- exactly what parse_qsl expects.
+
+    `back` is a QUERY param (from the form's action URL, see
+    _render_label_form), deliberately separate from the hand-parsed body
+    fields -- FastAPI still parses ordinary query params on a POST route
+    without needing python-multipart, since that only gates BODY parsing.
 
     Does not verify message_hash corresponds to a real evidence record
     before saving. The only path that reaches this route under normal
@@ -786,7 +960,16 @@ async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse
     unlike health.py's save_health_state -- see save_label's own
     docstring). Caught here and rendered as an explicit failure page, not
     a redirect that would look like success to a human who just clicked
-    submit and has no other way to know whether it actually worked."""
+    submit and has no other way to know whether it actually worked.
+
+    [Story 11.2, AC3] Failure pages are styled as a visible .flash-error
+    banner, not a bare, unstyled sentence -- readable was already true
+    (see the finding this story's own investigation reported); this makes
+    it also unmistakable at a glance, matching the same treatment the
+    success path (AC2) gets."""
+    back_suffix = f"?back={quote(back, safe='')}" if back else ""
+    record_href = f"/verdicts/{quote(message_hash, safe='')}{back_suffix}"
+
     body = await request.body()
     # [Review, Blind Hunter/Edge Case Hunter] Every other failure path in
     # this route (invalid label, no config, save_label raising) renders a
@@ -803,8 +986,9 @@ async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse
     except UnicodeDecodeError:
         return _page(
             "Verdict Detail",
-            "<p>Invalid form submission (not valid UTF-8). Nothing was saved.</p>"
-            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            '<p class="flash flash-error">Invalid form submission (not valid UTF-8). '
+            "Nothing was saved.</p>"
+            f'<p><a href="{_esc(record_href)}">Back to record</a></p>',
             status_code=400,
         )
     fields = dict(parse_qsl(decoded_body, strict_parsing=False))
@@ -814,9 +998,9 @@ async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse
     if label_value not in VALID_LABELS:
         return _page(
             "Verdict Detail",
-            f'<p>Invalid label "{_esc(label_value)}" — must be one of confirmed-phishing, '
-            "confirmed-benign, unclear. Nothing was saved.</p>"
-            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            f'<p class="flash flash-error">Invalid label "{_esc(label_value)}" — must be one of '
+            "confirmed-phishing, confirmed-benign, unclear. Nothing was saved.</p>"
+            f'<p><a href="{_esc(record_href)}">Back to record</a></p>',
             status_code=400,
         )
     label: Label = label_value
@@ -825,9 +1009,9 @@ async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse
     if config is None:
         return _page(
             "Verdict Detail",
-            "<p>Server is not configured — required environment variables are missing. "
-            "Nothing was saved.</p>"
-            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            '<p class="flash flash-error">Server is not configured — required environment '
+            "variables are missing. Nothing was saved.</p>"
+            f'<p><a href="{_esc(record_href)}">Back to record</a></p>',
             status_code=500,
         )
 
@@ -840,10 +1024,13 @@ async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse
         print(f"[sentinel-web] Label save error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return _page(
             "Verdict Detail",
-            "<p>Failed to save the label — nothing was recorded. Check server logs and try "
-            "again.</p>"
-            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            '<p class="flash flash-error">Failed to save the label — nothing was recorded. '
+            "Check server logs and try again.</p>"
+            f'<p><a href="{_esc(record_href)}">Back to record</a></p>',
             status_code=500,
         )
 
-    return RedirectResponse(url=f"/verdicts/{message_hash}", status_code=303)
+    redirect_url = f"/verdicts/{quote(message_hash, safe='')}?saved=1"
+    if back:
+        redirect_url += f"&back={quote(back, safe='')}"
+    return RedirectResponse(url=redirect_url, status_code=303)
