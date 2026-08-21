@@ -70,23 +70,61 @@ The two Mechanism B records are a separate campaign with a different lure
 (romantic/apology framing) and no DKIM at all. DMARC passes on SPF alignment
 alone, so the attacker skipped signing. Minimum viable authentication.
 
-## Watchman's contribution is not fixed
+## Watchman's contribution is tier-capped, not fixed
 
 An earlier version of this document claimed Watchman's output is "normalized
 to a fixed total regardless of how many findings it produces," based on three
-records where it summed to 0.50 (6 x 0.0833, 7 x 0.0714, 8 x 0.0625).
+records where it summed to 0.50 (6 x 0.0833, 7 x 0.0714, 8 x 0.0625). The
+jillas and jerryas records total 0.70 instead (7 x 0.1, 8 x 0.0875), which
+disproves the "fixed" part. The mechanism has now been traced.
 
-That claim is wrong. The jillas and jerryas records total 0.70 (7 x 0.1 and
-8 x 0.0875). The total varies.
+The weight lives in `src/sentinel/watchman.py`, not `confidence.py` — that
+file is the older CLI tool's Watchman/Cipher corroboration tiering, unrelated
+to phishing-triage scoring.
 
-In both of those records it lands exactly equal to the benign auth weight,
-which is either coincidence twice over or a property of the algorithm. The
-mechanism has not been traced. It is under investigation; this document should
-be updated once the answer is known rather than guessed at again.
+    _CONFIDENCE_WEIGHT = {"confirmed": 0.7, "probable": 0.5, "investigating": 0.3}
+    weight = _CONFIDENCE_WEIGHT[tier] / len(findings)
 
-What holds regardless: Watchman's contribution is capped well below what full
-authentication contributes, and in every case above the verdict follows the
-auth arithmetic rather than the content evidence.
+Each finding gets `tier_weight / N`, where `tier_weight` is one of exactly
+three values keyed to Watchman's own self-reported confidence for that
+message, and N is how many findings it listed. The division by N was added in
+Story 2.2 specifically so that one LLM inference listing more findings does
+not get more total influence for being verbose — N findings collectively
+contribute the same total weight-mass to the score that a single finding at
+the tier weight would.
+
+So Watchman's total per message is always exactly 0.3, 0.5, or 0.7 — never a
+universal constant, but never anything outside those three values either.
+Finding count only changes how that total is split across individual
+EvidenceItems.
+
+jillas.org and jerryas.org both scored "confirmed" — Watchman's maximum tier,
+its strongest possible self-assessment — and both still resolved Deferred.
+
+The ceiling matters beyond these two records. 0.7 is the most Watchman can
+ever contribute, at any confidence level, with any number of findings. Full
+authentication passing all three mechanisms contributes 1.05 (the tsukuba
+record). 0.7 < 1.05. On a fully-authenticated sender, no Watchman output —
+not more findings, not higher confidence, not both — can outweigh auth. The
+ceiling is structural, not incidental to these particular records.
+
+### The 0.70 parity is coincidence
+
+Watchman's total equaled the benign auth weight exactly in the two Mechanism
+B records (0.70 = 0.70) and not in any of the three Mechanism A records (0.50
+against 1.05, 0.60, and 0.35 — see the table above). Five records, two
+independently-computed numbers, agreement in two of five: consistent with two
+small, unrelated value sets occasionally colliding, not with a shared
+mechanism.
+
+There is no code path connecting the two numbers. `watchman.py`'s
+`_CONFIDENCE_WEIGHT` and `headers.py`'s `_MECHANISM_PASS_WEIGHT` are
+independent constants in separate modules, computed from unrelated inputs — an
+LLM's categorical self-assessment of email content versus a deterministic
+header check. In the jillas/jerryas case, 0.70 came from Watchman rating
+"confirmed" (0.7) and separately from SPF pass (0.25) + DMARC pass (0.45) with
+no DKIM signal at all — both domains skip signing entirely. Different
+mechanisms, same number, by chance.
 
 ## Watchman was correct every time
 
@@ -104,8 +142,18 @@ The content analysis is not the weak component.
 
 Across all five records: VirusTotal returned 404 or zero detections, AbuseIPDB
 does not support domain lookups at all, URLhaus had no match. One VirusTotal
-lookup returned "1 suspicious" and was recorded with direction neutral,
-contributing nothing directional.
+lookup (jerryas.org) returned "0 malicious, 1 suspicious" and was recorded
+with weight 0.20, direction neutral — contributing nothing directional.
+
+That is deliberate, not a gap. `cipher.py`'s `_vt_weight_and_direction` only
+returns `direction="malicious"` when at least one engine flags malicious
+outright; a suspicious-only result gets weight but never direction. The
+scoring function defines a neutral item's contribution to the signed sum as
+exactly 0.0 regardless of its weight — the weight only feeds the denominator,
+damping the score toward the neutral prior, never pushing it toward a
+verdict. Cipher's reputation checks are already barred from ever asserting
+"benign"; this extends the same conservatism to weak "malicious" signals —
+"suspicious" alone doesn't clear the bar either.
 
 Freshly registered infrastructure does not appear in reputation feeds. That is
 expected, and it is exactly why behavioral analysis exists. It also means the
