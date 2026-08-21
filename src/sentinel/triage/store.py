@@ -94,7 +94,20 @@ def _require_valid_retention_days(config: Config) -> None:
         )
 
 
-def _require_fernet(config: Config) -> Fernet:
+def require_fernet(config: Config) -> Fernet:
+    """[Story 11.1] Public (no leading underscore, unlike this module's
+    other helpers): the only Fernet-key validation/construction logic in
+    the codebase, reused as-is by src/sentinel/web/labels.py to encrypt
+    the label note field in a SEPARATE file (labels.json, not
+    evidence.db) under the same operator-configured key -- there is only
+    one key in this deployment, and generating/managing a second one for
+    a smaller, related data domain would be unwarranted complexity for a
+    single-operator personal tool. Reusing this function (rather than
+    duplicating key validation in labels.py) keeps that logic in one
+    place; it does not reintroduce evidence.db-read-logic drift, since
+    labels.py never touches evidence_records at all (see AC4's structural
+    test) -- it only needed a Fernet object, which this function's own
+    job already was."""
     if not config.evidence_encryption_key:
         raise ConfigError("Missing required environment variable: SENTINEL_EVIDENCE_KEY")
     try:
@@ -115,7 +128,7 @@ def persist_evidence_record(
     anything fails before the commit — including a hard process kill — NEITHER
     row is written: the message is naturally retried by a future poll cycle,
     since is_message_processed will correctly report it as not yet processed."""
-    fernet = _require_fernet(config)
+    fernet = require_fernet(config)
     _require_valid_retention_days(config)
     plaintext = json.dumps(record).encode()
     encrypted = fernet.encrypt(plaintext)
@@ -150,7 +163,7 @@ def persist_evidence_record(
 def read_evidence_record(
     db_path: str, message_hash: str, config: Config
 ) -> EvidenceRecord | None:
-    fernet = _require_fernet(config)
+    fernet = require_fernet(config)
     conn = _connect(db_path)
     try:
         row = conn.execute(
@@ -212,7 +225,7 @@ def read_recent_evidence_records(
     record from before a key rotation), or it decrypts fine but isn't
     valid JSON, or isn't shaped like a well-formed EvidenceRecord (see
     _is_well_formed_evidence_record)."""
-    fernet = _require_fernet(config)
+    fernet = require_fernet(config)
     conn = _connect_read_only(db_path)
     try:
         rows = conn.execute(

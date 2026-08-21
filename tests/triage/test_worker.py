@@ -839,14 +839,14 @@ def test_replay_legacy_record_missing_deferral_threshold_used_exits_nonzero_with
 
     # Bypass persist_evidence_record (which always supplies
     # deferral_threshold_used) to simulate a genuinely pre-Story-1.6 record.
-    from sentinel.triage.store import _connect, _require_fernet
+    from sentinel.triage.store import _connect, require_fernet
 
     legacy_record = {
         "message_id": "m1",
         "sender": "alice@example.com",
         "report": _make_report(),
     }
-    fernet: Fernet = _require_fernet(store_config)
+    fernet: Fernet = require_fernet(store_config)
     encrypted = fernet.encrypt(json.dumps(legacy_record).encode())
     conn = _connect(store_db_path)
     conn.execute(
