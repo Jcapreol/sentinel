@@ -33,19 +33,22 @@ import html
 import sys
 from datetime import datetime, timezone
 from typing import Literal
+from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from sentinel.config import ConfigError
 from sentinel.triage.health import HealthState, try_load_health_state
 from sentinel.triage.store import EvidenceRecord, read_recent_evidence_records
 from sentinel.web import state
+from sentinel.web.labels import VALID_LABELS, Label, LabelEntry, load_labels, save_label
 
 router = APIRouter()
 
 Verdict = Literal["Malicious", "Benign", "Deferred", "CoverageGap"]
+LabelFilter = Literal["confirmed-phishing", "confirmed-benign", "unclear", "unlabelled"]
 _VALID_VERDICTS: tuple[Verdict, ...] = ("Malicious", "Benign", "Deferred", "CoverageGap")
 
 # [Story 10.2, AC3] Hardcoded to US Eastern for this dashboard's current
@@ -119,7 +122,27 @@ tbody tr:nth-child(even) { background: var(--row-alt); }
 .badge-healthy { background: var(--benign-bg); color: var(--benign-fg); }
 .badge-unhealthy { background: var(--malicious-bg); color: var(--malicious-fg); }
 .badge-unknown { background: var(--neutral-bg); color: var(--neutral-fg); }
+.badge-confirmed-phishing { background: var(--malicious-bg); color: var(--malicious-fg); }
+.badge-confirmed-benign { background: var(--benign-bg); color: var(--benign-fg); }
+.badge-unclear { background: var(--deferred-bg); color: var(--deferred-fg); }
+.unlabelled { color: var(--muted); }
 .meta { color: var(--muted); margin: 0.3rem 0; }
+.crosstab { margin: 1.5rem 0; font-size: 0.9rem; }
+.crosstab caption { text-align: left; font-weight: 600; margin-bottom: 0.4rem; color: var(--fg); }
+.label-form {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 0.9rem 1rem; margin: 1rem 0; max-width: 480px;
+}
+.label-form label { display: block; font-weight: 600; margin-bottom: 0.3rem; font-size: 0.85rem; }
+.label-form select, .label-form textarea {
+  width: 100%; font: inherit; padding: 0.4rem; margin-bottom: 0.75rem;
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.label-form textarea { min-height: 4rem; resize: vertical; }
+.label-form button {
+  font: inherit; padding: 0.4rem 1rem; border-radius: 4px; border: 1px solid var(--link);
+  background: var(--link); color: #ffffff; cursor: pointer;
+}
 .evidence-list { list-style: none; margin: 1rem 0 0; padding: 0; }
 .evidence-item {
   border: 1px solid var(--border); border-radius: 6px;
@@ -314,6 +337,22 @@ def _load_health_status() -> HealthState | None:
     return try_load_health_state(config.evidence_db_path)
 
 
+def _load_labels_safe() -> dict[str, LabelEntry]:
+    """[Story 11.1] Synchronous by design -- reads and parses labels.json
+    (a small local file, sibling of evidence.db). Bridged through
+    loop.run_in_executor in both routes, like _load_records and
+    _load_health_status, for the same async<->sync reason.
+
+    Returns {} when there is no config to locate the file from --
+    load_labels itself already never raises for a missing/corrupt file
+    (see its own docstring), so the only extra case here is "no Config at
+    all", mirroring _load_records/_load_health_status's identical guard."""
+    config = state._config
+    if config is None:
+        return {}
+    return load_labels(config.evidence_db_path, config)
+
+
 def _format_confidence(confidence: object, decimals: int = 3) -> str:
     """[Review, Blind Hunter] read_recent_evidence_records' well-formedness
     check only guarantees calibrated_confidence is a PRESENT key, never
@@ -367,13 +406,48 @@ def _sender_display(sender: str | None) -> str:
     return sender if sender is not None else "Message unavailable (coverage gap)"
 
 
-def _filter_links(active: str | None) -> str:
-    options: list[tuple[str, str]] = [("All", "/verdicts")]
-    options += [(v, f"/verdicts?verdict={v}") for v in _VALID_VERDICTS]
+def _filter_query(verdict: str | None, label: str | None) -> str:
+    """[Story 11.1] Shared by both filter-link rows so the verdict and
+    label filters combine rather than clobber each other -- clicking a
+    verdict link while a label filter is active must keep the label
+    filter in the resulting URL, and vice versa (e.g. "show me all Benign
+    records labelled confirmed-phishing", exactly the kind of query this
+    story exists to make possible)."""
+    params = []
+    if verdict is not None:
+        params.append(f"verdict={verdict}")
+    if label is not None:
+        params.append(f"label={label}")
+    return "?" + "&".join(params) if params else ""
+
+
+def _filter_links(active_verdict: str | None, active_label: str | None) -> str:
+    options: list[tuple[str, str | None]] = [("All", None)]
+    options += [(v, v) for v in _VALID_VERDICTS]
     parts = []
-    for label, href in options:
-        is_active = (active is None and label == "All") or active == label
-        text = f"<strong>{_esc(label)}</strong>" if is_active else _esc(label)
+    for display, value in options:
+        is_active = active_verdict == value
+        text = f"<strong>{_esc(display)}</strong>" if is_active else _esc(display)
+        href = f"/verdicts{_filter_query(value, active_label)}"
+        parts.append(f'<a href="{_esc(href)}">{text}</a>')
+    return '<div class="filters">' + " | ".join(parts) + "</div>"
+
+
+def _label_filter_links(active_verdict: str | None, active_label: str | None) -> str:
+    """[Story 11.1, AC5] "Unlabelled" is deliberately a real filter option,
+    not just the three stored label values -- Notes for dev: alerted
+    records get reviewed, quiet Benign records do not, and that sampling
+    bias is exactly what hid the auth-alignment finding. Filtering to
+    Unlabelled is how a reviewer deliberately reaches records nothing
+    would otherwise draw them to."""
+    options: list[tuple[str, str | None]] = [("All", None)]
+    options += [(v, v) for v in VALID_LABELS]
+    options.append(("Unlabelled", "unlabelled"))
+    parts = []
+    for display, value in options:
+        is_active = active_label == value
+        text = f"<strong>{_esc(display)}</strong>" if is_active else _esc(display)
+        href = f"/verdicts{_filter_query(active_verdict, value)}"
         parts.append(f'<a href="{_esc(href)}">{text}</a>')
     return '<div class="filters">' + " | ".join(parts) + "</div>"
 
@@ -423,8 +497,96 @@ def _summary_strip(records: list[tuple[str, EvidenceRecord]]) -> str:
     return '<div class="summary-strip">' + "".join(parts) + "</div>"
 
 
+def _label_display(entry: LabelEntry | None) -> str:
+    """[Story 11.1, AC5] Plain, muted text for "no label" -- not a colored
+    badge, matching the existing convention that a missing value (e.g.
+    _sender_display's CoverageGap placeholder) reads as a placeholder,
+    not a chip suggesting a real, positive value."""
+    if entry is None:
+        return '<span class="unlabelled">Unlabelled</span>'
+    return _badge(entry["label"])
+
+
+def _label_verdict_crosstab(
+    records: list[tuple[str, EvidenceRecord]], labels: dict[str, LabelEntry]
+) -> str:
+    """[Story 11.1, AC6] The point of the story: turns "here are five
+    examples" into a number. Rows are label status -- including "no label
+    at all", not just the three stored values, since "how many Benign
+    records are still unlabelled" is exactly the number that makes the
+    sampling-bias gap (Notes for dev) visible rather than invisible.
+    Columns are verdict.
+
+    Computed from the SAME already-decrypted `records` list _summary_strip
+    uses (see its own AC7 discussion -- no extra store decrypt) crossed
+    against the separately, cheaply loaded `labels` dict (a small local
+    JSON file, nowhere near evidence.db's scale). Always computed from the
+    full, unfiltered records list, matching _summary_strip's "stable
+    overview" precedent -- this table would be far less useful if its own
+    numbers moved every time a filter link was clicked.
+
+    A record with a malformed (non-string / unrecognized) verdict is
+    skipped from this table entirely, unlike _summary_strip's "still
+    counts toward the total" treatment -- there is no single grand-total
+    cell here for it to safely land in without either double-counting a
+    row or needing a fifth verdict-shaped column for "unknown", and the
+    case is already narrow and extensively guarded elsewhere (see
+    _summary_strip's own comment on the same gap)."""
+    row_keys: tuple[str, ...] = (*VALID_LABELS, "unlabelled")
+    counts: dict[str, dict[str, int]] = {row: {v: 0 for v in _VALID_VERDICTS} for row in row_keys}
+    for message_hash, record in records:
+        verdict = record["report"]["verdict"]
+        if not isinstance(verdict, str) or verdict not in _VALID_VERDICTS:
+            continue
+        entry = labels.get(message_hash)
+        row = entry["label"] if entry is not None else "unlabelled"
+        counts[row][verdict] += 1
+
+    header_cells = "".join(f"<th>{_esc(v)}</th>" for v in _VALID_VERDICTS)
+    body_rows = []
+    for row_key in row_keys:
+        row_display = "Unlabelled" if row_key == "unlabelled" else row_key
+        row_total = sum(counts[row_key].values())
+        data_cells = "".join(f"<td>{counts[row_key][v]}</td>" for v in _VALID_VERDICTS)
+        body_rows.append(f"<tr><th>{_esc(row_display)}</th>{data_cells}<td>{row_total}</td></tr>")
+    return (
+        '<table class="crosstab"><caption>Labels vs. Verdict</caption>'
+        f"<thead><tr><th></th>{header_cells}<th>Total</th></tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody></table>"
+    )
+
+
+def _render_label_form(message_hash: str, current: LabelEntry | None) -> str:
+    """[Story 11.1, AC3] Plain HTML form, no JavaScript -- consistent with
+    every other page in this dashboard. The POST body is
+    application/x-www-form-urlencoded (the <form> default; no enctype
+    set) and is parsed in the route handler below via stdlib
+    urllib.parse.parse_qsl, NOT FastAPI's Form()/Starlette's
+    Request.form() -- both require the python-multipart package, which
+    is not an existing dependency and AC9 forbids adding one for this.
+
+    Pre-selects the current label and pre-fills the current note (if any)
+    so "set OR change a label" (AC3) is the same form either way -- the
+    button text is the only thing that differs."""
+    options = []
+    for value in VALID_LABELS:
+        selected = " selected" if current is not None and current["label"] == value else ""
+        options.append(f'<option value="{_esc(value)}"{selected}>{_esc(value)}</option>')
+    note_value = _esc(current["note"]) if current is not None else ""
+    button_text = "Change label" if current is not None else "Set label"
+    return (
+        f'<form class="label-form" method="post" action="/verdicts/{_esc(message_hash)}/label">'
+        '<label for="label-select">Label</label>'
+        f'<select name="label" id="label-select">{"".join(options)}</select>'
+        '<label for="label-note">Note</label>'
+        f'<textarea name="note" id="label-note">{note_value}</textarea>'
+        f'<button type="submit">{_esc(button_text)}</button>'
+        "</form>"
+    )
+
+
 @router.get("/verdicts", response_class=HTMLResponse)
-async def verdict_list(verdict: Verdict | None = None) -> HTMLResponse:
+async def verdict_list(verdict: Verdict | None = None, label: LabelFilter | None = None) -> HTMLResponse:
     """AC1/AC2 (Story 10.1): verdict list -- timestamp, sender, verdict,
     filterable by verdict via ?verdict=. `verdict: Verdict | None` reuses
     the same four-value Literal store.py's own EvidenceRecord/TriageReport
@@ -435,18 +597,34 @@ async def verdict_list(verdict: Verdict | None = None) -> HTMLResponse:
     into the verdict badge (e.g. "Malicious 1.00"); a CoverageGap or
     otherwise-unusable confidence shows the verdict with no number at all,
     not "N/A" inside the badge (that would read as clutter next to a
-    colored chip that already means "no analysis ran")."""
+    colored chip that already means "no analysis ran").
+
+    [Story 11.1, AC5] `label: LabelFilter | None` -- the three real Label
+    values plus "unlabelled" -- filters and combines with `verdict` (see
+    _filter_query). Records are matched by joining the already-decrypted
+    `records` list against the separately-loaded `labels` dict on
+    message_hash, in memory -- no additional store read."""
     loop = asyncio.get_running_loop()
     records, error = await loop.run_in_executor(None, _load_records)
     health = await loop.run_in_executor(None, _load_health_status)
+    labels = await loop.run_in_executor(None, _load_labels_safe)
     header = _render_header(health)
     if error is not None or records is None:
         return _page("Verdicts", f"{header}<p>{_esc(error)}</p>")
 
     summary = _summary_strip(records)
+    crosstab = _label_verdict_crosstab(records, labels)
 
     if verdict is not None:
         records = [r for r in records if r[1]["report"]["verdict"] == verdict]
+    if label is not None:
+        if label == "unlabelled":
+            records = [r for r in records if r[0] not in labels]
+        else:
+            records = [
+                r for r in records
+                if (entry := labels.get(r[0])) is not None and entry["label"] == label
+            ]
 
     rows = []
     for message_hash, record in records:
@@ -459,6 +637,7 @@ async def verdict_list(verdict: Verdict | None = None) -> HTMLResponse:
             f"<td>{_esc(_format_display_timestamp(report['timestamp']))}</td>"
             f"<td>{_esc(sender_display)}</td>"
             f"<td>{_badge(report['verdict'], confidence_suffix)}</td>"
+            f"<td>{_label_display(labels.get(message_hash))}</td>"
             f'<td><a href="/verdicts/{_esc(message_hash)}">Detail</a></td>'
             "</tr>"
         )
@@ -466,9 +645,11 @@ async def verdict_list(verdict: Verdict | None = None) -> HTMLResponse:
     body = (
         f"{header}<h1>Verdicts</h1>"
         f"{summary}"
-        f"{_filter_links(verdict)}"
+        f"{crosstab}"
+        f"{_filter_links(verdict, label)}"
+        f"{_label_filter_links(verdict, label)}"
         "<table><thead><tr><th>Timestamp</th><th>Sender</th><th>Verdict</th>"
-        "<th></th></tr></thead><tbody>"
+        "<th>Label</th><th></th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
         f'<p class="summary">{len(records)} record(s) shown.</p>'
@@ -495,10 +676,19 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
 
     [Story 10.3, AC1] Shares the same header bar as the list route -- no
     per-verdict summary strip here (AC3 places it "above the filter
-    links", which only exist on the list page)."""
+    links", which only exist on the list page).
+
+    [Story 11.1, AC3] The label set/change control lives here, and only
+    here (Out of scope: not the alert email -- a clickable action link in
+    email is a request-forgery surface and a phishing-shaped pattern in a
+    product that warns about phishing). Setting a label never touches
+    `match`/`report`/anything from the evidence store -- it only ever
+    calls sentinel.web.labels.save_label, a completely separate file
+    (AC4)."""
     loop = asyncio.get_running_loop()
     records, error = await loop.run_in_executor(None, _load_records)
     health = await loop.run_in_executor(None, _load_health_status)
+    labels = await loop.run_in_executor(None, _load_labels_safe)
     header = _render_header(health)
     if error is not None or records is None:
         return _page("Verdict Detail", f"{header}<p>{_esc(error)}</p>")
@@ -514,6 +704,7 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
     report = match["report"]
     sender_display = _sender_display(match["sender"])
     confidence_display = _format_confidence(report["calibrated_confidence"])
+    current_label = labels.get(message_hash)
 
     lines = [
         header,
@@ -522,7 +713,14 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
         f'<p class="meta">Sender: {_esc(sender_display)}</p>',
         f'<p class="meta">Verdict: {_badge(report["verdict"])}</p>',
         f'<p class="meta">Confidence: {_esc(confidence_display)}</p>',
+        f'<p class="meta">Label: {_label_display(current_label)}</p>',
     ]
+    if current_label is not None and current_label["note"]:
+        lines.append(
+            f'<p class="meta">Note ({_esc(_format_display_timestamp(current_label["timestamp"]))}): '
+            f'{_esc(current_label["note"])}</p>'
+        )
+    lines.append(_render_label_form(message_hash, current_label))
     # .get(): a loaded record can predate coverage_gap_reason's schema
     # addition (Story 6.1) and lack the key entirely -- see
     # TriageReport.coverage_gap_reason's own docstring in report.py.
@@ -557,3 +755,95 @@ async def verdict_detail(message_hash: str) -> HTMLResponse:
         lines.append('<ul class="evidence-list">' + "".join(item_blocks) + "</ul>")
 
     return _page("Verdict Detail", "".join(lines))
+
+
+@router.post("/verdicts/{message_hash}/label", response_model=None)
+async def set_verdict_label(message_hash: str, request: Request) -> HTMLResponse | RedirectResponse:
+    """[Story 11.1, AC3] Sets or changes a label. Never touches the
+    evidence record or stored verdict -- structurally guaranteed by only
+    ever calling sentinel.web.labels.save_label, a module with no
+    knowledge of evidence.db at all (AC4's structural test).
+
+    Parses the POST body itself via stdlib urllib.parse.parse_qsl rather
+    than FastAPI's Form()/Starlette's Request.form() -- both require the
+    python-multipart package, which is not an existing dependency and
+    AC9 forbids adding one for this. The <form> in _render_label_form
+    has no enctype set, so the browser sends
+    application/x-www-form-urlencoded -- exactly what parse_qsl expects.
+
+    Does not verify message_hash corresponds to a real evidence record
+    before saving. The only path that reaches this route under normal
+    use already validated the hash (the detail page 404s first), and a
+    label for a hash that turns out not to exist is a harmless orphan
+    entry -- never rendered anywhere, since nothing ever joins against a
+    hash absent from the evidence store. Adding that check would mean
+    reading evidence.db from this route for no functional benefit, on a
+    loopback-only, single-operator, no-auth tool (AC8) where the
+    realistic threat model does not include a stranger guessing an
+    unguessable SHA-256 hash.
+
+    [Notes for dev] save_label raises on any failure (deliberately,
+    unlike health.py's save_health_state -- see save_label's own
+    docstring). Caught here and rendered as an explicit failure page, not
+    a redirect that would look like success to a human who just clicked
+    submit and has no other way to know whether it actually worked."""
+    body = await request.body()
+    # [Review, Blind Hunter/Edge Case Hunter] Every other failure path in
+    # this route (invalid label, no config, save_label raising) renders a
+    # clean message per this module's own convention -- a raw body
+    # containing non-UTF-8 bytes previously reached body.decode("utf-8")
+    # unguarded, raising an uncaught UnicodeDecodeError and producing
+    # Starlette's generic "Internal Server Error" 500 instead. Reachable
+    # by any client on the loopback port (or the accepted CSRF-shaped
+    # vector docs/labelling-design.md's D4 already discusses), with no
+    # data-corruption consequence -- but it broke this route's own "never
+    # crash uncaught" design intent, which every other branch honors.
+    try:
+        decoded_body = body.decode("utf-8")
+    except UnicodeDecodeError:
+        return _page(
+            "Verdict Detail",
+            "<p>Invalid form submission (not valid UTF-8). Nothing was saved.</p>"
+            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            status_code=400,
+        )
+    fields = dict(parse_qsl(decoded_body, strict_parsing=False))
+    label_value = fields.get("label")
+    note = fields.get("note", "")
+
+    if label_value not in VALID_LABELS:
+        return _page(
+            "Verdict Detail",
+            f'<p>Invalid label "{_esc(label_value)}" — must be one of confirmed-phishing, '
+            "confirmed-benign, unclear. Nothing was saved.</p>"
+            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            status_code=400,
+        )
+    label: Label = label_value
+
+    config = state._config
+    if config is None:
+        return _page(
+            "Verdict Detail",
+            "<p>Server is not configured — required environment variables are missing. "
+            "Nothing was saved.</p>"
+            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            status_code=500,
+        )
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, save_label, config.evidence_db_path, config, message_hash, label, note
+        )
+    except Exception as exc:
+        print(f"[sentinel-web] Label save error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return _page(
+            "Verdict Detail",
+            "<p>Failed to save the label — nothing was recorded. Check server logs and try "
+            "again.</p>"
+            f'<p><a href="/verdicts/{_esc(message_hash)}">Back to record</a></p>',
+            status_code=500,
+        )
+
+    return RedirectResponse(url=f"/verdicts/{message_hash}", status_code=303)

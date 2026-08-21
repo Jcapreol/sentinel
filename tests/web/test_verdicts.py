@@ -110,9 +110,9 @@ def _persist_raw(env: VerdictsEnv, message_hash: str, record: dict) -> None:  # 
     could never itself produce, but a corrupted/pre-schema row could."""
     import json
 
-    from sentinel.triage.store import _require_fernet
+    from sentinel.triage.store import require_fernet
 
-    fernet = _require_fernet(env.config)
+    fernet = require_fernet(env.config)
     encrypted = fernet.encrypt(json.dumps(record).encode())
     conn = _store_connect(env.db_path)
     conn.execute(
@@ -144,11 +144,56 @@ def _matches_forbidden(module_name: str | None, forbidden: set[str]) -> bool:
     )
 
 
+# [Story 11.1, AC4] Every name in store.py that can write to evidence_records
+# or otherwise mutate the database -- persist_evidence_record/purge_expired/
+# save_history_checkpoint are the public write functions; _connect is the
+# raw, writable sqlite3.Connection factory, which would let a web/ file
+# execute arbitrary SQL without ever importing sqlite3 itself, sidestepping
+# the module-level import ban below entirely. _connect_read_only is
+# deliberately NOT included: SQLite enforces that connection's read-only-ness
+# itself (mode=ro), so importing it cannot violate "cannot write" even in
+# the worst case.
+_FORBIDDEN_STORE_WRITE_NAMES = {
+    "persist_evidence_record",
+    "purge_expired",
+    "save_history_checkpoint",
+    "_connect",
+}
+
+
 def test_web_imports_no_direct_db_or_crypto_access() -> None:
-    """AC1: no file under src/sentinel/web/ may import sqlite3 or
-    cryptography.fernet directly -- all reads go through store.py's
+    """AC1 (Story 10.1): no file under src/sentinel/web/ may import sqlite3
+    or cryptography.fernet directly -- all reads go through store.py's
     existing functions. Mirrors test_triage_imports_no_remediation_capable_
-    library's ast.walk pattern exactly."""
+    library's ast.walk pattern exactly.
+
+    [Story 11.1, AC4] Extended, not duplicated in a parallel test: also
+    asserts no file under web/ imports any of store.py's write-capable
+    names (_FORBIDDEN_STORE_WRITE_NAMES above) -- the sqlite3/Fernet import
+    ban alone would NOT catch a web/ file that imported
+    persist_evidence_record (or _connect) directly from store.py and called
+    it, since that file would never need to import sqlite3 or
+    cryptography.fernet itself to do so. sentinel.web.labels (this story)
+    imports store.require_fernet (read-only key handling, not a write
+    function) and nothing else from store.py, so it passes this check by
+    construction, not by accident.
+
+    [Review, Edge Case Hunter] Also checks every ast.Attribute node's
+    .attr against the same forbidden set, regardless of what the base
+    expression resolves to -- the ImportFrom-name check above only
+    catches `from sentinel.triage.store import persist_evidence_record`.
+    A whole-module import (`import sentinel.triage.store as store` /
+    `import sentinel.triage.store`) followed by attribute access
+    (`store.persist_evidence_record(...)` / `sentinel.triage.store.
+    persist_evidence_record(...)`) was confirmed, empirically, to sail
+    through the ImportFrom-only check untouched. Scanning for the
+    ATTRIBUTE NAME itself, independent of import style, closes this
+    without needing full symbol-table resolution: these four names are
+    distinctive enough that a genuine false positive (an unrelated
+    object happening to expose a same-named attribute) is not a real
+    risk in this codebase -- confirmed by running this exact check
+    against the current web/ tree and finding zero matches before this
+    story's own code ever existed to trigger it."""
     web_dir = Path(__file__).resolve().parents[2] / "src" / "sentinel" / "web"
     forbidden = {"sqlite3", "cryptography.fernet", "fernet"}
     for source_path in web_dir.glob("*.py"):
@@ -162,6 +207,19 @@ def test_web_imports_no_direct_db_or_crypto_access() -> None:
             elif isinstance(node, ast.ImportFrom):
                 assert not _matches_forbidden(node.module, forbidden), (
                     f"{source_path.name} imports from {node.module}"
+                )
+                if node.module == "sentinel.triage.store":
+                    for alias in node.names:
+                        assert alias.name not in _FORBIDDEN_STORE_WRITE_NAMES, (
+                            f"{source_path.name} imports write-capable "
+                            f"store.{alias.name} -- labelling/dashboard code "
+                            "must never be able to write to evidence_records"
+                        )
+            elif isinstance(node, ast.Attribute):
+                assert node.attr not in _FORBIDDEN_STORE_WRITE_NAMES, (
+                    f"{source_path.name} accesses .{node.attr} -- write-capable "
+                    "store.py names must be unreachable even via a whole-module "
+                    "import, not just a banned `from ... import` name"
                 )
 
 
@@ -1044,3 +1102,285 @@ def test_verdict_badge_folds_in_confidence_for_real_records(verdicts_env: Verdic
     response = verdicts_env.client.get("/verdicts")
 
     assert '<span class="badge badge-malicious">Malicious 1.00</span>' in response.text
+
+
+# --- Story 11.1: human labelling --------------------------------------------
+
+
+def test_detail_page_shows_unlabelled_and_a_label_form(verdicts_env: VerdictsEnv) -> None:
+    """AC2/AC3: the three legal label values are offered, and an
+    unlabelled record's current status reads "Unlabelled", not a blank
+    or a crash."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+    body = response.text
+
+    assert '<span class="unlabelled">Unlabelled</span>' in body
+    assert '<form class="label-form" method="post" action="/verdicts/hash1/label">' in body
+    assert '<option value="confirmed-phishing">' in body
+    assert '<option value="confirmed-benign">' in body
+    assert '<option value="unclear">' in body
+    assert ">Set label<" in body
+
+
+def test_set_label_redirects_to_detail_page_showing_new_label(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC3: setting a label via the form control."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.post(
+        "/verdicts/hash1/label",
+        data={"label": "confirmed-phishing", "note": "fake DocuSign link"},
+    )
+
+    assert response.status_code == 200  # TestClient follows the 303 redirect
+    assert response.history and response.history[0].status_code == 303
+    body = response.text
+    assert '<span class="badge badge-confirmed-phishing">confirmed-phishing</span>' in body
+    assert "fake DocuSign link" in body
+    assert ">Change label<" in body  # button text flips once a label exists
+
+
+def test_change_label_prefills_form_with_current_values(verdicts_env: VerdictsEnv) -> None:
+    """AC3: "set OR change" -- the form pre-selects the current label and
+    pre-fills the current note, so changing it starts from what's there."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+    verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "unclear", "note": "not sure yet"}
+    )
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+
+    assert '<option value="unclear" selected>' in response.text
+    assert "<textarea" in response.text
+    assert "not sure yet</textarea>" in response.text
+
+
+def test_setting_a_label_does_not_modify_the_evidence_record_or_verdict(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC3's own explicit requirement: setting a label MUST NOT modify the
+    evidence record or the stored verdict. Reads the record back through
+    the same store path and confirms it is byte-for-byte identical."""
+    from sentinel.triage.store import read_recent_evidence_records
+
+    _persist(
+        verdicts_env,
+        "hash1",
+        verdict="Malicious",
+        sender="phisher@evil.example",
+        calibrated_confidence=0.92,
+        evidence=[
+            EvidenceItem(name="watchman_finding", finding="x", weight=0.7, direction="malicious")
+        ],
+    )
+    before, _ = read_recent_evidence_records(verdicts_env.db_path, verdicts_env.config)
+
+    verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "confirmed-phishing", "note": "note"}
+    )
+
+    after, _ = read_recent_evidence_records(verdicts_env.db_path, verdicts_env.config)
+    assert before == after
+
+
+def test_set_label_rejects_invalid_label_value(verdicts_env: VerdictsEnv) -> None:
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.post(
+        "/verdicts/hash1/label",
+        data={"label": "definitely-phishing", "note": "x"},
+    )
+
+    assert response.status_code == 400
+    assert "Nothing was saved" in response.text
+
+
+def test_set_label_missing_label_field_rejected_not_crash(verdicts_env: VerdictsEnv) -> None:
+    """A hand-crafted POST omitting the "label" field entirely -- must be
+    rejected cleanly (label_value is None), never a 500."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.post("/verdicts/hash1/label", data={"note": "x"})
+
+    assert response.status_code == 400
+
+
+def test_set_label_non_utf8_body_rejected_cleanly_not_a_raw_500(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """[Review, Blind Hunter/Edge Case Hunter] The hand-rolled body parsing
+    (parse_qsl, not Starlette's Request.form()) previously decoded the raw
+    body with a bare body.decode("utf-8") -- a body containing invalid
+    UTF-8 bytes raised an uncaught UnicodeDecodeError, producing
+    Starlette's generic "Internal Server Error" 500 instead of this
+    route's own clean failure message (every other failure path here --
+    invalid label, missing config, a raising save_label -- already
+    rendered one). Fixed to catch the decode failure explicitly."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.post(
+        "/verdicts/hash1/label",
+        content=b"label=unclear&note=bad\xffbyte",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert "Internal Server Error" not in response.text
+    assert "Nothing was saved" in response.text
+
+
+def test_set_label_server_not_configured_renders_clean_error() -> None:
+    with patch(
+        "sentinel.web.main.load_config",
+        side_effect=ConfigError("Missing required environment variable: ANTHROPIC_API_KEY"),
+    ):
+        with TestClient(app) as client:
+            response = client.post(
+                "/verdicts/hash1/label", data={"label": "unclear", "note": "x"}
+            )
+    assert response.status_code == 500
+    assert "Nothing was saved" in response.text
+
+
+def test_set_label_save_failure_renders_clean_error_not_silent_redirect(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """[Notes for dev] A human just clicked submit -- a failed save must
+    render an explicit failure, never a redirect that would look like
+    success with no other way to know it did not actually work."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    with patch(
+        "sentinel.web.verdicts.save_label", side_effect=RuntimeError("disk full")
+    ):
+        response = verdicts_env.client.post(
+            "/verdicts/hash1/label", data={"label": "unclear", "note": "x"}
+        )
+
+    assert response.status_code == 500
+    assert "Failed to save the label" in response.text
+    assert "nothing was recorded" in response.text.lower()
+
+
+def test_note_with_script_tag_is_escaped_in_detail_view(verdicts_env: VerdictsEnv) -> None:
+    """AC7: the free-text note is attacker-adjacent input once rendered --
+    same escaping as every other field."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    verdicts_env.client.post(
+        "/verdicts/hash1/label",
+        data={"label": "confirmed-phishing", "note": '<script>alert("note")</script>'},
+    )
+    response = verdicts_env.client.get("/verdicts/hash1")
+
+    assert "<script>alert" not in response.text
+    assert "&lt;script&gt;" in response.text
+
+
+def test_label_visible_and_filterable_in_list_view(verdicts_env: VerdictsEnv) -> None:
+    """AC5: labelled records are findable in the list, and the list is
+    filterable by label."""
+    _persist(verdicts_env, "hash1", verdict="Malicious", sender="a@example.com")
+    _persist(verdicts_env, "hash2", verdict="Malicious", sender="b@example.com")
+    verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "confirmed-phishing", "note": ""}
+    )
+
+    unfiltered = verdicts_env.client.get("/verdicts")
+    assert '<span class="badge badge-confirmed-phishing">confirmed-phishing</span>' in unfiltered.text
+    assert '<span class="unlabelled">Unlabelled</span>' in unfiltered.text
+
+    filtered = verdicts_env.client.get("/verdicts", params={"label": "confirmed-phishing"})
+    assert "a@example.com" in filtered.text
+    assert "b@example.com" not in filtered.text
+
+
+def test_unlabelled_filter_reaches_benign_records(verdicts_env: VerdictsEnv) -> None:
+    """[Notes for dev] Sampling bias: alerted (Malicious) records get
+    reviewed, quiet Benign records do not. The Unlabelled filter must
+    reach a Benign record deliberately, not just Malicious ones."""
+    _persist(verdicts_env, "hash1", verdict="Benign", sender="quiet@example.com")
+
+    response = verdicts_env.client.get("/verdicts", params={"label": "unlabelled"})
+
+    assert "quiet@example.com" in response.text
+
+
+def test_verdict_and_label_filters_combine(verdicts_env: VerdictsEnv) -> None:
+    """AC5 + Notes for dev: verdict and label filters must combine, not
+    replace each other -- "show me Benign records labelled
+    confirmed-phishing" is exactly the kind of query this story exists
+    to make possible."""
+    _persist(verdicts_env, "hash1", verdict="Benign", sender="a@example.com")
+    _persist(verdicts_env, "hash2", verdict="Malicious", sender="b@example.com")
+    verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "confirmed-phishing", "note": ""}
+    )
+    verdicts_env.client.post(
+        "/verdicts/hash2/label", data={"label": "confirmed-phishing", "note": ""}
+    )
+
+    response = verdicts_env.client.get(
+        "/verdicts", params={"verdict": "Benign", "label": "confirmed-phishing"}
+    )
+
+    assert "a@example.com" in response.text
+    assert "b@example.com" not in response.text
+
+
+def test_label_filter_links_preserve_active_verdict_filter(verdicts_env: VerdictsEnv) -> None:
+    """The filter links themselves must carry the OTHER active filter
+    forward, not silently drop it when the reader clicks a different
+    label."""
+    response = verdicts_env.client.get("/verdicts", params={"verdict": "Malicious"})
+
+    assert 'href="/verdicts?verdict=Malicious&amp;label=confirmed-phishing"' in response.text
+
+
+def test_crosstab_shows_counts_by_label_crossed_with_verdict(
+    verdicts_env: VerdictsEnv,
+) -> None:
+    """AC6: the point of the story -- turns "here are five examples" into
+    a number. Verified against a known, hand-computed distribution."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+    _persist(verdicts_env, "hash2", verdict="Malicious")
+    _persist(verdicts_env, "hash3", verdict="Benign")
+    verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "confirmed-phishing", "note": ""}
+    )
+    verdicts_env.client.post(
+        "/verdicts/hash2/label", data={"label": "confirmed-phishing", "note": ""}
+    )
+    # hash3 stays unlabelled
+
+    response = verdicts_env.client.get("/verdicts")
+    body = response.text
+
+    assert '<table class="crosstab">' in body
+    assert "<th>confirmed-phishing</th><td>2</td><td>0</td><td>0</td><td>0</td><td>2</td>" in body
+    assert "<th>Unlabelled</th><td>0</td><td>1</td><td>0</td><td>0</td><td>1</td>" in body
+
+
+def test_crosstab_reflects_full_store_not_the_active_filter(verdicts_env: VerdictsEnv) -> None:
+    """Matches _summary_strip's own precedent (Story 10.3): a stable
+    overview, not a number that changes as the filter changes."""
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+    _persist(verdicts_env, "hash2", verdict="Benign")
+    verdicts_env.client.post(
+        "/verdicts/hash1/label", data={"label": "confirmed-phishing", "note": ""}
+    )
+
+    response = verdicts_env.client.get("/verdicts", params={"verdict": "Benign"})
+
+    assert "<th>confirmed-phishing</th><td>1</td><td>0</td><td>0</td><td>0</td><td>1</td>" in response.text
+
+
+def test_crosstab_not_present_on_detail_page(verdicts_env: VerdictsEnv) -> None:
+    _persist(verdicts_env, "hash1", verdict="Malicious")
+
+    response = verdicts_env.client.get("/verdicts/hash1")
+
+    assert '<table class="crosstab">' not in response.text

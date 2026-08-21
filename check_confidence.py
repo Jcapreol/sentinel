@@ -1,12 +1,12 @@
 import json, sqlite3, sys
 from cryptography.fernet import InvalidToken
 from sentinel.config import load as load_config
-from sentinel.triage.store import _require_fernet
+from sentinel.triage.store import require_fernet
 from sentinel.triage.scoring import compute_raw_score
 
 config = load_config()
 print(repr(config.evidence_encryption_key), len(config.evidence_encryption_key or ""))
-fernet = _require_fernet(config)
+fernet = require_fernet(config)
 conn = sqlite3.connect('data/evidence.db')
 rows = conn.execute('SELECT message_hash, verdict_json FROM evidence_records ORDER BY created_at ASC').fetchall()
 conn.close()
