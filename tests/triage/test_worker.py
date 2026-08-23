@@ -2204,7 +2204,7 @@ def test_alert_threshold_benign_is_rejected_as_invalid(
     assert "invalid" in capsys.readouterr().err.lower()
 
 
-def test_alert_payload_findings_are_sorted_capped_and_truncated(
+def test_alert_payload_findings_are_sorted_and_capped(
     mocker,  # type: ignore[no-untyped-def]
     store_db_path: str,
     store_config: Config,
@@ -2212,18 +2212,19 @@ def test_alert_payload_findings_are_sorted_capped_and_truncated(
 ) -> None:
     """[Review] The finding-construction path had zero test coverage --
     every prior alert test used empty evidence. Covers real multi-finding
-    evidence: correct sort order (highest weight first), the top-2 cap,
-    and length truncation of an unbounded finding string (Watchman's LLM
-    output has no length constraint of its own)."""
+    evidence: correct sort order (highest weight first) and the top-2 cap,
+    "neutral" (coverage-gap) items excluded. [Story 12.1] Truncation-for-
+    display moved to alerter.py's own rendering (see test_alerter.py) --
+    this layer's job is now only selecting WHICH structured EvidenceItems
+    to pass along, unmodified, not how they'll eventually be displayed."""
     config = _alert_config(store_config)
     _setup_single_message_poll(mocker, store_db_path)
-    long_finding = "A" * 500
     evidence = [
         make_evidence_item(
             name="low", finding="low weight finding", weight=0.1, direction="malicious"
         ),
         make_evidence_item(
-            name="high", finding=long_finding, weight=0.9, direction="malicious"
+            name="high", finding="high weight finding", weight=0.9, direction="malicious"
         ),
         make_evidence_item(
             name="mid", finding="mid weight finding", weight=0.5, direction="benign"
@@ -2234,7 +2235,7 @@ def test_alert_payload_findings_are_sorted_capped_and_truncated(
     ]
     mocker.patch(
         "sentinel.triage.worker.process_message",
-        return_value=_make_report(verdict="Malicious", evidence=evidence),
+        return_value=_make_report(verdict="Malicious", evidence=evidence, message_hash="realhash1"),
     )
     alert_spy = mocker.patch("sentinel.triage.worker.send_alert")
 
@@ -2242,10 +2243,10 @@ def test_alert_payload_findings_are_sorted_capped_and_truncated(
 
     payload = alert_spy.call_args.args[1]
     assert len(payload["findings"]) == 2  # capped at _ALERT_MAX_FINDINGS, "neutral" excluded
-    assert payload["findings"][0].startswith("[malicious] " + "A" * 10)  # highest weight first
-    assert len(payload["findings"][0]) <= 200
-    assert payload["findings"][0].endswith("…")
-    assert payload["findings"][1].startswith("[benign] mid weight finding")
+    assert payload["findings"][0]["name"] == "high"  # highest weight first
+    assert payload["findings"][0]["finding"] == "high weight finding"
+    assert payload["findings"][1]["name"] == "mid"
+    assert payload["message_hash"] == "realhash1"
 
 
 def test_alert_dispatch_unexpected_exception_before_send_does_not_crash_processing(
