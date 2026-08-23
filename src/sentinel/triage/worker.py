@@ -351,7 +351,6 @@ _ALERT_VERDICT_SEVERITY = {"Benign": 0, "Deferred": 1, "Malicious": 2}
 # including genuinely benign ones -- found in review, regression-tested.
 _ALERT_VALID_THRESHOLDS = {"Deferred", "Malicious"}
 _ALERT_MAX_FINDINGS = 2
-_ALERT_FINDING_MAX_LEN = 200
 
 
 def _verdict_meets_alert_threshold(verdict: str, threshold: str) -> bool:
@@ -384,12 +383,6 @@ def _extract_subject_line(email_content: str) -> str | None:
         return None
     subject = first_line[len("Subject: "):]
     return subject if subject else None
-
-
-def _truncate(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1] + "…"
 
 
 def _is_self_alert(
@@ -478,10 +471,13 @@ def _maybe_dispatch_alert(
         if not _verdict_meets_alert_threshold(report["verdict"], config.alert_threshold):
             return
 
-        findings = [
-            _truncate(f"[{item['direction']}] {item['finding']}", _ALERT_FINDING_MAX_LEN)
-            for item in _sorted_directional_findings(report["evidence"])[:_ALERT_MAX_FINDINGS]
-        ]
+        # [Story 12.1] Structured items, not pre-flattened strings --
+        # alerter.py's own _format_finding_line now does the "[direction]
+        # text" -> plain-language rendering, which needs item["name"] (an
+        # already-flattened string had discarded it). Selection here is
+        # otherwise unchanged: still the top _ALERT_MAX_FINDINGS directional
+        # findings by weight.
+        findings = _sorted_directional_findings(report["evidence"])[:_ALERT_MAX_FINDINGS]
         payload = AlertPayload(
             timestamp=report["timestamp"],
             sender=sender,
@@ -489,6 +485,8 @@ def _maybe_dispatch_alert(
             verdict=report["verdict"],
             calibrated_confidence=report["calibrated_confidence"],
             findings=findings,
+            message_hash=report["message_hash"],
+            is_test=False,
         )
         send_alert(config, payload)
     except Exception as e:

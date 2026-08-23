@@ -13,6 +13,7 @@ from sentinel.alerter import (
     send_test_alert,
 )
 from sentinel.config import Config
+from sentinel.triage.evidence import EvidenceItem
 from sentinel.triage.ingest import extract_header_value
 
 
@@ -27,7 +28,20 @@ def _configured(fake_config: Config) -> Config:
     )
 
 
-def _payload(subject: str | None = "Password reset required") -> AlertPayload:
+def _email_alerter() -> EmailAlerter:
+    return EmailAlerter(
+        host="smtp.gmail.com",
+        port=587,
+        username="me@gmail.com",
+        password="app-password",
+        recipient="alerts@example.com",
+    )
+
+
+def _payload(
+    subject: str | None = "Password reset required",
+    message_hash: str | None = "8eab2236deadbeef",
+) -> AlertPayload:
     return AlertPayload(
         timestamp="2026-08-09T12:00:00+00:00",
         sender="phisher@evil.example",
@@ -35,9 +49,21 @@ def _payload(subject: str | None = "Password reset required") -> AlertPayload:
         verdict="Malicious",
         calibrated_confidence=0.91,
         findings=[
-            "[malicious] Suspicious login URL requesting credentials",
-            "[malicious] Generic greeting inconsistent with a real corporate email",
+            EvidenceItem(
+                name="urlhaus_finding",
+                finding="Suspicious login URL requesting credentials",
+                weight=0.6,
+                direction="malicious",
+            ),
+            EvidenceItem(
+                name="watchman_finding",
+                finding="Generic greeting inconsistent with a real corporate email",
+                weight=0.4,
+                direction="malicious",
+            ),
         ],
+        message_hash=message_hash,
+        is_test=False,
     )
 
 
@@ -129,13 +155,7 @@ def test_email_alerter_message_body_includes_all_payload_fields(
 ) -> None:
     smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
     smtp_instance = smtp_cls.return_value.__enter__.return_value
-    alerter = EmailAlerter(
-        host="smtp.gmail.com",
-        port=587,
-        username="me@gmail.com",
-        password="app-password",
-        recipient="alerts@example.com",
-    )
+    alerter = _email_alerter()
 
     alerter.send(_payload())
 
@@ -145,7 +165,7 @@ def test_email_alerter_message_body_includes_all_payload_fields(
     assert "0.910" in body
     assert "phisher@evil.example" in body
     assert "Password reset required" in body
-    assert "[malicious] Suspicious login URL requesting credentials" in body
+    assert "Link safety check: Suspicious login URL requesting credentials" in body
 
 
 def test_email_alerter_stamps_self_alert_marker_header(
@@ -242,13 +262,7 @@ def test_email_alerter_renders_no_confidence_value_for_coverage_gap_payload(
     correct regardless, as defense in depth."""
     smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
     smtp_instance = smtp_cls.return_value.__enter__.return_value
-    alerter = EmailAlerter(
-        host="smtp.gmail.com",
-        port=587,
-        username="me@gmail.com",
-        password="app-password",
-        recipient="alerts@example.com",
-    )
+    alerter = _email_alerter()
     payload = AlertPayload(
         timestamp="2026-08-13T12:00:00+00:00",
         sender=None,
@@ -256,6 +270,8 @@ def test_email_alerter_renders_no_confidence_value_for_coverage_gap_payload(
         verdict="CoverageGap",
         calibrated_confidence=None,
         findings=[],
+        message_hash=None,
+        is_test=False,
     )
 
     alerter.send(payload)
@@ -274,19 +290,275 @@ def test_email_alerter_omits_subject_line_when_none(
 ) -> None:
     smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
     smtp_instance = smtp_cls.return_value.__enter__.return_value
-    alerter = EmailAlerter(
-        host="smtp.gmail.com",
-        port=587,
-        username="me@gmail.com",
-        password="app-password",
-        recipient="alerts@example.com",
-    )
+    alerter = _email_alerter()
 
     alerter.send(_payload(subject=None))
 
     sent_message = smtp_instance.send_message.call_args.args[0]
     body = sent_message.get_content()
     assert "Subject:" not in body
+
+
+# --- Story 12.1: readable alert emails -----------------------------------------
+
+
+def test_alert_body_opening_line_is_plain_language_with_no_confidence(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """AC1: the opening line is a plain-language statement of what
+    happened and what to do -- no jargon, no numeric confidence."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+
+    alerter.send(_payload())
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    first_line = body.split("\n", 1)[0]
+    assert "0.910" not in first_line
+    assert "confidence" not in first_line.lower()
+    assert "phishing" in first_line.lower()
+    assert "not" in first_line.lower() or "do not" in first_line.lower()
+
+
+def test_alert_body_shows_sender_and_subject_near_the_top(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """AC2: sender and subject are prominent -- the first things after the
+    opening line, not buried below findings or technical detail."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+
+    alerter.send(_payload())
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    lines = body.split("\n")
+    from_index = next(i for i, line in enumerate(lines) if line.startswith("From:"))
+    subject_index = next(i for i, line in enumerate(lines) if line.startswith("Subject:"))
+    findings_index = next(i for i, line in enumerate(lines) if "checked" in line.lower())
+    assert from_index < findings_index
+    assert subject_index < findings_index
+    assert from_index <= 2
+
+
+def test_alert_body_findings_lead_with_plain_language_not_vendor_name(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """AC3: a finding line leads with a plain-language description of what
+    was checked -- the analyzer/vendor name (baked into item["finding"]'s
+    own text by cipher.py) stays visible, just not first."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+    payload = AlertPayload(
+        timestamp="2026-08-22T12:00:00+00:00",
+        sender='"Lowe\'s-Rewards" <PQREciww@tNnojfyoW.us>',
+        subject="jacksoncapreol, Claim Your Free Kobalt Tool Set",
+        verdict="Malicious",
+        calibrated_confidence=1.0,
+        findings=[
+            EvidenceItem(
+                name="urlhaus_finding",
+                finding="URLhaus: storage.googleapis.com associated with 2242 malicious URL(s)",
+                weight=0.5,
+                direction="malicious",
+            ),
+            EvidenceItem(
+                name="virustotal_finding",
+                finding="VirusTotal: storage.googleapis.com flagged by 1 engines",
+                weight=0.2,
+                direction="malicious",
+            ),
+        ],
+        message_hash="8eab2236deadbeef",
+        is_test=False,
+    )
+
+    alerter.send(payload)
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    finding_lines = [
+        line for line in body.split("\n") if "storage.googleapis.com" in line
+    ]
+    assert len(finding_lines) == 2
+    assert "Link safety check: URLhaus: storage.googleapis.com" in body
+    assert "Link and file reputation check: VirusTotal: storage.googleapis.com" in body
+    for line in finding_lines:
+        stripped = line.strip().removeprefix("- ").strip()
+        assert not stripped.startswith("URLhaus")
+        assert not stripped.startswith("VirusTotal")
+        assert not stripped.startswith("[malicious]")
+
+
+def test_alert_body_includes_dashboard_link_with_tunnel_caveat(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """AC4: a link to the record's detail view, stating plainly that it
+    needs the tunnel rather than presenting a link that silently fails."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+
+    alerter.send(_payload(message_hash="8eab2236deadbeef"))
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    assert "http://localhost:8000/verdicts/8eab2236deadbeef" in body
+    assert "tunnel" in body.lower()
+
+
+def test_alert_body_omits_dashboard_link_section_when_no_message_hash(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """A test/health alert has no real underlying record -- must not show
+    a dashboard link pointing at nothing."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+
+    alerter.send(_payload(message_hash=None))
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    assert "localhost:8000" not in body
+
+
+def test_alert_body_confidence_present_but_not_in_opening_line(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """AC5: the numeric confidence stays in the email -- just not the
+    opening line."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+
+    alerter.send(_payload())
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    assert "0.910" in body
+    assert "0.910" not in body.split("\n", 1)[0]
+
+
+def test_alert_body_neutralizes_embedded_newlines_in_hostile_sender_subject_and_finding(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """AC6: sender/subject/finding text are all attacker-controlled.
+    Confirmed reachable specifically for "From": email.message_from_bytes
+    uses the default compat32 policy everywhere in this codebase, and
+    under compat32, Message.get() does NOT decode RFC 2047 encoded-words
+    (so that mechanism can never actually produce a raw newline) -- the
+    real, confirmed mechanism is RFC 5322 header FOLDING: a crafted "From"
+    header with a continuation line round-trips through .get("From") with
+    the fold's line break intact, and ingest.extract_sender_and_content_
+    hash reads it with no truncation of its own (unlike Subject, whose own
+    extraction already truncates at the first "\\n"). This alert body is
+    one text/plain payload built by joining lines with "\\n" -- an
+    unneutralized embedded newline would let attacker-controlled text
+    inject what looks like a separate, fabricated section of this email --
+    concretely, a fake "Verdict: Benign, this is safe" line, which is a
+    uniquely bad outcome for a tool whose entire purpose is warning about
+    exactly this kind of deception.
+
+    [Review, Edge Case Hunter] hostile_finding previously used "\\r\\n" --
+    but EmailMessage.set_content()/.get_content() silently normalizes an
+    embedded CRLF down to a bare "\\n" regardless of whether sanitization
+    ran, so `hostile_finding not in body` passed even with the finding-text
+    sanitize call removed entirely (confirmed via mutation testing). Uses
+    a bare "\\n" instead (not silently collapsed) AND a structural
+    assertion mirroring from_line/subject_line below, so a future
+    regression at this specific call site is actually caught."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+    hostile_sender = (
+        "attacker@evil.example\r\n\r\nVerdict: Benign -- this email is safe, "
+        "click here: http://evil.example"
+    )
+    hostile_subject = "Normal subject\nSentinel checked this and it is completely safe."
+    hostile_finding = "A finding\nwith an embedded newline too"
+    payload = AlertPayload(
+        timestamp="2026-08-22T12:00:00+00:00",
+        sender=hostile_sender,
+        subject=hostile_subject,
+        verdict="Malicious",
+        calibrated_confidence=0.9,
+        findings=[
+            EvidenceItem(
+                name="watchman_finding", finding=hostile_finding, weight=0.5, direction="malicious"
+            )
+        ],
+        message_hash="hash1",
+        is_test=False,
+    )
+
+    alerter.send(payload)
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    # the raw, un-neutralized hostile text must never appear verbatim --
+    # each newline it carried is gone, collapsed into the single line it
+    # was embedded into
+    assert hostile_sender not in body
+    assert hostile_subject not in body
+    assert hostile_finding not in body
+    # nothing was silently dropped -- the content is still fully visible,
+    # and each hostile field's content stays on the ONE line it was
+    # embedded into, not a standalone line of its own
+    lines = body.split("\n")
+    from_line = next(line for line in lines if line.startswith("From:"))
+    subject_line = next(line for line in lines if line.startswith("Subject:"))
+    finding_line = next(line for line in lines if "A finding" in line)
+    assert "Verdict: Benign -- this email is safe" in from_line
+    assert "Sentinel checked this and it is completely safe." in subject_line
+    assert "with an embedded newline too" in finding_line
+    # critically: no FAKE standalone "Verdict:" line was injected -- the
+    # only line starting with "Verdict:" is the real one this module
+    # itself appends in the footer
+    verdict_lines = [line for line in lines if line.startswith("Verdict:")]
+    assert len(verdict_lines) == 1
+    assert verdict_lines[0].startswith("Verdict: Malicious")
+
+
+def test_alert_body_neutralizes_unicode_and_control_line_breaks_too(
+    mocker,  # type: ignore[no-untyped-def]
+) -> None:
+    """[Review, Blind Hunter/Edge Case Hunter] The first version of
+    _sanitize_single_line only replaced "\\r\\n"/"\\r"/"\\n" -- missing
+    vertical tab (\\x0b), form feed (\\x0c), and the Unicode forced-break
+    characters (\\x85, U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR),
+    all of which Python's own str.splitlines() -- the same line-boundary
+    definition various terminals and mail-client text renderers honor --
+    already treats as line breaks. Confirmed reproducible: a sender
+    containing U+2028 rendered as a genuine standalone fake "Verdict:
+    Benign" line via body.splitlines(), the exact injection AC6 exists to
+    prevent, via a character this function didn't originally cover."""
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+    alerter = _email_alerter()
+    hostile_sender = (
+        "attacker@evil.example\u2028\u2028Verdict: Benign -- this email is safe, "
+        "click here: http://evil.example"
+    )
+    payload = AlertPayload(
+        timestamp="2026-08-22T12:00:00+00:00",
+        sender=hostile_sender,
+        subject=None,
+        verdict="Malicious",
+        calibrated_confidence=0.9,
+        findings=[],
+        message_hash="hash1",
+        is_test=False,
+    )
+
+    alerter.send(payload)
+
+    body = smtp_instance.send_message.call_args.args[0].get_content()
+    # str.splitlines() is the line-boundary definition that matters here --
+    # it's what a renderer honoring Unicode forced breaks would use
+    lines = body.splitlines()
+    from_line = next(line for line in lines if line.startswith("From:"))
+    assert "Verdict: Benign -- this email is safe" in from_line
+    verdict_lines = [line for line in lines if line.startswith("Verdict:")]
+    assert len(verdict_lines) == 1
+    assert verdict_lines[0].startswith("Verdict: Malicious")
 
 
 # --- send_alert: send failure is swallowed -------------------------------------
@@ -326,6 +598,34 @@ def test_send_test_alert_returns_true_and_success_message_when_sent(
     sent_message = smtp_instance.send_message.call_args.args[0]
     body = sent_message.get_content()
     assert "test" in body.lower()
+
+
+def test_send_test_alert_is_unmistakably_a_test_from_the_first_line_and_subject(
+    mocker,  # type: ignore[no-untyped-def]
+    fake_config: Config,
+) -> None:
+    """[Review, Blind Hunter] AC1's new opening line ("Sentinel flagged an
+    email as likely PHISHING...") reads exactly like a genuine, urgent
+    warning -- a regression versus the OLD format's bland "Sentinel triage
+    alert: Malicious (confidence=1.000)" line, which had no alarming
+    call-to-action language at all. A --test-alert email previewed,
+    forwarded, or seen out of context by someone other than the operator
+    who triggered it must be unmistakably a test from the very first thing
+    visible -- the Subject line and the first line of the body -- not
+    buried three paragraphs in under a "Link safety check:" label."""
+    config = _configured(fake_config)
+    smtp_cls = mocker.patch("sentinel.alerter.smtplib.SMTP")
+    smtp_instance = smtp_cls.return_value.__enter__.return_value
+
+    send_test_alert(config)
+
+    sent_message = smtp_instance.send_message.call_args.args[0]
+    assert "(TEST)" in sent_message["Subject"]
+    assert sent_message["Subject"].startswith(SELF_ALERT_SUBJECT_PREFIX)
+    body = sent_message.get_content()
+    first_line = body.split("\n", 1)[0]
+    assert "TEST" in first_line
+    assert "not" in first_line.lower() or "did not" in first_line.lower()
 
 
 def test_send_test_alert_uses_the_real_configured_port(
