@@ -1,259 +1,229 @@
 # SENTINEL
 
+**An AI phishing analyst that shows its work.**
+
 [![CI](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Types](https://img.shields.io/badge/mypy-strict-informational)
 
-## Quick Start
+Most email security tools give you a verdict. SENTINEL gives you the evidence behind it.
 
-```bash
-git clone https://github.com/Jcapreol/sentinel.git
-cd sentinel
-pip install -e .
-cp .env.example .env   # then fill in your four API keys
-
-# Basic triage
-sentinel "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
-
-# Full incident report with MITRE ATT&CK mapping (saves Markdown to reports/)
-sentinel --report "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
-
-# Web dashboard (browser UI with demo scenarios, session history, live quota)
-uvicorn sentinel.web.main:app --reload
-# then open http://localhost:8000
-```
-
-API keys required: Anthropic (pay-per-use, fractions of a cent per run), VirusTotal (free tier), AbuseIPDB (free tier), URLhaus (free tier — get one at auth.abuse.ch).
+It watches a live inbox, sends every new message through two independent AI and threat-intelligence agents, and turns their findings into a calibrated verdict. Every decision is stored as an encrypted evidence record you can open, review, label, and replay. When SENTINEL isn't sure, it says so instead of guessing.
 
 ---
 
-SENTINEL is an open-source, MIT-licensed multi-agent AI SOC analyst for the terminal that accepts a raw security alert, log line, or IOC and produces a corroborated, structured verdict in under 30 seconds.
-It runs two independent analysis agents — Watchman (Claude behavioral analysis) and Cipher (VirusTotal + AbuseIPDB + URLhaus threat intelligence) — and weighs their combined evidence into a human-readable verdict (Benign / Investigating / Probable / Confirmed). A clean reputation lookup pulls a verdict toward benign; concrete malicious reputation pushes it toward confirmed; behavioral suspicion alone is reported but not treated as proof.
-JSON output is stable across all v1.x releases and parseable by standard tools like `jq` without SENTINEL-specific libraries.
+## How it works
 
-## Demo
-
-Real run against a credential dumping alert:
-
-```
-$ sentinel "Sysmon Event ID 10: C:\Users\Public\update.exe (unsigned) accessed lsass.exe with GrantedAccess 0x1410 on WORKSTATION-42"
-[sentinel] Analyzing alert...
-
-Verdict:          Probable
-Confidence tier:  2
-
-Watchman findings:
-  - Unsigned/unknown binary executing from Public user directory attempting privileged access
-  - Direct access to lsass.exe process indicates potential credential dumping
-  - GrantedAccess value 0x1410 includes PROCESS_QUERY_INFORMATION and PROCESS_VM_READ
-    permissions commonly used in credential theft
-  - Execution from C:\Users\Public\ directory suggests persistence mechanism or staging location
-  - lsass.exe targeting is characteristic of lateral movement and privilege escalation attacks
-
-Named blind spot:
-  - No external IOCs found — verify alert contains an external IP address, domain, or file hash
-
-Execution time: 2.57 seconds
+```mermaid
+flowchart LR
+    A[Gmail inbox] --> B[Ingest]
+    B --> C[Header auth<br/>SPF, DKIM, DMARC]
+    B --> D[Watchman<br/>Claude content analysis]
+    B --> E[Cipher<br/>VirusTotal, AbuseIPDB, URLhaus]
+    C --> F[Evidence weighting<br/>+ isotonic calibration]
+    D --> F
+    E --> F
+    F --> G{Verdict}
+    G --> H[(Encrypted<br/>evidence store)]
+    G --> I[Email alert]
+    H --> J[Local dashboard<br/>review and label]
 ```
 
-Two independent agents analyzed the alert. Watchman flagged the behavioral TTPs (lsass access + unsigned binary from a world-writable directory). Cipher found no external IOC to corroborate against threat intelligence — so the verdict rests on a single source (Watchman) and lands at Probable rather than Confirmed. Cipher reports the gap explicitly so you know exactly what to add to the alert to raise confidence, rather than silently dropping it.
+**Watchman** reads the message the way an analyst would: urgency, impersonation, mismatched links, requests for credentials.
+**Cipher** checks every extracted indicator against three independent threat-intelligence feeds.
+**Header analysis** parses SPF, DKIM, and DMARC results, including DMARC policy strength.
 
-## Web Dashboard
+Each finding carries a weight and a direction. SENTINEL combines them, runs the result through a calibration model, and assigns one of four verdicts:
 
-SENTINEL also ships with a browser-based dashboard — a FastAPI backend wrapping the same analysis engine, with a vanilla HTML/CSS/JS frontend. No build step, no npm, no framework.
+| Verdict | Meaning |
+|---------|---------|
+| **Malicious** | The evidence points to phishing |
+| **Benign** | The evidence points to legitimate mail |
+| **Deferred** | The evidence is weak or conflicting, so a human should look |
+| **CoverageGap** | The message couldn't be analyzed, so no confidence is claimed |
 
-```bash
-uvicorn sentinel.web.main:app --reload
-```
+---
 
-Open `http://localhost:8000`. The dashboard includes:
+## Design principles
 
-- **Alert input** — paste a raw alert or pick from five pre-loaded demo scenarios (one for each verdict tier) that run entirely from local fixture data, with no live API calls
-- **Live progress** — streamed agent-by-agent status during a live analysis via Server-Sent Events
-- **Verdict display** — the same evidence chain, named blind spots, and MITRE ATT&CK tags as the CLI, rendered as readable cards instead of JSON
-- **Session history** — every alert analyzed in the current tab, with confidence tier and timing; click any row to re-expand its full evidence chain without a new request
-- **Live VirusTotal quota indicator** — remaining daily calls, visible at all times, so a live demo never runs out of quota unannounced
-- **Eval transparency footnote** — the same evaluation results from below, shown directly in the UI rather than left to a README someone may not read
+**A clean lookup is not the same as no lookup.** "Checked, zero engines flagged it" is evidence of safety. "Nothing to check" is not. SENTINEL treats them differently.
 
-The web layer makes zero changes to the verdict logic in `verdict.py` or `confidence.py` — it calls the same `run_analysis()` function the CLI uses, so a given alert produces an identical verdict through either interface. The dashboard is local-only in v1: no authentication, no hosted deployment, no database. Session history lives in browser `sessionStorage` and clears when the tab closes.
+**Suspicion is not proof.** Behavioral red flags alone are reported, never treated as confirmation.
 
-## Install
+**Never claim confidence you don't have.** Weak or conflicting evidence becomes `Deferred`. Missing evidence becomes `CoverageGap`. Neither gets a made-up score.
+
+**Attacker-controlled data stays data.** Sender names, subjects, and message bodies are written by the attacker. They are escaped on render, sanitized before analysis, and never trusted to make decisions on their own.
+
+**Fail loud.** If the pipeline stops working, SENTINEL tells you, even when the failure is in Gmail authentication itself.
+
+---
+
+## Features
+
+### Autonomous triage
+- Continuous polling, or one cycle per run for cron
+- Gmail via personal OAuth or a Google Workspace service account
+- Replay any stored verdict to see exactly how it would score today
+
+### Encrypted evidence store
+- Every record encrypted at rest with Fernet
+- Findings, weights, directions, and verdicts preserved for review and audit
+- Configurable retention and purge
+
+### Alerting that people can read
+- Email alerts at a configurable threshold (default: `Deferred` or worse)
+- Written for a non-technical reader: what happened and what to do come first, technical detail comes after
+- Built-in guard so SENTINEL never triages its own alerts and spirals into a loop
+
+### Self-monitoring
+- Heartbeat tracks every successful poll
+- If nothing succeeds within the threshold (default 30 minutes), a liveness alert goes out over SMTP, which uses a separate credential from Gmail
+- Alerts once on failure, not every cycle
+
+### Analyst dashboard
+- Verdict list with filters, summary counts, and live pipeline health
+- Full evidence detail for every record
+- Human labelling (confirmed phishing, confirmed benign, unclear) with encrypted notes, building ground truth over time
+- Bound to `127.0.0.1` only, with dark theme and Eastern time display
+
+### Alert triage CLI
+A separate one-shot mode for SOC-style alerts. Paste a log line, alert, or IOC and get a corroborated verdict with MITRE ATT&CK mapping and named blind spots, as JSON or a Markdown incident report.
+
+---
+
+## Research: when authentication works against you
+
+While running SENTINEL on live mail, I found phishing messages that passed SPF and DMARC cleanly and scored as safe, even though Watchman correctly flagged them.
+
+The cause is structural. Valid authentication proves a sender controls their domain. It doesn't prove the domain is trustworthy. Attackers get there two ways:
+
+- **Compromised accounts:** sending from a real organization's mailbox and borrowing its reputation.
+- **Fresh domains:** registering a domain for about ten dollars, configuring authentication correctly, and sending. Two of the phishing domains I found were registered in the same second.
+
+The full write-up traces the scoring math, shows why content analysis can't currently outvote clean authentication, and lays out what a fix needs to consider: [docs/findings/auth-alignment.md](docs/findings/auth-alignment.md).
+
+---
+
+## Quick start
+
+Requires Python 3.10 or newer.
 
 ```bash
 git clone https://github.com/Jcapreol/sentinel.git
 cd sentinel
 pip install -e .
+cp .env.example .env    # add your API keys
 ```
 
 > **Windows:** use `py -m pip install -e .` if `pip` is not on your PATH.
 
-Set your API keys. SENTINEL reads them from a `.env` file in the project root (copy `.env.example` to `.env` and fill in your keys), or from environment variables:
+### Run phishing triage
 
-**.env file:**
-```
-ANTHROPIC_API_KEY=your_anthropic_key
-VIRUSTOTAL_API_KEY=your_virustotal_key
-ABUSEIPDB_API_KEY=your_abuseipdb_key
-URLHAUS_API_KEY=your_urlhaus_key
-```
-
-**Or export directly (macOS / Linux):**
 ```bash
-export ANTHROPIC_API_KEY=your_anthropic_key
-export VIRUSTOTAL_API_KEY=your_virustotal_key
-export ABUSEIPDB_API_KEY=your_abuseipdb_key
-export URLHAUS_API_KEY=your_urlhaus_key
+sentinel-triage --once                 # one poll cycle, then exit
+sentinel-triage                        # continuous loop
+sentinel-triage --view                 # recent verdicts in the terminal
+sentinel-triage --view --verdict Deferred --limit 50
+sentinel-triage --replay MESSAGE_HASH  # rescore a stored verdict and diff it
+sentinel-triage --test-alert           # verify alert delivery
 ```
 
-**Or export directly (Windows PowerShell):**
-```powershell
-$env:ANTHROPIC_API_KEY="your_anthropic_key"
-$env:VIRUSTOTAL_API_KEY="your_virustotal_key"
-$env:ABUSEIPDB_API_KEY="your_abuseipdb_key"
-$env:URLHAUS_API_KEY="your_urlhaus_key"
+### Open the dashboard
+
+```bash
+uvicorn sentinel.web.main:app --reload
+# then open http://127.0.0.1:8000/verdicts
 ```
 
-Run:
+On a remote host, tunnel in over SSH:
+
+```bash
+ssh -L 8000:127.0.0.1:8000 user@your-host
+```
+
+### Triage a single alert
 
 ```bash
 sentinel "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
-```
-
-Or generate a full incident report with MITRE ATT&CK mapping:
-
-```bash
-sentinel --report "Unusual outbound traffic to 185.220.101.45 on port 443 from prod-db-01"
-# Verdict JSON to stdout + Markdown report saved to reports/TIMESTAMP-incident.md
-```
-
-Or pipe via stdin:
-
-```bash
+sentinel --report "Sysmon Event ID 10: unsigned binary accessed lsass.exe"
 echo "Brute force attempt from 185.220.101.45 on SSH" | sentinel
 ```
 
-## Sample JSON Output
+The demo page at `http://127.0.0.1:8000` runs five built-in scenarios with no API calls.
 
-SENTINEL writes structured JSON to stdout on every run. All fields are always present regardless of confidence tier or agent error state.
+---
 
-```json
-{
-  "verdict": "Confirmed",
-  "confidence_tier": 3,
-  "methodology": [
-    {"agent": "watchman", "status": "success", "error": null},
-    {"agent": "cipher", "status": "success", "error": null}
-  ],
-  "citations": [
-    {
-      "source": "watchman",
-      "finding": "Suspicious outbound connection to known Tor exit node on non-standard port"
-    },
-    {
-      "source": "cipher",
-      "finding": "VirusTotal: 185.220.101.45 flagged by 12 engines as malicious, 2 as suspicious"
-    },
-    {
-      "source": "cipher",
-      "finding": "AbuseIPDB: 185.220.101.45 abuse confidence 97% from 234 reports"
-    }
-  ],
-  "blind_spots": [],
-  "source_independence_confirmed": true,
-  "execution_time_seconds": 4.231,
-  "timestamp": "2026-05-11T18:42:03.456789+00:00"
-}
-```
+## Configuration
 
-Pipe to `jq` to extract any field:
+**Required for everything:**
 
-```bash
-sentinel "alert text" | jq '.verdict'
-sentinel "alert text" | jq '.blind_spots[].reason'
-```
+| Variable | Source |
+|----------|--------|
+| `ANTHROPIC_API_KEY` | Anthropic (pay per use) |
+| `VIRUSTOTAL_API_KEY` | VirusTotal (free tier) |
+| `ABUSEIPDB_API_KEY` | AbuseIPDB (free tier) |
+| `URLHAUS_API_KEY` | URLhaus, via auth.abuse.ch (free) |
 
-## How Verdicts Work
+**For `sentinel-triage`:**
 
-SENTINEL does not treat behavioral suspicion as proof, and it does not treat a quiet alert as safe. The verdict is a function of two independent signals: what Cipher's threat intelligence says about the indicator, and how confident Watchman's behavioral analysis is. Crucially, a *clean* reputation lookup ("checked, 0 engines flagged it") is treated differently from *no* lookup ("nothing to check") — only the former is exonerating evidence.
+| Variable | Purpose |
+|----------|---------|
+| `SENTINEL_EVIDENCE_KEY` | Fernet key for the evidence store |
+| `GMAIL_AUTH_MODE` | `oauth` or `service_account` (default) |
+| `GMAIL_MONITORED_MAILBOX` | Mailbox to triage |
+| `SENTINEL_POLL_INTERVAL` | Seconds between polls in continuous mode |
+| `SENTINEL_ALERT_ENABLED` | `true` to send verdict alerts |
+| `SENTINEL_ALERT_THRESHOLD` | Lowest verdict that alerts (default `Deferred`) |
+| `SENTINEL_ALERT_SMTP_*` | Host, port, username, password, recipient |
+| `SENTINEL_ALERT_HEARTBEAT_THRESHOLD_MINUTES` | Liveness alert threshold (default 30) |
 
-| Cipher (threat intel) | Watchman (behavioral) | Verdict |
-|----------------------|------------------------|---------|
-| Malicious | High / Medium | **Confirmed** |
-| Malicious | Low / No data | **Probable** |
-| Clean | High | **Investigating** (suspicious behavior, but indicator cleared) |
-| Clean | Low / No data | **Benign** |
-| No data | High | **Probable** (single-source) |
-| No data | Medium / Low | **Investigating** |
+Setup guides: [Gmail](docs/gmail-setup.md) and [secrets, backup, and key rotation](docs/security.md).
 
-| Tier | Label | Meaning |
-|------|-------|---------|
-| 0 | Benign | Indicator cleared by threat intel; no corroborating threat behavior |
-| 1 | Investigating | Mixed or single weak signal; needs analyst follow-up |
-| 2 | Probable | Strong signal from one source, or malicious intel without behavioral corroboration |
-| 3 | Confirmed | Malicious reputation corroborated by independent behavioral analysis |
+---
 
-A named blind spot is always surfaced when a source can't contribute — so you know the confidence ceiling and what to check to raise it.
+## Engineering
 
-## Threat Intelligence Coverage
+- **900+ tests**, `mypy --strict`, and `ruff` on every push, across Python 3.10 and 3.12
+- **Dependency scanning** with `pip-audit` in CI
+- **Architecture enforced by tests:** the web layer is structurally blocked from opening the database or encryption key directly, and labelling code can't write to evidence records
+- **Security tests for hostile input,** including stored XSS through sender names and injection through alert subjects
+- **Calibrated confidence:** an isotonic calibration model, evaluated on a held-out set against an ECE, AUC-ROC, and deferral-rate release gate
+- **Provider-agnostic mail layer:** a mail source interface with Gmail as the first implementation
 
-Cipher extracts indicators from the alert text and queries three independent sources:
+SENTINEL is designed and directed by me and built with AI coding agents using the BMAD method. Every feature starts as a written story with acceptance criteria and goes through adversarial review before it ships.
 
-- **IP addresses** — VirusTotal reputation + AbuseIPDB abuse reports + URLhaus malware-host lookup
-- **Domains** — VirusTotal domain reputation + URLhaus malware-host lookup (AbuseIPDB is IP-only and is reported as a blind spot for domains)
-- **URLs** — the host/IP is extracted and looked up across all three sources
+---
 
-Each source covers different threat infrastructure. VirusTotal aggregates antivirus engine verdicts; AbuseIPDB tracks community-reported abuse; URLhaus specifically indexes active malware distribution hosts, catching freshly weaponized IOCs that other feeds haven't yet flagged. A miss on any single source is treated as no-data, not as exoneration — only a confirmed clean result counts as evidence of safety.
+## Known limitations
 
-Private/internal IP ranges are filtered out automatically so only externally routable indicators are queried.
+- **Authentication can outweigh content.** See the research section above.
+- **Narrow calibration data.** The model was fit on one personal inbox plus a public phishing set, so results on business mail are unproven.
+- **Gmail only.** Microsoft 365 support is planned on top of the existing mail source interface.
+- **Live feeds shift.** Threat intelligence changes over time, so rescoring the same message can give different results. VirusTotal's free tier allows 4 requests per minute and 500 per day; past that, SENTINEL reports a blind spot and continues.
+- **No dashboard authentication.** That's why it binds to loopback only.
 
-## Evaluation
+---
 
-SENTINEL ships with a small evaluation harness (`eval/run_eval.py`) that runs a labeled set of indicators through the full pipeline and scores the verdicts against known ground truth. The labeled set (`eval/labeled_set.json`) contains known-benign infrastructure (Cloudflare/Google DNS, major domains) and live malicious samples pulled from URLhaus.
+## Data handling
 
-The harness has been used to validate two successive improvements to the pipeline. The original implementation derived the verdict purely from the count of agents that returned findings, which meant a clean indicator and a malicious one received the same verdict. The changes below were made iteratively, each measured against the same labeled set:
+The one-shot `sentinel` CLI writes nothing to disk. `sentinel-triage` stores encrypted evidence records on the local machine only. Data leaves the machine only to reach the Anthropic, VirusTotal, AbuseIPDB, and URLhaus APIs, plus your own SMTP server for alerts.
 
-| Metric | Baseline (source-count verdict) | After evidence-weighting | After URLhaus added |
-|--------|--------------------------------|--------------------------|---------------------|
-| Precision | 50.0% | 100.0% | **100.0%** |
-| Recall | 100.0% | 80.0% | **100.0%** |
-| F1 | 66.7% | 88.9% | **100.0%** |
+---
 
-Confusion matrix (positive class = malicious), current:
-
-```
-                 predicted MAL   predicted BEN
-actual MAL          TP = 5          FN = 0
-actual BEN          FP = 0          TN = 5
-```
-
-The recall improvement from 80% to 100% came from adding URLhaus as a third intel source. The single false negative in the evidence-weighting run was a URLhaus-listed malicious IP that VirusTotal had not yet flagged — a real-world illustration of threat-intel source latency. URLhaus indexes active malware distribution hosts and caught that indicator when VirusTotal lagged, closing the gap.
-
-Reproduce it yourself:
+## Development
 
 ```bash
-py eval/run_eval.py
+pip install -e . -r requirements-dev.txt
+ruff check src/ tests/
+mypy src/
+pytest tests/
 ```
 
-### Known limitation
+## About
 
-Because Cipher depends on live threat-intelligence feeds, eval scores vary between runs as those feeds update. The numbers above reflect the current state of the labeled set against live feeds. Treat them as representative figures rather than fixed benchmarks — a freshly weaponized indicator may still lag on some feeds even with three sources, which is exactly why SENTINEL keeps Watchman's behavioral analysis as an independent signal rather than relying on reputation alone.
-
-## Data Handling
-
-SENTINEL does not store or transmit your incident data beyond the analysis APIs.
-
-No alert content, IOCs, or log lines are written to disk at any point. The only external transmissions are to the Anthropic API (Watchman behavioral analysis) and the VirusTotal, AbuseIPDB, and URLhaus APIs (Cipher threat intelligence) as required to produce a verdict.
-
-**The `sentinel-triage` autonomous phishing-triage pipeline is different**: unlike the one-shot `sentinel` CLI above, it persists an encrypted evidence record for every message it triages, so verdicts can be reviewed and replayed later. See [docs/security.md](docs/security.md) for how secrets (including the evidence encryption key) are stored, backed up, and rotated, and [docs/gmail-setup.md](docs/gmail-setup.md) for the pipeline's Gmail credential setup.
-
-## Connectivity Requirements
-
-SENTINEL requires internet access to the Anthropic, VirusTotal, AbuseIPDB, and URLhaus APIs. Air-gapped environments are not supported in v1.
-
-## Rate Limits
-
-**VirusTotal free tier:** 4 requests/minute, 500 requests/day.
-
-If SENTINEL hits the VirusTotal rate limit, Cipher returns a named blind spot (`"VirusTotal rate limit reached - reputation data unavailable"`) and analysis continues with Watchman results only. Upgrade to VirusTotal Premium to remove this ceiling.
+Built by **Jackson Capreol**, a cybersecurity student in Tampa, Florida, focused on AI-driven detection and security automation. SENTINEL was built to run unattended and has been deployed on a Raspberry Pi, triaging real mail every five minutes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
