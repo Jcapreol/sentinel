@@ -2,7 +2,7 @@
 
 **An AI phishing analyst that shows its work.**
 
-[![CI](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml)
+[![CI](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Jcapreol/sentinel/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.10%20%7C%203.12-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Types](https://img.shields.io/badge/mypy-strict-informational)
